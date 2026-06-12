@@ -52,7 +52,7 @@ func (st *Store) load() error {
 	if errors.Is(err, os.ErrNotExist) {
 		st.state = State{StateVersion: 0, Tasks: map[string]Task{}}
 		st.rebuildIndex()
-		return st.save()
+		return st.saveState(st.state)
 	}
 	if err != nil {
 		return err
@@ -72,9 +72,11 @@ func (st *Store) load() error {
 	return nil
 }
 
-// save writes the full state atomically: temp file -> fsync -> rename.
-func (st *Store) save() error {
-	b, err := json.MarshalIndent(st.state, "", "  ")
+// saveState writes the given state atomically: temp file -> fsync -> rename.
+// Callers persist a candidate state BEFORE committing it to st.state, so a save
+// failure leaves the in-memory state untouched (no memory/disk divergence).
+func (st *Store) saveState(s State) error {
+	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -228,11 +230,11 @@ func (st *Store) Add(req AddRequest) (Task, uint64, error) {
 		return Task{}, 0, err
 	}
 	cand.StateVersion++
-	st.state = cand
-	st.rebuildIndex()
-	if err := st.save(); err != nil {
+	if err := st.saveState(cand); err != nil {
 		return Task{}, 0, err
 	}
+	st.state = cand
+	st.rebuildIndex()
 	return st.state.Tasks[id], st.state.StateVersion, nil
 }
 
@@ -243,10 +245,15 @@ type UpdateOp struct {
 }
 
 func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
+	seen := map[string]struct{}{}
 	for _, op := range ops {
 		if err := validateContent(op.Content); err != nil {
 			return nil, 0, err
 		}
+		if _, dup := seen[op.ID]; dup {
+			return nil, 0, &ValidationError{"duplicate id in batch: " + op.ID}
+		}
+		seen[op.ID] = struct{}{}
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -291,11 +298,11 @@ func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
 		return nil, 0, err
 	}
 	cand.StateVersion++
-	st.state = cand
-	st.rebuildIndex()
-	if err := st.save(); err != nil {
+	if err := st.saveState(cand); err != nil {
 		return nil, 0, err
 	}
+	st.state = cand
+	st.rebuildIndex()
 	out := make([]Task, 0, len(ops))
 	for _, op := range ops {
 		out = append(out, st.state.Tasks[op.ID])

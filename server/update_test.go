@@ -32,6 +32,23 @@ func TestUpdateStaleVersionConflicts(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsDuplicateIDInBatch(t *testing.T) {
+	st := newTestStore(t)
+	task, _, _ := st.Add(AddRequest{Content: validContent("orig")})
+	c := task.Content
+	c.Title = "renamed"
+	_, _, err := st.Update([]UpdateOp{
+		{ID: task.ID, Content: c, ExpectedVersion: 1},
+		{ID: task.ID, Content: c, ExpectedVersion: 1},
+	})
+	if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("expected *ValidationError for duplicate id, got %v", err)
+	}
+	if st.Snapshot().Tasks[task.ID].Meta.Version != 1 {
+		t.Fatal("expected no mutation on duplicate-id rejection")
+	}
+}
+
 func TestUpdateUnknownID(t *testing.T) {
 	st := newTestStore(t)
 	_, _, err := st.Update([]UpdateOp{{ID: "ghost", Content: validContent("x"), ExpectedVersion: 1}})
