@@ -235,3 +235,70 @@ func (st *Store) Add(req AddRequest) (Task, uint64, error) {
 	}
 	return st.state.Tasks[id], st.state.StateVersion, nil
 }
+
+type UpdateOp struct {
+	ID              string  `json:"id"`
+	Content         Content `json:"content"`
+	ExpectedVersion uint64  `json:"expected_version"`
+}
+
+func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
+	for _, op := range ops {
+		if err := validateContent(op.Content); err != nil {
+			return nil, 0, err
+		}
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	// existence
+	for _, op := range ops {
+		if _, ok := st.state.Tasks[op.ID]; !ok {
+			return nil, 0, ErrNotFound
+		}
+	}
+	// conflicts (collect all, then reject)
+	var conflicts []Task
+	for _, op := range ops {
+		cur := st.state.Tasks[op.ID]
+		if cur.Meta.Version != op.ExpectedVersion {
+			conflicts = append(conflicts, cur)
+		}
+	}
+	if len(conflicts) > 0 {
+		return nil, 0, &ConflictError{Conflicts: conflicts}
+	}
+
+	now := st.now()
+	cand := cloneState(st.state)
+	for _, op := range ops {
+		t := cand.Tasks[op.ID]
+		oldStatus := t.Content.Status
+		c := op.Content
+		if c.ChildIDs == nil {
+			c.ChildIDs = []string{}
+		}
+		if c.Tags == nil {
+			c.Tags = []string{}
+		}
+		t.Content = c
+		t.Meta = applyCompletion(t.Meta, oldStatus, c.Status, now)
+		t.Meta.Version++
+		t.Meta.UpdatedAt = now
+		cand.Tasks[op.ID] = t
+	}
+	if err := validateState(cand); err != nil {
+		return nil, 0, err
+	}
+	cand.StateVersion++
+	st.state = cand
+	st.rebuildIndex()
+	if err := st.save(); err != nil {
+		return nil, 0, err
+	}
+	out := make([]Task, 0, len(ops))
+	for _, op := range ops {
+		out = append(out, st.state.Tasks[op.ID])
+	}
+	return out, st.state.StateVersion, nil
+}
