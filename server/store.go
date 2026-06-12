@@ -309,3 +309,41 @@ func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
 	}
 	return out, st.state.StateVersion, nil
 }
+
+func removeString(s []string, v string) []string {
+	out := s[:0]
+	for _, x := range s {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func (st *Store) Delete(id string) (uint64, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if _, ok := st.state.Tasks[id]; !ok {
+		return 0, ErrNotFound
+	}
+	now := st.now()
+	cand := cloneState(st.state)
+	if pid, ok := st.parent[id]; ok {
+		p := cand.Tasks[pid]
+		p.Content.ChildIDs = removeString(p.Content.ChildIDs, id)
+		p.Meta.Version++
+		p.Meta.UpdatedAt = now
+		cand.Tasks[pid] = p
+	}
+	delete(cand.Tasks, id) // its former children become unreferenced roots
+	if err := validateState(cand); err != nil {
+		return 0, err
+	}
+	cand.StateVersion++
+	if err := st.saveState(cand); err != nil {
+		return 0, err
+	}
+	st.state = cand
+	st.rebuildIndex()
+	return st.state.StateVersion, nil
+}
