@@ -4,6 +4,8 @@ const Client = @import("api/client.zig").Client;
 const task = @import("core/task.zig");
 const types = @import("api/types.zig");
 const formatter = @import("formatter.zig");
+const view = @import("core/view.zig");
+const argparse = @import("core/args.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -27,9 +29,7 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
 
     if (std.mem.eql(u8, cmd, "show")) {
-        const tasks = try client.fetchTasks();
-        try formatter.render(allocator, &out.interface, tasks);
-        try out.interface.flush();
+        try runShow(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "add")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat add <title> [priority]\n", .{});
@@ -43,7 +43,12 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Usage: seshat delete <id>\n", .{});
             return error.InvalidArgs;
         }
-        try client.deleteTask(args[2]);
+        const tasks = try client.fetchTasks();
+        const t = view.resolve(tasks, args[2]) catch |err| {
+            reportResolveError(err, args[2]);
+            return;
+        };
+        try client.deleteTask(t.id);
     } else if (std.mem.eql(u8, cmd, "done")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat done <id>\n", .{});
@@ -58,26 +63,149 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-// markDone fetches the task fresh, flips status to done, sends a batch update
-// with its current version. A conflict is reported plainly.
-fn markDone(client: *Client, id: []const u8) !void {
+const show_specs = [_]argparse.OptionSpec{
+    .{ .name = "sort", .kind = .value },
+    .{ .name = "filter", .kind = .multi },
+    .{ .name = "open", .kind = .boolean },
+    .{ .name = "flat", .kind = .boolean },
+    .{ .name = "detailed", .kind = .boolean },
+    .{ .name = "json", .kind = .boolean },
+    .{ .name = "no-color", .kind = .boolean },
+};
+
+fn runShow(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    client: *Client,
+    out: *std.Io.Writer,
+    flag_argv: []const []const u8,
+) !void {
+    var parsed = argparse.parse(allocator, flag_argv, &show_specs) catch |err| {
+        std.debug.print("Bad arguments to `show`: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer argparse.deinit(allocator, &parsed);
+
+    const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s));
     const tasks = try client.fetchTasks();
-    for (tasks) |t| {
-        if (std.mem.eql(u8, t.id, id)) {
-            var content = t.content;
-            content.status = .done;
-            const ops = [_]types.UpdateOp{.{ .id = id, .content = content, .expected_version = t.meta.version }};
-            client.updateTasks(&ops) catch |err| {
-                if (err == error.Conflict) {
-                    std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
-                    return;
+    var idx = try view.Index.build(allocator, tasks);
+    defer idx.deinit();
+
+    // --- build Filters ---
+    var status_list = std.ArrayList(task.Status).empty;
+    defer status_list.deinit(allocator);
+    var tag_list = std.ArrayList([]const u8).empty;
+    defer tag_list.deinit(allocator);
+    var overdue = false;
+
+    if (parsed.getBool("open")) {
+        try status_list.append(allocator, .todo);
+        try status_list.append(allocator, .in_progress);
+    }
+    for (parsed.getMulti("filter")) |expr| {
+        if (std.mem.startsWith(u8, expr, "tag:")) {
+            try tag_list.append(allocator, expr["tag:".len..]);
+        } else if (std.mem.startsWith(u8, expr, "status:")) {
+            var it = std.mem.splitScalar(u8, expr["status:".len..], ',');
+            while (it.next()) |s| {
+                if (std.meta.stringToEnum(task.Status, s)) |st| {
+                    try status_list.append(allocator, st);
+                } else {
+                    std.debug.print("Unknown status in filter: {s}\n", .{s});
+                    return error.InvalidArgs;
                 }
-                return err;
-            };
-            return;
+            }
+        } else if (std.mem.eql(u8, expr, "overdue")) {
+            overdue = true;
+        } else {
+            std.debug.print("Unknown filter: {s}\n", .{expr});
+            return error.InvalidArgs;
         }
     }
-    std.debug.print("No task with id {s}\n", .{id});
+
+    const filters = view.Filters{
+        .roots_only = !parsed.getBool("flat"),
+        .tags = tag_list.items,
+        .statuses = status_list.items,
+        .overdue = overdue,
+    };
+
+    // --- sort strategy ---
+    const strategy: view.Strategy = blk: {
+        const s = parsed.getValue("sort") orelse break :blk .urgency;
+        break :blk std.meta.stringToEnum(view.Strategy, s) orelse {
+            std.debug.print("Unknown sort strategy: {s}\n", .{s});
+            return error.InvalidArgs;
+        };
+    };
+
+    // --- run pipeline ---
+    const selected = try view.select(allocator, tasks, &idx, filters, now);
+    defer allocator.free(selected);
+    view.rank(selected, strategy, now);
+
+    if (parsed.getBool("json")) {
+        try formatter.renderJson(out, selected);
+        try out.flush();
+        return;
+    }
+
+    if (selected.len == 0) {
+        std.debug.print("No tasks match.\n", .{});
+        return;
+    }
+
+    var opts = if (parsed.getBool("detailed")) formatter.RenderOptions.detailed() else formatter.RenderOptions.compact();
+    opts.width = width_blk: {
+        if (init.environ_map.get("COLUMNS")) |c| {
+            if (std.fmt.parseInt(usize, c, 10)) |w| {
+                if (w > 0) break :width_blk w;
+            } else |_| {}
+        }
+        break :width_blk @as(usize, client.config.width);
+    };
+    if (parsed.getBool("flat")) opts.show_children = false;
+    opts.color = resolveColor(init, parsed.getBool("no-color"));
+
+    try formatter.render(out, opts, now, selected, &idx);
+    try out.flush();
+}
+
+// auto -> on only if stdout is a TTY and NO_COLOR is unset; --no-color forces off.
+// Uses std.Io.File.isTty (Zig 0.16 API) instead of posix.isatty.
+fn resolveColor(init: std.process.Init, no_color_flag: bool) formatter.ColorMode {
+    if (no_color_flag) return .off;
+    if (init.environ_map.get("NO_COLOR") != null) return .off;
+    const is_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    if (is_tty) return .on;
+    return .off;
+}
+
+fn reportResolveError(err: view.ResolveError, id_prefix: []const u8) void {
+    switch (err) {
+        error.NoSuchId => std.debug.print("No task matching id `{s}`\n", .{id_prefix}),
+        error.AmbiguousId => std.debug.print("Ambiguous id `{s}` — matches multiple tasks\n", .{id_prefix}),
+    }
+}
+
+// markDone fetches fresh, resolves the id prefix, flips status to done, sends a
+// batch update with the current version. A conflict is reported plainly.
+fn markDone(client: *Client, id_prefix: []const u8) !void {
+    const tasks = try client.fetchTasks();
+    const t = view.resolve(tasks, id_prefix) catch |err| {
+        reportResolveError(err, id_prefix);
+        return;
+    };
+    var content = t.content;
+    content.status = .done;
+    const ops = [_]types.UpdateOp{.{ .id = t.id, .content = content, .expected_version = t.meta.version }};
+    client.updateTasks(&ops) catch |err| {
+        if (err == error.Conflict) {
+            std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
+            return;
+        }
+        return err;
+    };
 }
 
 fn usage() void {
@@ -85,10 +213,17 @@ fn usage() void {
         \\Usage: seshat <command> [args]
         \\
         \\Commands:
-        \\  show              Show tasks (forest)
+        \\  show [flags]      Show tasks. Flags:
+        \\                      --sort <priority|due|title|created|urgency>  (default urgency)
+        \\                      --filter <tag:NAME|status:S1,S2|overdue>     (repeatable, AND)
+        \\                      --open        only todo/in_progress
+        \\                      --flat        rank all tasks, no tree
+        \\                      --detailed    rich output (tags, dates, ids, description)
+        \\                      --json        machine-readable Task array
+        \\                      --no-color    disable color
         \\  add <title> [prio] Add a top-level task
-        \\  delete <id>       Delete a task by id
-        \\  done <id>         Mark a task done by id
+        \\  delete <id>       Delete a task (id prefix ok)
+        \\  done <id>         Mark a task done (id prefix ok)
         \\
     , .{});
 }
