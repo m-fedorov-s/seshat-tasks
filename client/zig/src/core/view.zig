@@ -42,3 +42,88 @@ test "index identifies roots" {
     try std.testing.expect(idx.isRoot("root"));
     try std.testing.expect(!idx.isRoot("kid"));
 }
+
+pub const Filters = struct {
+    roots_only: bool = true,
+    tags: []const []const u8 = &.{},
+    statuses: []const Status = &.{},
+    overdue: bool = false,
+};
+
+test "select applies AND-combined filters over the top level" {
+    const a = std.testing.allocator;
+    const tasks = [_]Task{
+        .{ .id = "a", .content = .{ .title = "a", .status = .todo, .tags = @constCast(&[_][]const u8{"work"}), .due_at = 50 }, .meta = .{ .created_at = 1 } },
+        .{ .id = "b", .content = .{ .title = "b", .status = .done, .tags = @constCast(&[_][]const u8{"work"}) }, .meta = .{ .created_at = 2 } },
+        .{ .id = "c", .content = .{ .title = "c", .status = .todo }, .meta = .{ .created_at = 3 } },
+        .{ .id = "kid", .content = .{ .title = "k", .status = .todo, .tags = @constCast(&[_][]const u8{"work"}) }, .meta = .{ .created_at = 4 } },
+    };
+    // make "kid" a child of "a"
+    var tasks_mut = tasks;
+    tasks_mut[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+
+    var idx = try Index.build(a, &tasks_mut);
+    defer idx.deinit();
+
+    // forest + tag:work + status todo  => only "a" (b is done, c lacks tag, kid is not a root)
+    const now: i64 = 100;
+    const sel = try select(a, &tasks_mut, &idx, .{
+        .roots_only = true,
+        .tags = &[_][]const u8{"work"},
+        .statuses = &[_]Status{.todo},
+    }, now);
+    defer a.free(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("a", sel[0].id);
+
+    // overdue: due_at 50 < now 100 and todo => "a" is overdue
+    const od = try select(a, &tasks_mut, &idx, .{ .overdue = true }, now);
+    defer a.free(od);
+    try std.testing.expectEqual(@as(usize, 1), od.len);
+    try std.testing.expectEqualStrings("a", od[0].id);
+}
+
+fn hasAllTags(t: Task, tags: []const []const u8) bool {
+    for (tags) |want| {
+        var found = false;
+        for (t.content.tags) |have| {
+            if (std.mem.eql(u8, want, have)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn statusInSet(s: Status, set: []const Status) bool {
+    for (set) |x| if (x == s) return true;
+    return false;
+}
+
+fn isOverdue(t: Task, now: i64) bool {
+    const due = t.content.due_at orelse return false;
+    if (t.content.status == .done or t.content.status == .cancelled) return false;
+    return due < now;
+}
+
+fn passes(t: Task, idx: *const Index, f: Filters, now: i64) bool {
+    if (f.roots_only and !idx.isRoot(t.id)) return false;
+    if (f.tags.len != 0 and !hasAllTags(t, f.tags)) return false;
+    if (f.statuses.len != 0 and !statusInSet(t.content.status, f.statuses)) return false;
+    if (f.overdue and !isOverdue(t, now)) return false;
+    return true;
+}
+
+// Returns a newly-allocated slice of the tasks that pass all filters.
+// Caller owns the slice (free with allocator.free); the Task values are shallow
+// copies referencing the original (arena-backed) string data.
+pub fn select(allocator: std.mem.Allocator, tasks: []const Task, idx: *const Index, f: Filters, now: i64) ![]Task {
+    var list: std.ArrayList(Task) = .empty;
+    errdefer list.deinit(allocator);
+    for (tasks) |t| {
+        if (passes(t, idx, f, now)) try list.append(allocator, t);
+    }
+    return list.toOwnedSlice(allocator);
+}
