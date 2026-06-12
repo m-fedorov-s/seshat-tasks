@@ -216,6 +216,7 @@ test "render: color-on emits SGR escapes" {
 // Truncate to at most `max_cols` Unicode codepoints, never splitting a codepoint.
 // (Codepoint count, not grapheme width — wide chars may still misalign; documented v1 limit.)
 pub fn truncateTitle(s: []const u8, max_cols: usize) []const u8 {
+    if (max_cols == 0) return s; // 0 = no width budget -> don't truncate (avoid blanking titles)
     var cols: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
@@ -234,12 +235,15 @@ pub fn renderJson(out: *std.Io.Writer, tasks: []const Task) !void {
 }
 
 test "truncateTitle never splits a UTF-8 codepoint" {
-    // "héllo" where é is 2 bytes; truncating to 3 display cols must not cut mid-codepoint.
+    // "héllo" where é is 2 bytes; truncating to 3 codepoints yields exactly "hél".
     const s = "h\u{00e9}llo";
     const out = truncateTitle(s, 3);
-    // valid UTF-8 prefix, length <= original
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
-    try std.testing.expect(out.len <= s.len);
+    try std.testing.expectEqualStrings("h\u{00e9}l", out);
+    // fits-entirely returns the whole string
+    try std.testing.expectEqualStrings(s, truncateTitle(s, 99));
+    // 0 = no budget -> full string (not blank)
+    try std.testing.expectEqualStrings(s, truncateTitle(s, 0));
 }
 
 test "renderJson emits a Task array" {
