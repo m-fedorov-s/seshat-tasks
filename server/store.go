@@ -126,8 +126,10 @@ func (st *Store) Snapshot() State {
 func cloneState(s State) State {
 	ts := make(map[string]Task, len(s.Tasks))
 	for k, v := range s.Tasks {
-		v.Content.ChildIDs = append([]string(nil), v.Content.ChildIDs...)
-		v.Content.Tags = append([]string(nil), v.Content.Tags...)
+		// Clone into a non-nil base so empty slices stay non-nil and serialize as
+		// JSON `[]` (not `null`), matching the stored state and the schema contract.
+		v.Content.ChildIDs = append([]string{}, v.Content.ChildIDs...)
+		v.Content.Tags = append([]string{}, v.Content.Tags...)
 		ts[k] = v
 	}
 	return State{StateVersion: s.StateVersion, Tasks: ts}

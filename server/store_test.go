@@ -80,6 +80,18 @@ func TestSnapshot(t *testing.T) {
 	}
 }
 
+func TestSnapshotKeepsEmptySlicesNonNil(t *testing.T) {
+	st := newTestStore(t)
+	task, _, _ := st.Add(AddRequest{Content: validContent("x")})
+	got := st.Snapshot().Tasks[task.ID]
+	if got.Content.ChildIDs == nil {
+		t.Fatal("snapshot child_ids must stay non-nil so JSON emits [] not null")
+	}
+	if got.Content.Tags == nil {
+		t.Fatal("snapshot tags must stay non-nil so JSON emits [] not null")
+	}
+}
+
 func validContent(title string) Content {
 	return Content{Title: title, Status: StatusTodo, Priority: PriorityNone}
 }
