@@ -63,6 +63,8 @@ func writeErr(w http.ResponseWriter, err error) {
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	snap := s.store.Snapshot()
 	etag := `"` + strconv.FormatUint(snap.StateVersion, 10) + `"`
+	// Per RFC 9110 a 304 must also carry the ETag, so set it before branching.
+	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -71,7 +73,6 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	for _, t := range snap.Tasks {
 		tasks = append(tasks, t)
 	}
-	w.Header().Set("ETag", etag)
 	writeJSON(w, http.StatusOK, map[string]any{"state_version": snap.StateVersion, "tasks": tasks})
 }
 
