@@ -72,12 +72,12 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8, specs: []co
     var no_more_flags = false;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (no_more_flags or !std.mem.startsWith(u8, arg, "--")) {
-            try result.positionals.append(allocator, arg);
+        if (!no_more_flags and std.mem.eql(u8, arg, "--")) {
+            no_more_flags = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--")) {
-            no_more_flags = true;
+        if (no_more_flags or !std.mem.startsWith(u8, arg, "--")) {
+            try result.positionals.append(allocator, arg);
             continue;
         }
         const body = arg[2..];
@@ -90,6 +90,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8, specs: []co
         }
         const spec = findSpec(specs, name) orelse return error.UnknownFlag;
         switch (spec.kind) {
+            // boolean flags are presence-only; any `=value` (inline_val) is intentionally ignored
             .boolean => try result.bools.put(name, {}),
             .value, .multi => {
                 const val = inline_val orelse blk: {
@@ -108,6 +109,21 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8, specs: []co
         }
     }
     return result;
+}
+
+test "parser treats args after -- as positionals" {
+    const a = std.testing.allocator;
+    const specs = [_]OptionSpec{
+        .{ .name = "flat", .kind = .boolean },
+    };
+    const argv = [_][]const u8{ "--flat", "--", "--not-a-flag", "pos" };
+    var parsed = try parse(a, &argv, &specs);
+    defer deinit(a, &parsed);
+
+    try std.testing.expect(parsed.getBool("flat"));
+    try std.testing.expectEqual(@as(usize, 2), parsed.positionals.items.len);
+    try std.testing.expectEqualStrings("--not-a-flag", parsed.positionals.items[0]);
+    try std.testing.expectEqualStrings("pos", parsed.positionals.items[1]);
 }
 
 pub fn deinit(allocator: std.mem.Allocator, p: *ParsedArgs) void {
