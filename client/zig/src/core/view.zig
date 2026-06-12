@@ -177,3 +177,100 @@ pub fn urgency(t: Task, now: i64) i64 {
     if (t.content.status == .done or t.content.status == .cancelled) return 0;
     return priorityWeight(t.content.priority) + dueFactor(t, now) + ageFactor(t, now);
 }
+
+test "rank: priority strategy with completed sink and stable tiebreak" {
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        .{ .id = "z", .content = .{ .title = "z", .priority = .low }, .meta = .{ .created_at = 1 } },
+        .{ .id = "d", .content = .{ .title = "d", .priority = .high, .status = .done }, .meta = .{ .created_at = 2 } },
+        .{ .id = "h1", .content = .{ .title = "h1", .priority = .high }, .meta = .{ .created_at = 5 } },
+        .{ .id = "h2", .content = .{ .title = "h2", .priority = .high }, .meta = .{ .created_at = 3 } },
+    };
+    rank(&tasks, .priority, now);
+    // high tasks first, tie broken by created_at asc (h2 before h1), then low, done sinks last
+    try std.testing.expectEqualStrings("h2", tasks[0].id);
+    try std.testing.expectEqualStrings("h1", tasks[1].id);
+    try std.testing.expectEqualStrings("z", tasks[2].id);
+    try std.testing.expectEqualStrings("d", tasks[3].id);
+}
+
+test "rank: title strategy is case-insensitive" {
+    const now: i64 = 0;
+    var tasks = [_]Task{
+        .{ .id = "1", .content = .{ .title = "banana" }, .meta = .{} },
+        .{ .id = "2", .content = .{ .title = "Apple" }, .meta = .{} },
+    };
+    rank(&tasks, .title, now);
+    try std.testing.expectEqualStrings("Apple", tasks[0].content.title);
+}
+
+fn isCompleted(t: Task) bool {
+    return t.content.status == .done or t.content.status == .cancelled;
+}
+
+// Three-way string compare, case-insensitive (ASCII). <0,0,>0.
+fn ciCmp(a: []const u8, b: []const u8) i32 {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const ca = std.ascii.toLower(a[i]);
+        const cb = std.ascii.toLower(b[i]);
+        if (ca != cb) return if (ca < cb) -1 else 1;
+    }
+    if (a.len == b.len) return 0;
+    return if (a.len < b.len) -1 else 1;
+}
+
+const RankCtx = struct { strategy: Strategy, now: i64 };
+
+// true if a should sort before b.
+fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
+    // 1. completed always sinks
+    const ca = isCompleted(a);
+    const cb = isCompleted(b);
+    if (ca != cb) return !ca; // non-completed (false) comes first
+
+    // 2. strategy key
+    const key: ?bool = switch (ctx.strategy) {
+        .priority => blk: {
+            const pa = priorityWeight(a.content.priority);
+            const pb = priorityWeight(b.content.priority);
+            if (pa != pb) break :blk pa > pb; // higher priority first
+            break :blk null;
+        },
+        .urgency => blk: {
+            const ua = urgency(a, ctx.now);
+            const ub = urgency(b, ctx.now);
+            if (ua != ub) break :blk ua > ub; // higher urgency first
+            break :blk null;
+        },
+        .due => blk: {
+            // undated sinks; otherwise soonest (smallest due_at) first
+            const da = a.content.due_at;
+            const db = b.content.due_at;
+            if (da == null and db == null) break :blk null;
+            if (da == null) break :blk false; // a undated -> after b
+            if (db == null) break :blk true; // b undated -> a first
+            if (da.? != db.?) break :blk da.? < db.?;
+            break :blk null;
+        },
+        .title => blk: {
+            const c = ciCmp(a.content.title, b.content.title);
+            if (c != 0) break :blk c < 0;
+            break :blk null;
+        },
+        .created => blk: {
+            if (a.meta.created_at != b.meta.created_at) break :blk a.meta.created_at > b.meta.created_at; // newest first
+            break :blk null;
+        },
+    };
+    if (key) |k| return k;
+
+    // 3. stable tiebreak: created_at asc, then id asc
+    if (a.meta.created_at != b.meta.created_at) return a.meta.created_at < b.meta.created_at;
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+pub fn rank(tasks: []Task, strategy: Strategy, now: i64) void {
+    std.mem.sort(Task, tasks, RankCtx{ .strategy = strategy, .now = now }, lessThan);
+}
