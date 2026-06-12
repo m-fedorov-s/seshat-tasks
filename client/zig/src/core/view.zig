@@ -208,19 +208,6 @@ fn isCompleted(t: Task) bool {
     return t.content.status == .done or t.content.status == .cancelled;
 }
 
-// Three-way string compare, case-insensitive (ASCII). <0,0,>0.
-fn ciCmp(a: []const u8, b: []const u8) i32 {
-    const n = @min(a.len, b.len);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const ca = std.ascii.toLower(a[i]);
-        const cb = std.ascii.toLower(b[i]);
-        if (ca != cb) return if (ca < cb) -1 else 1;
-    }
-    if (a.len == b.len) return 0;
-    return if (a.len < b.len) -1 else 1;
-}
-
 const RankCtx = struct { strategy: Strategy, now: i64 };
 
 // true if a should sort before b.
@@ -255,22 +242,38 @@ fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
             break :blk null;
         },
         .title => blk: {
-            const c = ciCmp(a.content.title, b.content.title);
-            if (c != 0) break :blk c < 0;
+            const ord = std.ascii.orderIgnoreCase(a.content.title, b.content.title);
+            if (ord != .eq) break :blk ord == .lt;
             break :blk null;
         },
         .created => blk: {
-            if (a.meta.created_at != b.meta.created_at) break :blk a.meta.created_at > b.meta.created_at; // newest first
+            // newest first (larger created_at sorts earlier)
+            if (a.meta.created_at != b.meta.created_at) break :blk a.meta.created_at > b.meta.created_at;
             break :blk null;
         },
     };
     if (key) |k| return k;
 
-    // 3. stable tiebreak: created_at asc, then id asc
+    // stable tiebreak: oldest first, then id ascending (ids are unique -> total order)
     if (a.meta.created_at != b.meta.created_at) return a.meta.created_at < b.meta.created_at;
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
 pub fn rank(tasks: []Task, strategy: Strategy, now: i64) void {
-    std.mem.sort(Task, tasks, RankCtx{ .strategy = strategy, .now = now }, lessThan);
+    // lessThan is a strict total order (the created_at,id tiebreak resolves all
+    // ties), so stability is irrelevant; use the faster unstable sort.
+    std.mem.sortUnstable(Task, tasks, RankCtx{ .strategy = strategy, .now = now }, lessThan);
+}
+
+test "rank: due strategy sorts soonest first and sinks undated" {
+    const now: i64 = 0;
+    var tasks = [_]Task{
+        .{ .id = "undated", .content = .{ .title = "u" }, .meta = .{ .created_at = 1 } },
+        .{ .id = "late", .content = .{ .title = "l", .due_at = 500 }, .meta = .{ .created_at = 2 } },
+        .{ .id = "soon", .content = .{ .title = "s", .due_at = 100 }, .meta = .{ .created_at = 3 } },
+    };
+    rank(&tasks, .due, now);
+    try std.testing.expectEqualStrings("soon", tasks[0].id);
+    try std.testing.expectEqualStrings("late", tasks[1].id);
+    try std.testing.expectEqualStrings("undated", tasks[2].id);
 }
