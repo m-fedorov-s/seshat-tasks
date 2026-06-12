@@ -1,0 +1,11 @@
+{
+  "id": "01JROOTA00000000000000000",
+  "content": {
+    "title": "root with subtree",
+    "status": "todo",
+    "priority": "medium",
+    "child_ids": ["01JKIDA000000000000000000", "01JKIDB000000000000000000"],
+    "tags": []
+  },
+  "meta": { "created_at": 1718100000, "updated_at": 1718100000, "version": 1 }
+}

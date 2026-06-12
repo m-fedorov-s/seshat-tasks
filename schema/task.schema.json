@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seshat/task.schema.json",
+  "$defs": {
+    "status": { "enum": ["todo", "in_progress", "done", "cancelled"] },
+    "priority": { "enum": ["none", "low", "medium", "high"] },
+    "content": {
+      "type": "object",
+      "required": ["title", "status", "priority", "child_ids", "tags"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" },
+        "priority": { "$ref": "#/$defs/priority" },
+        "child_ids": { "type": "array", "items": { "type": "string" } },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "due_at": { "type": ["integer", "null"] },
+        "scheduled_at": { "type": ["integer", "null"] }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["created_at", "updated_at", "version"],
+      "properties": {
+        "created_at": { "type": "integer" },
+        "updated_at": { "type": "integer" },
+        "completed_at": { "type": ["integer", "null"] },
+        "version": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "content", "meta"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "content": { "$ref": "#/$defs/content" },
+        "meta": { "$ref": "#/$defs/meta" }
+      }
+    }
+  },
+  "$ref": "#/$defs/task"
+}

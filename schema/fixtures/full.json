@@ -1,0 +1,14 @@
+{
+  "id": "01J9Z3K7QABCDEF0123456789",
+  "content": {
+    "title": "Prepare omelet",
+    "description": "breakfast",
+    "status": "in_progress",
+    "priority": "high",
+    "child_ids": ["01JCHILDA0000000000000000", "01JCHILDB0000000000000000"],
+    "tags": ["cooking", "morning"],
+    "due_at": 1718200000,
+    "scheduled_at": 1718190000
+  },
+  "meta": { "created_at": 1718100000, "updated_at": 1718105000, "completed_at": null, "version": 3 }
+}

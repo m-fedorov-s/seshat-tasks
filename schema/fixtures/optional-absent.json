@@ -1,0 +1,5 @@
+{
+  "id": "01JABSENT0000000000000000",
+  "content": { "title": "sparse", "status": "todo", "priority": "low", "child_ids": [], "tags": [], "due_at": null, "scheduled_at": null },
+  "meta": { "created_at": 1718100000, "updated_at": 1718100000, "completed_at": null, "version": 1 }
+}

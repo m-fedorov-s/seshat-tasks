@@ -1,0 +1,5 @@
+{
+  "id": "01J000000000000000000ROOT",
+  "content": { "title": "a task", "status": "todo", "priority": "none", "child_ids": [], "tags": [] },
+  "meta": { "created_at": 1718100000, "updated_at": 1718100000, "version": 1 }
+}
