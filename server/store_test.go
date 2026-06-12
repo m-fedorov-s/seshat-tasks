@@ -160,3 +160,33 @@ func TestAddDoneSetsCompletedAt(t *testing.T) {
 		t.Fatal("expected completed_at set on creation as done")
 	}
 }
+
+func TestAddChildAtPosition(t *testing.T) {
+	st := newTestStore(t)
+	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
+	a, _, _ := st.Add(AddRequest{Content: validContent("a"), ParentID: &parent.ID})
+	b, _, _ := st.Add(AddRequest{Content: validContent("b"), ParentID: &parent.ID})
+
+	// insert c between a and b
+	mid := 1
+	c, _, err := st.Add(AddRequest{Content: validContent("c"), ParentID: &parent.ID, Position: &mid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := st.Snapshot().Tasks[parent.ID].Content.ChildIDs
+	want := []string{a.ID, c.ID, b.ID}
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("mid-insert: expected %v, got %v", want, got)
+	}
+
+	// out-of-range position clamps to append
+	big := 99
+	d, _, err := st.Add(AddRequest{Content: validContent("d"), ParentID: &parent.ID, Position: &big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = st.Snapshot().Tasks[parent.ID].Content.ChildIDs
+	if got[len(got)-1] != d.ID {
+		t.Fatalf("clamp-to-append: expected last=%s, got %v", d.ID, got)
+	}
+}
