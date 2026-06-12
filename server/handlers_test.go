@@ -1,0 +1,123 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func newTestServer(t *testing.T) (*Server, *Store) {
+	t.Helper()
+	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, secret: "s3cr3t"}
+	return srv, st
+}
+
+func do(t *testing.T, srv *Server, method, path, secret, body string, hdr map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if secret != "" {
+		req.Header.Set("Authorization", secret)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	srv.mux().ServeHTTP(rr, req)
+	return rr
+}
+
+func TestAuthRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "wrong", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestGetReturnsETag(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t", "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if rr.Header().Get("ETag") != `"0"` {
+		t.Fatalf(`expected ETag "0", got %q`, rr.Header().Get("ETag"))
+	}
+	var resp struct {
+		StateVersion uint64 `json:"state_version"`
+		Tasks        []Task `json:"tasks"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp.StateVersion != 0 || len(resp.Tasks) != 0 {
+		t.Fatalf("unexpected body: %+v", resp)
+	}
+}
+
+func TestGetNotModified(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t", "", map[string]string{"If-None-Match": `"0"`})
+	if rr.Code != http.StatusNotModified {
+		t.Fatalf("expected 304, got %d", rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatal("expected empty body on 304")
+	}
+}
+
+func TestAddThenGet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "POST", "/api/tasks/add", "s3cr3t", `{"content":{"title":"hi","status":"todo","priority":"none"}}`, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		StateVersion uint64 `json:"state_version"`
+		Task         Task   `json:"task"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp.Task.ID == "" || resp.StateVersion != 1 {
+		t.Fatalf("bad add response: %+v", resp)
+	}
+}
+
+func TestAddBadInputIs400(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "POST", "/api/tasks/add", "s3cr3t", `{not json`, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestUpdateConflictIs409(t *testing.T) {
+	srv, st := newTestServer(t)
+	task, _, _ := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}})
+	body := `{"updates":[{"id":"` + task.ID + `","content":{"title":"y","status":"todo","priority":"none"},"expected_version":99}]}`
+	rr := do(t, srv, "POST", "/api/tasks/update", "s3cr3t", body, nil)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", rr.Code)
+	}
+	var resp struct {
+		Conflicts []Task `json:"conflicts"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if len(resp.Conflicts) != 1 {
+		t.Fatalf("expected 1 conflict, got %+v", resp.Conflicts)
+	}
+}
+
+func TestDeleteHandler(t *testing.T) {
+	srv, st := newTestServer(t)
+	task, _, _ := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}})
+	body := `{"id":"` + task.ID + `"}`
+	rr := do(t, srv, "POST", "/api/tasks/delete", "s3cr3t", body, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
