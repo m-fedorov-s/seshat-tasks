@@ -277,3 +277,31 @@ test "rank: due strategy sorts soonest first and sinks undated" {
     try std.testing.expectEqualStrings("late", tasks[1].id);
     try std.testing.expectEqualStrings("undated", tasks[2].id);
 }
+
+pub const ResolveError = error{ NoSuchId, AmbiguousId };
+
+// Resolve a (possibly short) id prefix to exactly one task. Exact-id match also
+// works since an id is a prefix of itself. Empty prefix is never a match.
+pub fn resolve(tasks: []const Task, prefix: []const u8) ResolveError!Task {
+    if (prefix.len == 0) return error.NoSuchId;
+    var match: ?Task = null;
+    for (tasks) |t| {
+        if (std.mem.startsWith(u8, t.id, prefix)) {
+            if (match != null) return error.AmbiguousId;
+            match = t;
+        }
+    }
+    return match orelse error.NoSuchId;
+}
+
+test "resolve: unique prefix, ambiguous, not found" {
+    const tasks = [_]Task{
+        .{ .id = "01ABCDEF", .content = .{ .title = "a" }, .meta = .{} },
+        .{ .id = "01ABCXYZ", .content = .{ .title = "b" }, .meta = .{} },
+        .{ .id = "09ZZZZZZ", .content = .{ .title = "c" }, .meta = .{} },
+    };
+    try std.testing.expectEqualStrings("09ZZZZZZ", (try resolve(&tasks, "09")).id);
+    try std.testing.expectError(error.AmbiguousId, resolve(&tasks, "01ABC"));
+    try std.testing.expectError(error.NoSuchId, resolve(&tasks, "zzz"));
+    try std.testing.expectError(error.NoSuchId, resolve(&tasks, ""));
+}
