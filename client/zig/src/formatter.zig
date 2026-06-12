@@ -85,6 +85,13 @@ fn shortId(id: []const u8) []const u8 {
 
 // Render the already-selected, already-ranked top-level list. `idx` is the full
 // index over every fetched task, used to look up immediate children.
+//
+// Immediate children only — grandchildren are NOT expanded (a child with its own
+// children is annotated with `(+n)` instead). This caps output depth at 1.
+//
+// Color contract: this is a pure renderer with no TTY detection. The caller must
+// pre-resolve `opts.color` to `.on` or `.off`; `.auto` is treated as "not on"
+// (no color). main.zig resolves `.auto` from isatty/NO_COLOR before calling here.
 pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []const Task, idx: *const view.Index) !void {
     const sgr = Sgr.make(opts.color == .on);
     for (toplevel) |t| {
@@ -114,11 +121,14 @@ fn renderRow(out: *std.Io.Writer, opts: RenderOptions, sgr: Sgr, now: i64, t: Ta
     if (opts.show_id) try out.print("{s} ", .{shortId(t.id)});
     try out.writeAll(t.content.title);
 
-    // (+n) marker for an immediate child that itself has children
+    // (+n) marker for an immediate child that itself has children.
+    // Raw child_ids count — may include dangling/missing ids (server is authoritative).
     if (depth > 0 and t.content.child_ids.len > 0) {
         try out.print(" (+{d})", .{t.content.child_ids.len});
     }
 
+    // A non-overdue date inherits the row's current color; only overdue dates get
+    // their own escape (sgr.overdue) and an explicit reset.
     if (opts.show_dates) {
         if (t.content.due_at) |due| {
             const overdue = due < now and !isCompleted(t);
@@ -182,4 +192,23 @@ test "render: forest with immediate children, dim done child, missing marker, (+
     try std.testing.expect(std.mem.indexOf(u8, out, "[missing: ghost99]") != null);
     // Grandkid must NOT appear (immediate children only)
     try std.testing.expect(std.mem.indexOf(u8, out, "Grandkid") == null);
+}
+
+test "render: color-on emits SGR escapes" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "hi000001", .content = .{ .title = "Important", .status = .todo, .priority = .high }, .meta = .{} },
+    };
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.compact();
+    opts.color = .on;
+
+    try render(&buf.writer, opts, 0, &tasks, &idx);
+    const out = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") != null); // an SGR escape is present
+    try std.testing.expect(std.mem.indexOf(u8, out, "Important") != null);
 }
