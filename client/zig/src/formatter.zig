@@ -119,7 +119,7 @@ fn renderRow(out: *std.Io.Writer, opts: RenderOptions, sgr: Sgr, now: i64, t: Ta
     try out.print("{s}{s} ", .{ open, statusGlyph(t.content.status) });
 
     if (opts.show_id) try out.print("{s} ", .{shortId(t.id)});
-    try out.writeAll(t.content.title);
+    try out.writeAll(truncateTitle(t.content.title, opts.width));
 
     // (+n) marker for an immediate child that itself has children.
     // Raw child_ids count — may include dangling/missing ids (server is authoritative).
@@ -211,4 +211,46 @@ test "render: color-on emits SGR escapes" {
     const out = buf.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") != null); // an SGR escape is present
     try std.testing.expect(std.mem.indexOf(u8, out, "Important") != null);
+}
+
+// Truncate to at most `max_cols` Unicode codepoints, never splitting a codepoint.
+// (Codepoint count, not grapheme width — wide chars may still misalign; documented v1 limit.)
+pub fn truncateTitle(s: []const u8, max_cols: usize) []const u8 {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        if (cols + 1 > max_cols) return s[0..i];
+        i += len;
+        cols += 1;
+    }
+    return s;
+}
+
+pub fn renderJson(out: *std.Io.Writer, tasks: []const Task) !void {
+    var w = std.json.Stringify{ .writer = out, .options = .{} };
+    try w.write(tasks);
+    try out.writeAll("\n");
+}
+
+test "truncateTitle never splits a UTF-8 codepoint" {
+    // "héllo" where é is 2 bytes; truncating to 3 display cols must not cut mid-codepoint.
+    const s = "h\u{00e9}llo";
+    const out = truncateTitle(s, 3);
+    // valid UTF-8 prefix, length <= original
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(out.len <= s.len);
+}
+
+test "renderJson emits a Task array" {
+    const a = std.testing.allocator;
+    const tasks = [_]Task{
+        .{ .id = "x", .content = .{ .title = "t" }, .meta = .{ .version = 1 } },
+    };
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    try renderJson(&buf.writer, &tasks);
+    const out = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"x\"") != null);
+    try std.testing.expect(out[0] == '[');
 }
