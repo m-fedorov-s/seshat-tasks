@@ -83,6 +83,21 @@ fn shortId(id: []const u8) []const u8 {
     return id[0..@min(7, id.len)];
 }
 
+// Format a unix-seconds timestamp as YYYY-MM-DD into `buf`, returning the slice.
+// Uses std.time.epoch (UTC). Negative timestamps (pre-1970) clamp to epoch 0.
+fn formatDate(buf: []u8, unix_seconds: i64) []const u8 {
+    const secs: u64 = if (unix_seconds < 0) 0 else @intCast(unix_seconds);
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+    }) catch buf[0..0];
+}
+
 // Render the already-selected, already-ranked top-level list. `idx` is the full
 // index over every fetched task, used to look up immediate children.
 //
@@ -130,10 +145,14 @@ fn renderRow(out: *std.Io.Writer, opts: RenderOptions, sgr: Sgr, now: i64, t: Ta
     // A non-overdue date inherits the row's current color; only overdue dates get
     // their own escape (sgr.overdue) and an explicit reset.
     if (opts.show_dates) {
+        var datebuf: [16]u8 = undefined;
         if (t.content.due_at) |due| {
             const overdue = due < now and !isCompleted(t);
             const col = if (overdue) sgr.overdue else "";
-            try out.print(" {s}due:{d}{s}", .{ col, due, if (overdue) sgr.reset else "" });
+            try out.print(" {s}due:{s}{s}", .{ col, formatDate(&datebuf, due), if (overdue) sgr.reset else "" });
+        }
+        if (t.content.scheduled_at) |sched| {
+            try out.print(" sched:{s}", .{formatDate(&datebuf, sched)});
         }
     }
     if (opts.show_tags and t.content.tags.len > 0) {
@@ -257,4 +276,29 @@ test "renderJson emits a Task array" {
     const out = buf.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"x\"") != null);
     try std.testing.expect(out[0] == '[');
+}
+
+test "formatDate renders YYYY-MM-DD" {
+    var buf: [16]u8 = undefined;
+    // 2021-01-01T00:00:00Z = 1609459200
+    try std.testing.expectEqualStrings("2021-01-01", formatDate(&buf, 1609459200));
+    // 1970-01-01
+    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
+}
+
+test "detailed render shows due and scheduled dates formatted" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "d0000001", .content = .{ .title = "Dated", .status = .todo, .due_at = 1609459200, .scheduled_at = 1609459200 }, .meta = .{} },
+    };
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.detailed();
+    opts.color = .off;
+    try render(&buf.writer, opts, 0, &tasks, &idx);
+    const out = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "due:2021-01-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sched:2021-01-01") != null);
 }
