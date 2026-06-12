@@ -115,6 +115,12 @@ func (st *Store) Snapshot() State {
 	return cloneState(st.state)
 }
 
+// cloneState deep-copies the task map and the per-task slices (ChildIDs, Tags).
+// The nullable *int64 fields (DueAt, ScheduledAt, CompletedAt) are copied by
+// pointer and thus aliased with the live state. This is safe ONLY because every
+// mutation replaces Content/Meta wholesale (never writes through these pointers);
+// do not introduce in-place mutation through a cloned pointer or it will corrupt
+// the live state.
 func cloneState(s State) State {
 	ts := make(map[string]Task, len(s.Tasks))
 	for k, v := range s.Tasks {
