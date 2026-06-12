@@ -1,27 +1,35 @@
 # seshat
 
 A personal task manager built as a **server + client** system. The server is the source of
-truth; clients fetch and locally cache task data.
+truth; clients fetch task data from it.
 
 ## Layout
 
-- `server/` — Go HTTP server. Single-file (`main.go`), stores tasks in memory with a `Version`
-  counter. Auth via a shared `secret` sent in the `Authorization` header. Config (secret, port)
-  loaded from YAML. Endpoints under `/api/tasks/` (e.g. `/api/tasks/get`).
-  - `Task` = `{ title: string, priority: uint8 }`.
-- `client/fish/` — the original minimal client, written in fish shell. Reference implementation
-  for client behaviour (`add_task.fish`, `delete_task.fish`, `print_tasks.fish`).
-- `client/zig/` — an in-progress rewrite of the client in Zig. See `client/zig/CLAUDE.md` for
-  Zig-specific notes. This is where active client development happens.
-- `plans/` — design docs (e.g. `mode_a_design.md`).
+- `server/` — Go HTTP server (`package main`, split across `task.go` / `store.go` / `validate.go`
+  / `handlers.go` / `main.go`). Stores tasks in memory, persisted to an atomic-rewrite JSON file,
+  with a global `state_version`. Auth via a shared `secret` sent in the `Authorization` header.
+  Config (secret, port, data_file) from YAML. Endpoints under `/api/tasks/` (`get`, `add`,
+  `update`, `delete`). Optimistic concurrency via per-task `meta.version`.
+- `schema/` — the shared `Task` contract: `task.schema.json`, `SCHEMA.md`, golden `fixtures/`.
+  Enforced across server + client by `make schema-test`.
+- `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
+- `client/fish/` — thin fish *integration* (completions/prompt, shelling out to the Zig binary),
+  added in a later spec. The standalone fish client was retired.
+- `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans.
+
+## Task model
+
+A `Task` is `{ id (ULID), content, meta }`. `content` (user-editable) = title, description,
+`status` (todo/in_progress/done/cancelled), `priority` (none/low/medium/high), `child_ids`
+(ordered subtask ids — the hierarchy is a **forest**), tags, due_at, scheduled_at. `meta`
+(server-owned) = created_at, updated_at, completed_at, version. See `schema/SCHEMA.md`.
 
 ## Client behaviour
 
-A client:
-1. Reads config (server URL, secret, cache settings).
-2. On `show`, fetches tasks — serving from a local on-disk cache when fresh, otherwise hitting the
-   server and re-caching.
-3. Supports `add <title> <priority>` and `delete <title>`, which mutate via the server.
+The Zig client:
+1. Reads config (server URL, secret) from JSON (`SESHAT_CONFIG` or `~/.config/seshat/config.json`).
+2. On `show`, fetches all tasks from the server and renders the forest.
+3. Supports `add <title> [priority]`, `delete <id>`, and `done <id>`, mutating via the server.
 
 ## Conventions
 
