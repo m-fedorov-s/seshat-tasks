@@ -1,35 +1,28 @@
 const std = @import("std");
 const Task = @import("core/task.zig").Task;
 
-pub fn formatTasksJson(allocator: std.mem.Allocator, tasks: []const Task, max_lines: u32) ![]const u8 {
-    const limit = if (tasks.len > max_lines) max_lines else tasks.len;
-    const display_tasks = tasks[0..limit];
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-
-    var stringifier = std.json.Stringify{
-        .writer = &aw.writer,
-        .options = .{ .whitespace = .indent_2 },
-    };
-    try stringifier.write(display_tasks);
-    return aw.toOwnedSlice();
+// Renders the forest as indented lines. Roots = tasks not referenced by any
+// task's child_ids. Each line: "<indent>[status] (priority) title".
+pub fn render(allocator: std.mem.Allocator, out: *std.Io.Writer, tasks: []const Task) !void {
+    var by_id = std.StringHashMap(Task).init(allocator);
+    defer by_id.deinit();
+    var referenced = std.StringHashMap(void).init(allocator);
+    defer referenced.deinit();
+    for (tasks) |t| {
+        try by_id.put(t.id, t);
+        for (t.content.child_ids) |c| try referenced.put(c, {});
+    }
+    for (tasks) |t| {
+        if (referenced.contains(t.id)) continue;
+        try renderTask(out, by_id, t, 0);
+    }
 }
 
-test "formatTasksJson" {
-    const allocator = std.testing.allocator;
-    const tasks = [_]Task{
-        .{ .id = try allocator.dupe(u8, "1"), .title = try allocator.dupe(u8, "task1"), .priority = 1, .status = .todo },
-        .{ .id = try allocator.dupe(u8, "2"), .title = try allocator.dupe(u8, "task2"), .priority = 2, .status = .done },
-    };
-    defer {
-        for (tasks) |t| t.deinit(allocator);
+fn renderTask(out: *std.Io.Writer, by_id: std.StringHashMap(Task), t: Task, depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) try out.writeAll("  ");
+    try out.print("[{s}] ({s}) {s}\n", .{ @tagName(t.content.status), @tagName(t.content.priority), t.content.title });
+    for (t.content.child_ids) |cid| {
+        if (by_id.get(cid)) |child| try renderTask(out, by_id, child, depth + 1);
     }
-
-    const json = try formatTasksJson(allocator, &tasks, 1);
-    defer allocator.free(json);
-
-    // Verify it contains task1 but not task2 due to max_lines=1
-    try std.testing.expect(std.mem.indexOf(u8, json, "task1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "task2") == null);
 }
