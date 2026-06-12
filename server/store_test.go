@@ -50,3 +50,113 @@ func TestLoadRejectsInvalidFile(t *testing.T) {
 		t.Fatal("expected load to reject invalid state")
 	}
 }
+
+func TestSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.json")
+	st, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.state.Tasks["A"] = Task{
+		ID: "A",
+		Content: Content{
+			Title:       "Task A",
+			Description: "",
+			Status:      StatusInProgress,
+			Priority:    PriorityMedium,
+			ChildIDs:    []string{},
+			Tags:        []string{},
+		},
+		Meta: Meta{},
+	}
+
+	snapshot := st.Snapshot()
+	task, ok := snapshot.Tasks["A"]
+	if !ok {
+		t.Fatal("Task A not in snapshot")
+	}
+	if task.Content.Title != "Task A" {
+		t.Fatal("Task title is wrong in snapshot.")
+	}
+}
+
+func validContent(title string) Content {
+	return Content{Title: title, Status: StatusTodo, Priority: PriorityNone}
+}
+
+func TestAddRoot(t *testing.T) {
+	st := newTestStore(t)
+	task, sv, err := st.Add(AddRequest{Content: validContent("root task")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ID == "" || task.Meta.Version != 1 || task.Meta.CreatedAt != 1000 {
+		t.Fatalf("bad meta: %+v", task.Meta)
+	}
+	if sv != 1 {
+		t.Fatalf("expected state_version 1, got %d", sv)
+	}
+	if task.Content.ChildIDs == nil || task.Content.Tags == nil {
+		t.Fatal("nil slices must be normalized to empty")
+	}
+}
+
+func TestAddChildBumpsParentVersion(t *testing.T) {
+	st := newTestStore(t)
+	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
+	child, sv, err := st.Add(AddRequest{Content: validContent("child"), ParentID: &parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := st.Snapshot()
+	p := snap.Tasks[parent.ID]
+	if len(p.Content.ChildIDs) != 1 || p.Content.ChildIDs[0] != child.ID {
+		t.Fatalf("child not appended: %+v", p.Content.ChildIDs)
+	}
+	if p.Meta.Version != 2 {
+		t.Fatalf("expected parent version bumped to 2, got %d", p.Meta.Version)
+	}
+	if sv != 2 {
+		t.Fatalf("expected state_version 2, got %d", sv)
+	}
+}
+
+func TestAddUnknownParent(t *testing.T) {
+	st := newTestStore(t)
+	ghost := "nope"
+	_, _, err := st.Add(AddRequest{Content: validContent("x"), ParentID: &ghost})
+	if err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestAddRejectsNonEmptyChildIDs(t *testing.T) {
+	st := newTestStore(t)
+	c := validContent("x")
+	c.ChildIDs = []string{"whatever"}
+	_, _, err := st.Add(AddRequest{Content: c})
+	if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("expected *ValidationError, got %v", err)
+	}
+}
+
+func TestAddRejectsBadTitle(t *testing.T) {
+	st := newTestStore(t)
+	_, _, err := st.Add(AddRequest{Content: validContent("   ")})
+	if _, ok := err.(*ValidationError); !ok {
+		t.Fatalf("expected *ValidationError, got %v", err)
+	}
+}
+
+func TestAddDoneSetsCompletedAt(t *testing.T) {
+	st := newTestStore(t)
+	c := validContent("done one")
+	c.Status = StatusDone
+	task, _, err := st.Add(AddRequest{Content: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Meta.CompletedAt == nil || *task.Meta.CompletedAt != 1000 {
+		t.Fatal("expected completed_at set on creation as done")
+	}
+}

@@ -130,3 +130,108 @@ func cloneState(s State) State {
 	}
 	return State{StateVersion: s.StateVersion, Tasks: ts}
 }
+
+type AddRequest struct {
+	Content  Content `json:"content"`
+	ParentID *string `json:"parent_id"`
+	Position *int    `json:"position"`
+}
+
+func validateContent(c Content) error {
+	if len(c.Title) == 0 || onlySpace(c.Title) {
+		return &ValidationError{"title must be non-empty"}
+	}
+	if !c.Status.Valid() {
+		return &ValidationError{"unknown status: " + string(c.Status)}
+	}
+	if !c.Priority.Valid() {
+		return &ValidationError{"unknown priority: " + string(c.Priority)}
+	}
+	return nil
+}
+
+func onlySpace(s string) bool {
+	for _, r := range s {
+		if r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+// applyCompletion sets/clears completed_at on a status transition (§2.6).
+func applyCompletion(m Meta, old, next Status, now int64) Meta {
+	if !old.Terminal() && next.Terminal() {
+		m.CompletedAt = &now
+	} else if old.Terminal() && !next.Terminal() {
+		m.CompletedAt = nil
+	}
+	return m
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func insertAt(s []string, i int, v string) []string {
+	s = append(s, "")
+	copy(s[i+1:], s[i:])
+	s[i] = v
+	return s
+}
+
+func (st *Store) Add(req AddRequest) (Task, uint64, error) {
+	if err := validateContent(req.Content); err != nil {
+		return Task{}, 0, err
+	}
+	if len(req.Content.ChildIDs) > 0 {
+		return Task{}, 0, &ValidationError{"child_ids must be empty on add"}
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	now := st.now()
+	c := req.Content
+	c.ChildIDs = []string{}
+	if c.Tags == nil {
+		c.Tags = []string{}
+	}
+	id := st.newID()
+	t := Task{ID: id, Content: c, Meta: Meta{CreatedAt: now, UpdatedAt: now, Version: 1}}
+	t.Meta = applyCompletion(t.Meta, StatusTodo, c.Status, now)
+
+	cand := cloneState(st.state)
+	cand.Tasks[id] = t
+
+	if req.ParentID != nil {
+		p, ok := cand.Tasks[*req.ParentID]
+		if !ok {
+			return Task{}, 0, ErrNotFound
+		}
+		pos := len(p.Content.ChildIDs)
+		if req.Position != nil {
+			pos = clamp(*req.Position, 0, len(p.Content.ChildIDs))
+		}
+		p.Content.ChildIDs = insertAt(p.Content.ChildIDs, pos, id)
+		p.Meta.Version++
+		p.Meta.UpdatedAt = now
+		cand.Tasks[*req.ParentID] = p
+	}
+
+	if err := validateState(cand); err != nil {
+		return Task{}, 0, err
+	}
+	cand.StateVersion++
+	st.state = cand
+	st.rebuildIndex()
+	if err := st.save(); err != nil {
+		return Task{}, 0, err
+	}
+	return st.state.Tasks[id], st.state.StateVersion, nil
+}
