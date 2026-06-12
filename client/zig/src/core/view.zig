@@ -127,3 +127,53 @@ pub fn select(allocator: std.mem.Allocator, tasks: []const Task, idx: *const Ind
     }
     return list.toOwnedSlice(allocator);
 }
+
+test "urgency score: priority + due + age, completed sinks to zero" {
+    const week: i64 = 7 * 24 * 3600;
+    const now: i64 = 100 * week;
+
+    // high priority, overdue, ~2 weeks old
+    const a = Task{ .id = "a", .content = .{ .title = "a", .priority = .high, .due_at = now - 10 }, .meta = .{ .created_at = now - 2 * week } };
+    // none priority, no due, fresh
+    const b = Task{ .id = "b", .content = .{ .title = "b" }, .meta = .{ .created_at = now } };
+    // high priority but done
+    const c = Task{ .id = "c", .content = .{ .title = "c", .priority = .high, .status = .done, .due_at = now - 10 }, .meta = .{ .created_at = now - 2 * week } };
+
+    try std.testing.expectEqual(@as(i64, 5 + 8 + 2), urgency(a, now)); // 5 prio + 8 overdue + 2 age
+    try std.testing.expectEqual(@as(i64, 0), urgency(b, now));
+    try std.testing.expectEqual(@as(i64, 0), urgency(c, now)); // done -> 0
+}
+
+const DAY: i64 = 24 * 3600;
+const WEEK: i64 = 7 * DAY;
+
+fn priorityWeight(p: taskmod.Priority) i64 {
+    return switch (p) {
+        .none => 0,
+        .low => 1,
+        .medium => 3,
+        .high => 5,
+    };
+}
+
+fn dueFactor(t: Task, now: i64) i64 {
+    const due = t.content.due_at orelse return 0;
+    const delta = due - now; // negative => overdue
+    if (delta < 0) return 8;
+    if (delta <= 1 * DAY) return 6;
+    if (delta <= 3 * DAY) return 4;
+    if (delta <= 7 * DAY) return 2;
+    return 0;
+}
+
+fn ageFactor(t: Task, now: i64) i64 {
+    const age = now - t.meta.created_at;
+    if (age <= 0) return 0;
+    const weeks = @divFloor(age, WEEK);
+    return @min(weeks, 4);
+}
+
+pub fn urgency(t: Task, now: i64) i64 {
+    if (t.content.status == .done or t.content.status == .cancelled) return 0;
+    return priorityWeight(t.content.priority) + dueFactor(t, now) + ageFactor(t, now);
+}
