@@ -72,3 +72,20 @@ func TestUnknownFieldsTolerated(t *testing.T) {
 		t.Fatal("known fields must still decode")
 	}
 }
+
+// The server tolerates an unknown enum value at the PARSE layer (it decodes
+// without error) and rejects it only on WRITE via validateContent. The Zig
+// client maps unknowns to a fallback; this asserts the Go no-panic half of §8.3.
+func TestUnknownEnumDecodesWithoutError(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(schemaDir, "fixtures", "unknown-enum.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var task Task
+	if err := json.Unmarshal(b, &task); err != nil {
+		t.Fatalf("unknown enum must decode without error, got %v", err)
+	}
+	if task.Content.Status.Valid() {
+		t.Fatal("expected the unknown status to be reported invalid")
+	}
+}
