@@ -1,0 +1,20 @@
+# Zig client build artifacts
+client/zig/.zig-cache/
+client/zig/zig-out/
+
+# Server runtime data + atomic-write temp files
+server/seshat-data.json
+seshat-data.json
+.seshat-*.tmp
+
+# Local config (contains the shared secret)
+config.yaml
+server/config.yaml
+
+# OS / editor noise
+*.swp
+.DS_Store
+
+.roo
+plans/
+docs/
