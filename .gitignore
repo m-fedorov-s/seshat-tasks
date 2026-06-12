@@ -18,3 +18,9 @@ server/config.yaml
 .roo
 plans/
 docs/
+
+# Go build binary
+/server/seshat
+
+# Claude local settings
+.claude/settings.local.json
