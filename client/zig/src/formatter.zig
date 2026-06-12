@@ -1,6 +1,7 @@
 const std = @import("std");
-const Task = @import("core/task.zig").Task;
 const taskmod = @import("core/task.zig");
+const Task = taskmod.Task;
+const view = @import("core/view.zig");
 const Status = taskmod.Status;
 const Priority = taskmod.Priority;
 
@@ -64,7 +65,7 @@ const Sgr = struct {
             .high => self.high,
             .medium => self.medium,
             .low => self.low,
-            .none => "",
+            .none => "", // no priority color
         };
     }
 };
@@ -79,33 +80,65 @@ fn statusGlyph(s: Status) []const u8 {
 }
 
 fn shortId(id: []const u8) []const u8 {
-    return id[0..@min(@as(usize, 7), id.len)];
+    return id[0..@min(7, id.len)];
 }
 
-// Renders the forest as indented lines. Roots = tasks not referenced by any
-// task's child_ids. Each line: "<indent>[status] (priority) title".
-pub fn render(allocator: std.mem.Allocator, out: *std.Io.Writer, tasks: []const Task) !void {
-    var by_id = std.StringHashMap(Task).init(allocator);
-    defer by_id.deinit();
-    var referenced = std.StringHashMap(void).init(allocator);
-    defer referenced.deinit();
-    for (tasks) |t| {
-        try by_id.put(t.id, t);
-        for (t.content.child_ids) |c| try referenced.put(c, {});
-    }
-    for (tasks) |t| {
-        if (referenced.contains(t.id)) continue;
-        try renderTask(out, by_id, t, 0);
+// Render the already-selected, already-ranked top-level list. `idx` is the full
+// index over every fetched task, used to look up immediate children.
+pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []const Task, idx: *const view.Index) !void {
+    const sgr = Sgr.make(opts.color == .on);
+    for (toplevel) |t| {
+        try renderRow(out, opts, sgr, now, t, 0, false);
+        if (opts.show_children) {
+            for (t.content.child_ids) |cid| {
+                if (idx.by_id.get(cid)) |child| {
+                    try renderRow(out, opts, sgr, now, child, 1, isCompleted(child));
+                } else {
+                    try out.print("  └─ {s}[missing: {s}]{s}\n", .{ sgr.faint, shortId(cid), sgr.reset });
+                }
+            }
+        }
     }
 }
 
-fn renderTask(out: *std.Io.Writer, by_id: std.StringHashMap(Task), t: Task, depth: usize) !void {
-    var i: usize = 0;
-    while (i < depth) : (i += 1) try out.writeAll("  ");
-    try out.print("[{s}] ({s}) {s}\n", .{ @tagName(t.content.status), @tagName(t.content.priority), t.content.title });
-    for (t.content.child_ids) |cid| {
-        if (by_id.get(cid)) |child| try renderTask(out, by_id, child, depth + 1);
+fn isCompleted(t: Task) bool {
+    return t.content.status == .done or t.content.status == .cancelled;
+}
+
+fn renderRow(out: *std.Io.Writer, opts: RenderOptions, sgr: Sgr, now: i64, t: Task, depth: usize, dim: bool) !void {
+    if (depth > 0) try out.writeAll("  └─ ");
+
+    const open = if (dim) sgr.faint else sgr.priority(t.content.priority);
+    try out.print("{s}{s} ", .{ open, statusGlyph(t.content.status) });
+
+    if (opts.show_id) try out.print("{s} ", .{shortId(t.id)});
+    try out.writeAll(t.content.title);
+
+    // (+n) marker for an immediate child that itself has children
+    if (depth > 0 and t.content.child_ids.len > 0) {
+        try out.print(" (+{d})", .{t.content.child_ids.len});
     }
+
+    if (opts.show_dates) {
+        if (t.content.due_at) |due| {
+            const overdue = due < now and !isCompleted(t);
+            const col = if (overdue) sgr.overdue else "";
+            try out.print(" {s}due:{d}{s}", .{ col, due, if (overdue) sgr.reset else "" });
+        }
+    }
+    if (opts.show_tags and t.content.tags.len > 0) {
+        try out.writeAll(" [");
+        for (t.content.tags, 0..) |tag, k| {
+            if (k != 0) try out.writeAll(",");
+            try out.writeAll(tag);
+        }
+        try out.writeAll("]");
+    }
+    if (opts.show_description and t.content.description.len > 0) {
+        try out.print(" — {s}", .{t.content.description});
+    }
+
+    try out.print("{s}\n", .{sgr.reset});
 }
 
 test "render options constructors differ as specified" {
@@ -118,4 +151,35 @@ test "render options constructors differ as specified" {
     try std.testing.expect(d.show_id);
     try std.testing.expect(d.show_dates);
     try std.testing.expect(d.show_tags);
+}
+
+test "render: forest with immediate children, dim done child, missing marker, (+n)" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root0001", .content = .{ .title = "Root", .status = .todo }, .meta = .{} },
+        .{ .id = "kidAAAAA", .content = .{ .title = "Kid A", .status = .todo }, .meta = .{} },
+        .{ .id = "kidBBBBB", .content = .{ .title = "Kid B", .status = .done }, .meta = .{} },
+        .{ .id = "gkid0001", .content = .{ .title = "Grandkid", .status = .todo }, .meta = .{} },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{ "kidAAAAA", "kidBBBBB", "ghost999" });
+    tasks[1].content.child_ids = @constCast(&[_][]const u8{"gkid0001"}); // Kid A has 1 child -> (+1)
+
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.compact();
+    opts.color = .off;
+
+    const top = [_]Task{tasks[0]};
+    try render(&buf.writer, opts, 0, &top, &idx);
+    const out = buf.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "Root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Kid A (+1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Kid B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[missing: ghost99]") != null);
+    // Grandkid must NOT appear (immediate children only)
+    try std.testing.expect(std.mem.indexOf(u8, out, "Grandkid") == null);
 }
