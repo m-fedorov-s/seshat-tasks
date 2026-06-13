@@ -90,7 +90,7 @@ fn statusGlyph(s: Status) []const u8 {
 // Write a dim "#<tail>" handle: last `len` chars of id, lower-cased. Emits its own
 // reset so the handle is dim regardless of the surrounding row color.
 fn writeHandle(out: *std.Io.Writer, sgr: Sgr, id: []const u8, len: usize) !void {
-    try out.print("{s}#", .{sgr.faint});
+    try out.print("{s}{s}#", .{ sgr.reset, sgr.faint });
     for (id[id.len -| len ..]) |c| try out.writeByte(std.ascii.toLower(c));
     try out.writeAll(sgr.reset);
 }
@@ -123,8 +123,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
     for (toplevel) |t| {
         // Root line: <glyph> <title> #<tail>
         const root_col = sgr.priority(t.content.priority);
-        try out.print("{s}{s} ", .{ root_col, statusGlyph(t.content.status) });
-        try out.print("{s}{s}", .{ sgr.reset, truncateTitle(t.content.title, opts.width) });
+        try out.print("{s}{s} {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
         try out.writeAll(" ");
         try writeHandle(out, sgr, t.id, opts.handle_len);
         try out.writeAll("\n");
@@ -138,8 +137,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                 if (idx.by_id.get(cid)) |child| {
                     const dim = isCompleted(child);
                     const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
-                    try out.print("  {s} {s}{s} ", .{ connector, child_col, statusGlyph(child.content.status) });
-                    try out.print("{s}{s}", .{ sgr.reset, truncateTitle(child.content.title, opts.width) });
+                    try out.print("  {s} {s}{s} {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
                     try out.writeAll(" ");
                     try writeHandle(out, sgr, child.id, opts.handle_len);
                     try out.writeAll("\n");
@@ -243,6 +241,29 @@ test "formatDate renders YYYY-MM-DD" {
     try std.testing.expectEqualStrings("2021-01-01", formatDate(&buf, 1609459200));
     // 1970-01-01
     try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
+}
+
+test "compact color: row color spans glyph+title; done child dimmed" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "01HZZ0000000000000000WORK1", .content = .{ .title = "Work", .status = .in_progress, .priority = .high }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000DONE1", .content = .{ .title = "Done item", .status = .done }, .meta = .{} },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"01HZZ0000000000000000DONE1"});
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.compact();
+    opts.color = .on;
+    opts.handle_len = 4;
+    const top = [_]Task{tasks[0]};
+    try render(&buf.writer, opts, 0, &top, &idx);
+    const out = buf.written();
+    // high-priority row: red opens immediately before glyph, title follows with NO reset between
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[31m◐ Work") != null);
+    // done child: faint opens before its glyph+title
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2m✓ Done item") != null);
 }
 
 test "compact: oneline, trailing #handle, mixed tree connectors" {
