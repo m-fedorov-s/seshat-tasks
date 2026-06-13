@@ -9,22 +9,43 @@ std source rather than relying on memory or pre-0.16 examples.
 ```sh
 zig build              # compile
 zig build run -- show  # run a subcommand (args after --)
-zig build test         # NOTE: test root is src/main.zig — only runs tests reachable from it
-zig test src/<file>.zig # run a single file's unit tests directly (use this for per-file tests)
+zig build test         # runs the whole suite (main.zig aggregates the other files' tests)
+zig test src/<file>.zig # run a single file's unit tests directly (fastest iteration)
 ```
 
-**Gotcha:** `zig build test` uses `src/main.zig` as the test root, so unit tests in other files
-(e.g. `formatter.zig`) are **not** run unless reachable from main's import graph. To exercise a
-file's tests, run `zig test src/<file>.zig` directly.
+**Gotcha:** `zig build test` uses `src/main.zig` as the test root, so a file's tests only run if
+reachable from main's import graph. `src/main.zig` ends with a `test { _ = @import("core/view.zig");
+… }` aggregator block precisely so `zig build test` exercises view/args/formatter/config. If you add
+a new test-bearing file, add it to that block (or run `zig test src/<file>.zig` directly).
+
+**Local dev (server + client + sample data):** see `dev/` at the repo root — `dev/run-server.sh`
+starts a dev server, `dev/seed.sh` loads a realistic dataset, `dev/seshat.sh show --detailed` runs
+this client against it. Handy for eyeballing rendering. (`make dev-server` / `make dev-seed`.)
 
 ## Layout
 
 - `src/main.zig` — entry point + subcommand dispatch (`show`, `add`, `delete <id>`, `done <id>`,
   `help`). Uses the 0.16 `std.process.Init` entry signature: `pub fn main(init: std.process.Init)
   !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env from
-  `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O.
-- `src/formatter.zig` — renders the task forest as indented text lines (roots = tasks not
-  referenced by any `child_ids`).
+  `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
+  `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline (parse →
+  fetch → `view.select` → `view.rank` → `formatter.render`|`renderJson`), resolves color
+  (`.auto`→on/off via `std.Io.File.stdout().isTty`), width (`COLUMNS` env → `config.width`), and the
+  `#handle` length (`view.minUniqueSuffixLen` over *all* fetched tasks, so handles resolve uniquely).
+  `done`/`delete` resolve an id **tail/suffix** (or `#handle`) via `view.resolve`.
+- `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
+  children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
+  sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
+  `urgency` score, `resolve` (id **suffix/tail** → unique task), and `minUniqueSuffixLen` (shortest
+  unique tail length). All pure, `now: i64` passed in.
+- `src/core/args.zig` — a generic, declaration-driven flag parser: `OptionSpec` table in →
+  `ParsedArgs` (query by name with `getBool`/`getValue`/`getMulti`). No seshat flag names baked in.
+- `src/formatter.zig` — `RenderOptions` (one struct, `compact()`/`detailed()` constructors, a
+  `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
+  children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
+  OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Plus `renderJson`,
+  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD), a
+  tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
   `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred).
@@ -55,3 +76,18 @@ These are the 0.16 patterns this codebase relies on. The new I/O model threads a
 - **JSON serialize:** `var aw: std.Io.Writer.Allocating = .init(alloc); var w = std.json.Stringify{
   .writer = &aw.writer, .options = .{} }; try w.write(payload);` → body bytes = `aw.written()`.
   Enums serialize as their tag-name string by default.
+- **No `std.time.timestamp()` in 0.16.** Wall-clock seconds come from the I/O instance:
+  `@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s)` (the `.nanoseconds`
+  field is `i96`, so use `@divTrunc` + `@intCast` to `i64`).
+- **No `std.posix.isatty`.** TTY detection is `std.Io.File.stdout().isTty(io)` → `Io.Cancelable!bool`
+  (`catch false` for the safe no-color default).
+- **`std.ArrayList(T)` is unmanaged.** Init with `.empty` (NOT `{}`); methods take the allocator:
+  `list.append(allocator, x)`, `list.toOwnedSlice(allocator)`, `list.deinit(allocator)`.
+- **Sorting:** `std.mem.sortUnstable(T, items, ctx, lessThan)` (prefer the unstable variant when the
+  comparator is already a total order). Case-insensitive compare: `std.ascii.orderIgnoreCase(a, b)`
+  → `std.math.Order`.
+- **Dates:** break a unix timestamp into Y-M-D via `std.time.epoch`:
+  `EpochSeconds{ .secs }.getEpochDay().calculateYearDay()` → `.year`/`.calculateMonthDay()`
+  (`.month.numeric()`, `.day_index + 1`).
+- **UTF-8:** `std.unicode.utf8ByteSequenceLength(lead_byte)` (`!u3`) to walk codepoints without
+  splitting them; `std.unicode.utf8ValidateSlice`.

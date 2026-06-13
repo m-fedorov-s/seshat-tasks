@@ -15,7 +15,9 @@ truth; clients fetch task data from it.
 - `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
 - `client/fish/` — thin fish *integration* (completions/prompt, shelling out to the Zig binary),
   added in a later spec. The standalone fish client was retired.
-- `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans.
+- `dev/` — local dev environment: a throwaway server/client config + scripts to run the server,
+  seed a realistic dataset, and run the client (see `dev/README.md`; `make dev-server`/`dev-seed`).
+- `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans (gitignored).
 
 ## Task model
 
@@ -27,9 +29,15 @@ A `Task` is `{ id (ULID), content, meta }`. `content` (user-editable) = title, d
 ## Client behaviour
 
 The Zig client:
-1. Reads config (server URL, secret) from JSON (`SESHAT_CONFIG` or `~/.config/seshat/config.json`).
-2. On `show`, fetches all tasks from the server and renders the forest.
-3. Supports `add <title> [priority]`, `delete <id>`, and `done <id>`, mutating via the server.
+1. Reads config (server URL, secret, optional `width`) from JSON (`SESHAT_CONFIG` or
+   `~/.config/seshat/config.json`).
+2. On `show`, fetches all tasks and renders the forest through a `select → rank → render`
+   pipeline. Flags: `--sort <priority|due|title|created|urgency>` (default urgency),
+   `--filter <tag:NAME|status:S1,S2|overdue>` (repeatable, AND), `--open`, `--flat` (rank all
+   tasks, no tree), `--detailed`, `--json`, `--no-color`. Compact = one line/task with a `#handle`;
+   `--detailed` = git-log-style multi-line blocks (meta line + description + `│`-rail subtasks).
+3. Supports `add <title> [priority]`, `delete <id>`, and `done <id>` — `<id>` accepts a short id
+   **tail** / `#handle` — mutating via the server with optimistic concurrency.
 
 ## Conventions
 
