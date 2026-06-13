@@ -167,6 +167,13 @@ fn runShow(
     if (parsed.getBool("flat")) opts.show_children = false;
     opts.color = resolveColor(init, parsed.getBool("no-color"));
 
+    // Handle length computed over ALL fetched tasks so every printed #handle is
+    // globally unique and resolvable by view.resolve (which scans all tasks).
+    var all_ids = std.ArrayList([]const u8).empty;
+    defer all_ids.deinit(allocator);
+    for (tasks) |t| try all_ids.append(allocator, t.id);
+    opts.handle_len = try view.minUniqueSuffixLen(allocator, all_ids.items);
+
     try formatter.render(out, opts, now, selected, &idx);
     try out.flush();
 }
@@ -222,8 +229,8 @@ fn usage() void {
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
         \\  add <title> [prio] Add a top-level task
-        \\  delete <id>       Delete a task (id prefix ok)
-        \\  done <id>         Mark a task done (id prefix ok)
+        \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
+        \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
         \\
     , .{});
 }
