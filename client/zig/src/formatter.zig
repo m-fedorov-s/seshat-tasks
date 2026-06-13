@@ -117,41 +117,185 @@ fn formatDate(buf: []u8, unix_seconds: i64) []const u8 {
 // pre-resolve `opts.color` to `.on` or `.off`; `.auto` is treated as "not on"
 // (no color). main.zig resolves `.auto` from isatty/NO_COLOR before calling here.
 pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []const Task, idx: *const view.Index) !void {
-    _ = now;
     const sgr = Sgr.make(opts.color == .on);
-    // Both .compact and .detailed use compact rendering for now (R3 implements real detailed).
-    for (toplevel) |t| {
-        // Root line: <glyph> <title> #<tail>
-        const root_col = sgr.priority(t.content.priority);
-        try out.print("{s}{s} {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
-        try out.writeAll(" ");
-        try writeHandle(out, sgr, t.id, opts.handle_len);
-        try out.writeAll("\n");
+    switch (opts.layout) {
+        .compact => {
+            for (toplevel) |t| {
+                // Root line: <glyph> <title> #<tail>
+                const root_col = sgr.priority(t.content.priority);
+                try out.print("{s}{s} {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
+                try out.writeAll(" ");
+                try writeHandle(out, sgr, t.id, opts.handle_len);
+                try out.writeAll("\n");
 
-        if (opts.show_children) {
-            const children = t.content.child_ids;
-            const n = children.len;
-            for (children, 0..) |cid, i| {
-                const is_last = (i == n - 1);
-                const connector = if (is_last) "└─" else "├─";
-                if (idx.by_id.get(cid)) |child| {
-                    const dim = isCompleted(child);
-                    const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
-                    try out.print("  {s} {s}{s} {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
-                    try out.writeAll(" ");
-                    try writeHandle(out, sgr, child.id, opts.handle_len);
-                    try out.writeAll("\n");
-                } else {
-                    // Dangling child id
-                    try out.print("  {s} {s}[missing: ", .{ connector, sgr.faint });
-                    try out.writeByte('#');
-                    for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
-                    try out.print("]{s}\n", .{sgr.reset});
+                if (opts.show_children) {
+                    const children = t.content.child_ids;
+                    const n = children.len;
+                    for (children, 0..) |cid, i| {
+                        const is_last = (i == n - 1);
+                        const connector = if (is_last) "└─" else "├─";
+                        if (idx.by_id.get(cid)) |child| {
+                            const dim = isCompleted(child);
+                            const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
+                            try out.print("  {s} {s}{s} {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
+                            try out.writeAll(" ");
+                            try writeHandle(out, sgr, child.id, opts.handle_len);
+                            try out.writeAll("\n");
+                        } else {
+                            // Dangling child id
+                            try out.print("  {s} {s}[missing: ", .{ connector, sgr.faint });
+                            try out.writeByte('#');
+                            for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
+                            try out.print("]{s}\n", .{sgr.reset});
+                        }
+                    }
                 }
             }
-        }
+        },
+        .detailed => {
+            for (toplevel) |t| {
+                // Root header line: {open}{glyph}  {title} #handle\n
+                const root_col = if (isCompleted(t)) sgr.faint else sgr.priority(t.content.priority);
+                try out.print("{s}{s}  {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
+                try out.writeAll(" ");
+                try writeHandle(out, sgr, t.id, opts.handle_len);
+                try out.writeAll("\n");
+
+                // Root meta line (3-space indent)
+                if (hasMetaParts(t, now)) {
+                    try out.writeAll("   ");
+                    try out.writeAll(sgr.faint);
+                    try writeMeta(out, sgr, t, now);
+                    try out.writeAll(sgr.reset);
+                    try out.writeAll("\n");
+                }
+
+                // Root description (if any)
+                if (opts.show_description and t.content.description.len > 0) {
+                    try out.print("   {s}{s}{s}\n", .{ sgr.faint, truncateTitle(t.content.description, opts.width), sgr.reset });
+                }
+
+                // Children
+                if (opts.show_children) {
+                    const children = t.content.child_ids;
+                    const n = children.len;
+                    for (children, 0..) |cid, i| {
+                        const is_last = (i == n - 1);
+                        const connector = if (is_last) "└─ " else "├─ ";
+
+                        // Spacer line before every child (including last)
+                        try out.writeAll("   │\n");
+
+                        if (idx.by_id.get(cid)) |child| {
+                            const dim = isCompleted(child);
+                            const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
+                            try out.print("   {s}{s}{s}  {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
+                            try out.writeAll(" ");
+                            try writeHandle(out, sgr, child.id, opts.handle_len);
+                            try out.writeAll("\n");
+
+                            // Child meta/description prefix:
+                            //   non-last: "   │     " (3 spaces + │ + 5 spaces = 9 chars)
+                            //   last:     "         " (9 spaces)
+                            const child_prefix = if (!is_last) "   │     " else "         ";
+                            if (hasMetaParts(child, now)) {
+                                try out.writeAll(child_prefix);
+                                try out.writeAll(sgr.faint);
+                                try writeMeta(out, sgr, child, now);
+                                try out.writeAll(sgr.reset);
+                                try out.writeAll("\n");
+                            }
+
+                            // Child description
+                            if (opts.show_description and child.content.description.len > 0) {
+                                try out.print("{s}{s}{s}{s}\n", .{ child_prefix, sgr.faint, truncateTitle(child.content.description, opts.width), sgr.reset });
+                            }
+                        } else {
+                            // Dangling child id
+                            try out.print("   {s}{s}[missing: ", .{ connector, sgr.faint });
+                            try out.writeByte('#');
+                            for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
+                            try out.print("]{s}\n", .{sgr.reset});
+                        }
+                    }
+                }
+
+                // Trailing blank line after each top-level block
+                try out.writeAll("\n");
+            }
+        },
     }
 }
+
+// Returns true if the task has any meta parts to display.
+fn hasMetaParts(t: Task, now: i64) bool {
+    if (t.content.priority != .none) return true;
+    if (t.content.due_at != null) return true;
+    if (t.content.scheduled_at != null) return true;
+    if (t.content.tags.len > 0) return true;
+    if (t.content.child_ids.len > 0) return true;
+    _ = now;
+    return false;
+}
+
+// Write the meta line content (no prefix, no surrounding faint/reset — caller handles those).
+// Parts joined by " · ", in order: priority word, due, scheduled, tags, subtasks.
+fn writeMeta(out: *std.Io.Writer, sgr: Sgr, t: Task, now: i64) !void {
+    var first = true;
+
+    // Helper: write " · " separator before each part after the first.
+    // 1. Priority word (omit if .none)
+    if (t.content.priority != .none) {
+        try out.writeAll(@tagName(t.content.priority));
+        first = false;
+    }
+
+    // 2. Due date
+    if (t.content.due_at) |due| {
+        if (!first) try out.writeAll(" · ");
+        first = false;
+        var date_buf: [16]u8 = undefined;
+        if (due < now and !isCompleted(t)) {
+            const days_overdue = @divTrunc(now - due, 86400);
+            const date_str = formatDate(&date_buf, due);
+            try out.print("{s}⚠ OVERDUE ({d}d, due {s}){s}", .{ sgr.overdue, days_overdue, date_str, sgr.reset });
+            // After overdue token, surrounding faint was interrupted; restore it.
+            if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
+        } else {
+            var date_buf2: [16]u8 = undefined;
+            const date_str = formatDate(&date_buf2, due);
+            try out.print("due {s}", .{date_str});
+        }
+    }
+
+    // 3. Scheduled date
+    if (t.content.scheduled_at) |sched| {
+        if (!first) try out.writeAll(" · ");
+        first = false;
+        var date_buf: [16]u8 = undefined;
+        const date_str = formatDate(&date_buf, sched);
+        try out.print("sched {s}", .{date_str});
+    }
+
+    // 4. Tags
+    if (t.content.tags.len > 0) {
+        if (!first) try out.writeAll(" · ");
+        first = false;
+        for (t.content.tags, 0..) |tag, ti| {
+            if (ti > 0) try out.writeAll(" ");
+            try out.print("#{s}", .{tag});
+        }
+    }
+
+    // 5. Subtasks count
+    if (t.content.child_ids.len > 0) {
+        if (!first) try out.writeAll(" · ");
+        first = false;
+        try out.print("{d} subtasks", .{t.content.child_ids.len});
+    }
+
+}
+
 
 fn isCompleted(t: Task) bool {
     return t.content.status == .done or t.content.status == .cancelled;
@@ -289,5 +433,68 @@ test "compact: oneline, trailing #handle, mixed tree connectors" {
     try std.testing.expect(std.mem.indexOf(u8, out, "├─ ○ Write report #pt01") != null); // non-last child
     try std.testing.expect(std.mem.indexOf(u8, out, "├─ ✓ Done item #one1") != null);     // now non-last
     try std.testing.expect(std.mem.indexOf(u8, out, "└─ [missing: #host]") != null);       // dangling, last
+}
+
+test "detailed: git-log block, priority word, # tags, overdue, gutter rail" {
+    const a = std.testing.allocator;
+    const day: i64 = 86400;
+    const now: i64 = 3 * day; // 1970-01-04
+    var tasks = [_]Task{
+        .{ .id = "01HZZ0000000000000000WORK1", .content = .{ .title = "Work", .status = .in_progress, .priority = .high }, .meta = .{} }, // no tags -> "high · 2 subtasks"
+        .{ .id = "01HZZ0000000000000000RPT01", .content = .{ .title = "Write report", .status = .todo, .priority = .medium, .due_at = 10 * day, .scheduled_at = 2 * day, .tags = @constCast(&[_][]const u8{"work"}) }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000DONE1", .content = .{ .title = "Done item", .status = .done, .priority = .low }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000TAX01", .content = .{ .title = "Tax", .status = .todo, .priority = .high, .due_at = 0, .tags = @constCast(&[_][]const u8{"urgent"}) }, .meta = .{} },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{ "01HZZ0000000000000000RPT01", "01HZZ0000000000000000DONE1" });
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.detailed();
+    opts.color = .off;
+    opts.handle_len = 4;
+    const top = [_]Task{ tasks[0], tasks[3] };
+    try render(&buf.writer, opts, now, &top, &idx);
+    const out = buf.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "◐  Work #ork1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "high · 2 subtasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "medium · due 1970-01-11 · sched 1970-01-03 · #work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "├─ ○  Write report #pt01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "│") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "└─ ✓  Done item #one1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "low") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "high · ⚠ OVERDUE (3d, due 1970-01-01) · #urgent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null); // no-color: no escapes
+}
+
+test "detailed: exact block layout (rails, indentation, spacers)" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "0000000000000000000000WRK1", .content = .{ .title = "Work", .status = .in_progress, .priority = .high }, .meta = .{} },
+        .{ .id = "0000000000000000000000TSK1", .content = .{ .title = "Write A", .status = .todo, .priority = .medium, .tags = @constCast(&[_][]const u8{"work"}) }, .meta = .{} },
+        .{ .id = "0000000000000000000000DNE1", .content = .{ .title = "Done B", .status = .done, .priority = .low }, .meta = .{} },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{ "0000000000000000000000TSK1", "0000000000000000000000DNE1" });
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var buf: std.Io.Writer.Allocating = .init(a);
+    defer buf.deinit();
+    var opts = RenderOptions.detailed();
+    opts.color = .off;
+    opts.handle_len = 4;
+    const top = [_]Task{tasks[0]};
+    try render(&buf.writer, opts, 0, &top, &idx);
+    try std.testing.expectEqualStrings(
+        "◐  Work #wrk1\n" ++
+        "   high · 2 subtasks\n" ++
+        "   │\n" ++
+        "   ├─ ○  Write A #tsk1\n" ++
+        "   │     medium · #work\n" ++
+        "   │\n" ++
+        "   └─ ✓  Done B #dne1\n" ++
+        "         low\n" ++
+        "\n",
+        buf.written(),
+    );
 }
 
