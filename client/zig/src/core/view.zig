@@ -306,12 +306,12 @@ pub fn resolve(tasks: []const Task, query: []const u8) ResolveError!Task {
 }
 
 // Smallest suffix length in [4, 26] at which all ids have a distinct tail.
-// (ULIDs are uppercase, so raw-tail uniqueness == case-insensitive uniqueness.)
-// Intentionally naive O(26*n) — fine at task-list scale.
+// PRECONDITION: callers pass uppercase ULIDs — raw-tail uniqueness then equals
+// case-insensitive uniqueness (resolve lower-cases). Intentionally naive O(26*n).
 pub fn minUniqueSuffixLen(allocator: std.mem.Allocator, ids: []const []const u8) !usize {
     if (ids.len <= 1) return 4;
     var len: usize = 4;
-    while (len < 26) : (len += 1) {
+    while (len <= 26) : (len += 1) {
         var seen = std.StringHashMap(void).init(allocator);
         defer seen.deinit();
         var collision = false;
@@ -325,7 +325,7 @@ pub fn minUniqueSuffixLen(allocator: std.mem.Allocator, ids: []const []const u8)
         }
         if (!collision) return len;
     }
-    return 26;
+    return 26; // pathological: ids non-unique even at full length (duplicate ids)
 }
 
 test "resolve matches by id suffix, case-insensitive, # tolerated" {
@@ -352,4 +352,10 @@ test "minUniqueSuffixLen widens past collisions, floor 4" {
     try std.testing.expectEqual(@as(usize, 5), try minUniqueSuffixLen(a, &ids2));
     const ids3 = [_][]const u8{"AAAAAAAA"}; // 0/1 ids -> floor 4
     try std.testing.expectEqual(@as(usize, 4), try minUniqueSuffixLen(a, &ids3));
+}
+
+test "minUniqueSuffixLen: duplicate ids fall back to 26" {
+    const a = std.testing.allocator;
+    const dup = [_][]const u8{ "01HZZ0000000000000000WORK1", "01HZZ0000000000000000WORK1" };
+    try std.testing.expectEqual(@as(usize, 26), try minUniqueSuffixLen(a, &dup));
 }
