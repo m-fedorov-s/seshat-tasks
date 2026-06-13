@@ -162,13 +162,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                 try out.writeAll("\n");
 
                 // Root meta line (3-space indent)
-                if (hasMetaParts(t, now)) {
-                    try out.writeAll("   ");
-                    try out.writeAll(sgr.faint);
-                    try writeMeta(out, sgr, t, now);
-                    try out.writeAll(sgr.reset);
-                    try out.writeAll("\n");
-                }
+                try writeMetaLine(out, sgr, "   ", t, now);
 
                 // Root description (if any)
                 if (opts.show_description and t.content.description.len > 0) {
@@ -198,13 +192,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                             //   non-last: "   │     " (3 spaces + │ + 5 spaces = 9 chars)
                             //   last:     "         " (9 spaces)
                             const child_prefix = if (!is_last) "   │     " else "         ";
-                            if (hasMetaParts(child, now)) {
-                                try out.writeAll(child_prefix);
-                                try out.writeAll(sgr.faint);
-                                try writeMeta(out, sgr, child, now);
-                                try out.writeAll(sgr.reset);
-                                try out.writeAll("\n");
-                            }
+                            try writeMetaLine(out, sgr, child_prefix, child, now);
 
                             // Child description
                             if (opts.show_description and child.content.description.len > 0) {
@@ -227,33 +215,36 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
     }
 }
 
-// Returns true if the task has any meta parts to display.
-fn hasMetaParts(t: Task, now: i64) bool {
-    if (t.content.priority != .none) return true;
-    if (t.content.due_at != null) return true;
-    if (t.content.scheduled_at != null) return true;
-    if (t.content.tags.len > 0) return true;
-    if (t.content.child_ids.len > 0) return true;
-    _ = now;
-    return false;
-}
+// Writes a full meta line ("<prefix><faint>part · part…<reset>\n") for `t`, or
+// nothing at all if `t` has no meta parts. `prefix` is the indent/gutter string
+// (e.g. "   " for a root, "   │     "/"         " for a child). Single source of
+// truth for which parts exist — no separate emptiness predicate to keep in sync.
+fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now: i64) !void {
+    var started = false;
 
-// Write the meta line content (no prefix, no surrounding faint/reset — caller handles those).
-// Parts joined by " · ", in order: priority word, due, scheduled, tags, subtasks.
-fn writeMeta(out: *std.Io.Writer, sgr: Sgr, t: Task, now: i64) !void {
-    var first = true;
+    // Ensures the prefix + dim wrapper is emitted exactly once, before the first part,
+    // and a " · " separator before every subsequent part.
+    const beginPart = struct {
+        fn f(o: *std.Io.Writer, s: Sgr, pfx: []const u8, st: *bool) !void {
+            if (!st.*) {
+                try o.writeAll(pfx);
+                try o.writeAll(s.faint);
+                st.* = true;
+            } else {
+                try o.writeAll(" · ");
+            }
+        }
+    }.f;
 
-    // Helper: write " · " separator before each part after the first.
     // 1. Priority word (omit if .none)
     if (t.content.priority != .none) {
+        try beginPart(out, sgr, prefix, &started);
         try out.writeAll(@tagName(t.content.priority));
-        first = false;
     }
 
     // 2. Due date
     if (t.content.due_at) |due| {
-        if (!first) try out.writeAll(" · ");
-        first = false;
+        try beginPart(out, sgr, prefix, &started);
         var date_buf: [16]u8 = undefined;
         if (due < now and !isCompleted(t)) {
             const days_overdue = @divTrunc(now - due, 86400);
@@ -262,16 +253,14 @@ fn writeMeta(out: *std.Io.Writer, sgr: Sgr, t: Task, now: i64) !void {
             // After overdue token, surrounding faint was interrupted; restore it.
             if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
         } else {
-            var date_buf2: [16]u8 = undefined;
-            const date_str = formatDate(&date_buf2, due);
+            const date_str = formatDate(&date_buf, due);
             try out.print("due {s}", .{date_str});
         }
     }
 
     // 3. Scheduled date
     if (t.content.scheduled_at) |sched| {
-        if (!first) try out.writeAll(" · ");
-        first = false;
+        try beginPart(out, sgr, prefix, &started);
         var date_buf: [16]u8 = undefined;
         const date_str = formatDate(&date_buf, sched);
         try out.print("sched {s}", .{date_str});
@@ -279,8 +268,7 @@ fn writeMeta(out: *std.Io.Writer, sgr: Sgr, t: Task, now: i64) !void {
 
     // 4. Tags
     if (t.content.tags.len > 0) {
-        if (!first) try out.writeAll(" · ");
-        first = false;
+        try beginPart(out, sgr, prefix, &started);
         for (t.content.tags, 0..) |tag, ti| {
             if (ti > 0) try out.writeAll(" ");
             try out.print("#{s}", .{tag});
@@ -289,11 +277,14 @@ fn writeMeta(out: *std.Io.Writer, sgr: Sgr, t: Task, now: i64) !void {
 
     // 5. Subtasks count
     if (t.content.child_ids.len > 0) {
-        if (!first) try out.writeAll(" · ");
-        first = false;
+        try beginPart(out, sgr, prefix, &started);
         try out.print("{d} subtasks", .{t.content.child_ids.len});
     }
 
+    if (started) {
+        try out.writeAll(sgr.reset);
+        try out.writeAll("\n");
+    }
 }
 
 
