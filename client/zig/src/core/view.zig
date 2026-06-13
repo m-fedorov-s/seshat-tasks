@@ -280,13 +280,24 @@ test "rank: due strategy sorts soonest first and sinks undated" {
 
 pub const ResolveError = error{ NoSuchId, AmbiguousId };
 
-// Resolve a (possibly short) id prefix to exactly one task. Exact-id match also
-// works since an id is a prefix of itself. Empty prefix is never a match.
-pub fn resolve(tasks: []const Task, prefix: []const u8) ResolveError!Task {
-    if (prefix.len == 0) return error.NoSuchId;
+fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (suffix.len > haystack.len) return false;
+    const tail = haystack[haystack.len - suffix.len ..];
+    for (tail, suffix) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+// Resolve a task by a tail/suffix of its id (case-insensitive). A leading '#' is
+// tolerated. A full id is its own suffix. Empty (or just '#') -> NoSuchId.
+pub fn resolve(tasks: []const Task, query: []const u8) ResolveError!Task {
+    var q = query;
+    if (q.len > 0 and q[0] == '#') q = q[1..];
+    if (q.len == 0) return error.NoSuchId;
     var match: ?Task = null;
     for (tasks) |t| {
-        if (std.mem.startsWith(u8, t.id, prefix)) {
+        if (endsWithIgnoreCase(t.id, q)) {
             if (match != null) return error.AmbiguousId;
             match = t;
         }
@@ -294,14 +305,51 @@ pub fn resolve(tasks: []const Task, prefix: []const u8) ResolveError!Task {
     return match orelse error.NoSuchId;
 }
 
-test "resolve: unique prefix, ambiguous, not found" {
+// Smallest suffix length in [4, 26] at which all ids have a distinct tail.
+// (ULIDs are uppercase, so raw-tail uniqueness == case-insensitive uniqueness.)
+// Intentionally naive O(26*n) — fine at task-list scale.
+pub fn minUniqueSuffixLen(allocator: std.mem.Allocator, ids: []const []const u8) !usize {
+    if (ids.len <= 1) return 4;
+    var len: usize = 4;
+    while (len < 26) : (len += 1) {
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+        var collision = false;
+        for (ids) |id| {
+            const tail = id[id.len -| len ..];
+            const gop = try seen.getOrPut(tail);
+            if (gop.found_existing) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) return len;
+    }
+    return 26;
+}
+
+test "resolve matches by id suffix, case-insensitive, # tolerated" {
     const tasks = [_]Task{
-        .{ .id = "01ABCDEF", .content = .{ .title = "a" }, .meta = .{} },
-        .{ .id = "01ABCXYZ", .content = .{ .title = "b" }, .meta = .{} },
-        .{ .id = "09ZZZZZZ", .content = .{ .title = "c" }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000RPT01", .content = .{ .title = "a" }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000DONE1", .content = .{ .title = "b" }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000WORK1", .content = .{ .title = "c" }, .meta = .{} },
     };
-    try std.testing.expectEqualStrings("09ZZZZZZ", (try resolve(&tasks, "09")).id);
-    try std.testing.expectError(error.AmbiguousId, resolve(&tasks, "01ABC"));
+    try std.testing.expectEqualStrings("01HZZ0000000000000000RPT01", (try resolve(&tasks, "rpt01")).id);
+    try std.testing.expectEqualStrings("01HZZ0000000000000000RPT01", (try resolve(&tasks, "#RPT01")).id); // # + case
+    try std.testing.expectEqualStrings("01HZZ0000000000000000WORK1", (try resolve(&tasks, "k1")).id); // short unique tail
+    try std.testing.expectEqualStrings("01HZZ0000000000000000DONE1", (try resolve(&tasks, "01HZZ0000000000000000DONE1")).id); // full id is its own suffix
+    try std.testing.expectError(error.AmbiguousId, resolve(&tasks, "1")); // all three end in "1"
     try std.testing.expectError(error.NoSuchId, resolve(&tasks, "zzz"));
     try std.testing.expectError(error.NoSuchId, resolve(&tasks, ""));
+    try std.testing.expectError(error.NoSuchId, resolve(&tasks, "#"));
+}
+
+test "minUniqueSuffixLen widens past collisions, floor 4" {
+    const a = std.testing.allocator;
+    const ids1 = [_][]const u8{ "AAAAWORK1", "AAAARPT01", "AAAADONE1" }; // distinct at 4
+    try std.testing.expectEqual(@as(usize, 4), try minUniqueSuffixLen(a, &ids1));
+    const ids2 = [_][]const u8{ "AAAX0001", "AAAY0001" }; // share last 4 "0001", differ at 5
+    try std.testing.expectEqual(@as(usize, 5), try minUniqueSuffixLen(a, &ids2));
+    const ids3 = [_][]const u8{"AAAAAAAA"}; // 0/1 ids -> floor 4
+    try std.testing.expectEqual(@as(usize, 4), try minUniqueSuffixLen(a, &ids3));
 }
