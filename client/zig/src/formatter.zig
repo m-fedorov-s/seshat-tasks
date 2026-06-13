@@ -7,6 +7,8 @@ const Priority = taskmod.Priority;
 
 pub const ColorMode = enum { on, off, auto };
 
+pub const Layout = enum { compact, detailed };
+
 pub const RenderOptions = struct {
     color: ColorMode = .auto,
     show_tags: bool,
@@ -15,6 +17,8 @@ pub const RenderOptions = struct {
     show_id: bool,
     show_children: bool,
     width: usize,
+    layout: Layout,
+    handle_len: usize,
 
     pub fn compact() RenderOptions {
         return .{
@@ -24,6 +28,8 @@ pub const RenderOptions = struct {
             .show_id = false,
             .show_children = true,
             .width = 120,
+            .layout = .compact,
+            .handle_len = 4,
         };
     }
 
@@ -35,6 +41,8 @@ pub const RenderOptions = struct {
             .show_id = true,
             .show_children = true,
             .width = 120,
+            .layout = .detailed,
+            .handle_len = 4,
         };
     }
 };
@@ -79,8 +87,12 @@ fn statusGlyph(s: Status) []const u8 {
     };
 }
 
-fn shortId(id: []const u8) []const u8 {
-    return id[0..@min(7, id.len)];
+// Write a dim "#<tail>" handle: last `len` chars of id, lower-cased. Emits its own
+// reset so the handle is dim regardless of the surrounding row color.
+fn writeHandle(out: *std.Io.Writer, sgr: Sgr, id: []const u8, len: usize) !void {
+    try out.print("{s}#", .{sgr.faint});
+    for (id[id.len -| len ..]) |c| try out.writeByte(std.ascii.toLower(c));
+    try out.writeAll(sgr.reset);
 }
 
 // Format a unix-seconds timestamp as YYYY-MM-DD into `buf`, returning the slice.
@@ -101,22 +113,42 @@ fn formatDate(buf: []u8, unix_seconds: i64) []const u8 {
 // Render the already-selected, already-ranked top-level list. `idx` is the full
 // index over every fetched task, used to look up immediate children.
 //
-// Immediate children only — grandchildren are NOT expanded (a child with its own
-// children is annotated with `(+n)` instead). This caps output depth at 1.
-//
 // Color contract: this is a pure renderer with no TTY detection. The caller must
 // pre-resolve `opts.color` to `.on` or `.off`; `.auto` is treated as "not on"
 // (no color). main.zig resolves `.auto` from isatty/NO_COLOR before calling here.
 pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []const Task, idx: *const view.Index) !void {
+    _ = now;
     const sgr = Sgr.make(opts.color == .on);
+    // Both .compact and .detailed use compact rendering for now (R3 implements real detailed).
     for (toplevel) |t| {
-        try renderRow(out, opts, sgr, now, t, 0, false);
+        // Root line: <glyph> <title> #<tail>
+        const root_col = sgr.priority(t.content.priority);
+        try out.print("{s}{s} ", .{ root_col, statusGlyph(t.content.status) });
+        try out.print("{s}{s}", .{ sgr.reset, truncateTitle(t.content.title, opts.width) });
+        try out.writeAll(" ");
+        try writeHandle(out, sgr, t.id, opts.handle_len);
+        try out.writeAll("\n");
+
         if (opts.show_children) {
-            for (t.content.child_ids) |cid| {
+            const children = t.content.child_ids;
+            const n = children.len;
+            for (children, 0..) |cid, i| {
+                const is_last = (i == n - 1);
+                const connector = if (is_last) "└─" else "├─";
                 if (idx.by_id.get(cid)) |child| {
-                    try renderRow(out, opts, sgr, now, child, 1, isCompleted(child));
+                    const dim = isCompleted(child);
+                    const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
+                    try out.print("  {s} {s}{s} ", .{ connector, child_col, statusGlyph(child.content.status) });
+                    try out.print("{s}{s}", .{ sgr.reset, truncateTitle(child.content.title, opts.width) });
+                    try out.writeAll(" ");
+                    try writeHandle(out, sgr, child.id, opts.handle_len);
+                    try out.writeAll("\n");
                 } else {
-                    try out.print("  └─ {s}[missing: {s}]{s}\n", .{ sgr.faint, shortId(cid), sgr.reset });
+                    // Dangling child id
+                    try out.print("  {s} {s}[missing: ", .{ connector, sgr.faint });
+                    try out.writeByte('#');
+                    for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
+                    try out.print("]{s}\n", .{sgr.reset});
                 }
             }
         }
@@ -125,49 +157,6 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
 
 fn isCompleted(t: Task) bool {
     return t.content.status == .done or t.content.status == .cancelled;
-}
-
-fn renderRow(out: *std.Io.Writer, opts: RenderOptions, sgr: Sgr, now: i64, t: Task, depth: usize, dim: bool) !void {
-    if (depth > 0) try out.writeAll("  └─ ");
-
-    const open = if (dim) sgr.faint else sgr.priority(t.content.priority);
-    try out.print("{s}{s} ", .{ open, statusGlyph(t.content.status) });
-
-    if (opts.show_id) try out.print("{s} ", .{shortId(t.id)});
-    try out.writeAll(truncateTitle(t.content.title, opts.width));
-
-    // (+n) marker for an immediate child that itself has children.
-    // Raw child_ids count — may include dangling/missing ids (server is authoritative).
-    if (depth > 0 and t.content.child_ids.len > 0) {
-        try out.print(" (+{d})", .{t.content.child_ids.len});
-    }
-
-    // A non-overdue date inherits the row's current color; only overdue dates get
-    // their own escape (sgr.overdue) and an explicit reset.
-    if (opts.show_dates) {
-        var datebuf: [16]u8 = undefined;
-        if (t.content.due_at) |due| {
-            const overdue = due < now and !isCompleted(t);
-            const col = if (overdue) sgr.overdue else "";
-            try out.print(" {s}due:{s}{s}", .{ col, formatDate(&datebuf, due), if (overdue) sgr.reset else "" });
-        }
-        if (t.content.scheduled_at) |sched| {
-            try out.print(" sched:{s}", .{formatDate(&datebuf, sched)});
-        }
-    }
-    if (opts.show_tags and t.content.tags.len > 0) {
-        try out.writeAll(" [");
-        for (t.content.tags, 0..) |tag, k| {
-            if (k != 0) try out.writeAll(",");
-            try out.writeAll(tag);
-        }
-        try out.writeAll("]");
-    }
-    if (opts.show_description and t.content.description.len > 0) {
-        try out.print(" — {s}", .{t.content.description});
-    }
-
-    try out.print("{s}\n", .{sgr.reset});
 }
 
 test "render options constructors differ as specified" {
@@ -182,36 +171,6 @@ test "render options constructors differ as specified" {
     try std.testing.expect(d.show_tags);
 }
 
-test "render: forest with immediate children, dim done child, missing marker, (+n)" {
-    const a = std.testing.allocator;
-    var tasks = [_]Task{
-        .{ .id = "root0001", .content = .{ .title = "Root", .status = .todo }, .meta = .{} },
-        .{ .id = "kidAAAAA", .content = .{ .title = "Kid A", .status = .todo }, .meta = .{} },
-        .{ .id = "kidBBBBB", .content = .{ .title = "Kid B", .status = .done }, .meta = .{} },
-        .{ .id = "gkid0001", .content = .{ .title = "Grandkid", .status = .todo }, .meta = .{} },
-    };
-    tasks[0].content.child_ids = @constCast(&[_][]const u8{ "kidAAAAA", "kidBBBBB", "ghost999" });
-    tasks[1].content.child_ids = @constCast(&[_][]const u8{"gkid0001"}); // Kid A has 1 child -> (+1)
-
-    var idx = try view.Index.build(a, &tasks);
-    defer idx.deinit();
-
-    var buf: std.Io.Writer.Allocating = .init(a);
-    defer buf.deinit();
-    var opts = RenderOptions.compact();
-    opts.color = .off;
-
-    const top = [_]Task{tasks[0]};
-    try render(&buf.writer, opts, 0, &top, &idx);
-    const out = buf.written();
-
-    try std.testing.expect(std.mem.indexOf(u8, out, "Root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Kid A (+1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Kid B") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "[missing: ghost99]") != null);
-    // Grandkid must NOT appear (immediate children only)
-    try std.testing.expect(std.mem.indexOf(u8, out, "Grandkid") == null);
-}
 
 test "render: color-on emits SGR escapes" {
     const a = std.testing.allocator;
@@ -286,19 +245,28 @@ test "formatDate renders YYYY-MM-DD" {
     try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
 }
 
-test "detailed render shows due and scheduled dates formatted" {
+test "compact: oneline, trailing #handle, mixed tree connectors" {
     const a = std.testing.allocator;
     var tasks = [_]Task{
-        .{ .id = "d0000001", .content = .{ .title = "Dated", .status = .todo, .due_at = 1609459200, .scheduled_at = 1609459200 }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000WORK1", .content = .{ .title = "Work", .status = .in_progress, .priority = .high }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000RPT01", .content = .{ .title = "Write report", .status = .todo }, .meta = .{} },
+        .{ .id = "01HZZ0000000000000000DONE1", .content = .{ .title = "Done item", .status = .done }, .meta = .{} },
     };
+    // two real children + one dangling id (GHOST, not in the set) as the last child
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{ "01HZZ0000000000000000RPT01", "01HZZ0000000000000000DONE1", "01HZZ0000000000000000GHOST" });
     var idx = try view.Index.build(a, &tasks);
     defer idx.deinit();
     var buf: std.Io.Writer.Allocating = .init(a);
     defer buf.deinit();
-    var opts = RenderOptions.detailed();
+    var opts = RenderOptions.compact();
     opts.color = .off;
-    try render(&buf.writer, opts, 0, &tasks, &idx);
+    opts.handle_len = 4;
+    const top = [_]Task{tasks[0]};
+    try render(&buf.writer, opts, 0, &top, &idx);
     const out = buf.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "due:2021-01-01") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "sched:2021-01-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "◐ Work #ork1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "├─ ○ Write report #pt01") != null); // non-last child
+    try std.testing.expect(std.mem.indexOf(u8, out, "├─ ✓ Done item #one1") != null);     // now non-last
+    try std.testing.expect(std.mem.indexOf(u8, out, "└─ [missing: #host]") != null);       // dangling, last
 }
+
