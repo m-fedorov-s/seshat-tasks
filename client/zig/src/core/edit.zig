@@ -133,6 +133,44 @@ pub fn parseDate(input: []const u8, now: i64, kind: DateKind) DateError!DatePatc
     return parseAbsolute(input, kind);
 }
 
+pub const Patch = struct {
+    title: Edit([]const u8) = .unchanged,
+    description: Edit([]const u8) = .unchanged,
+    status: Edit(Status) = .unchanged,
+    priority: Edit(Priority) = .unchanged,
+    tags: Edit([][]const u8) = .unchanged, // .set with empty slice = cleared
+    due: DatePatch = .unchanged, // .set = null = cleared
+    scheduled: DatePatch = .unchanged,
+
+    pub fn isEmpty(self: Patch) bool {
+        return isUnchanged([]const u8, self.title) and
+            isUnchanged([]const u8, self.description) and
+            isUnchanged(Status, self.status) and
+            isUnchanged(Priority, self.priority) and
+            isUnchanged([][]const u8, self.tags) and
+            isUnchanged(?i64, self.due) and
+            isUnchanged(?i64, self.scheduled);
+    }
+};
+
+pub fn applyPatch(base: Content, p: Patch) Content {
+    return .{
+        .title = pick([]const u8, p.title, base.title),
+        .description = pick([]const u8, p.description, base.description),
+        .status = pick(Status, p.status, base.status),
+        .priority = pick(Priority, p.priority, base.priority),
+        .child_ids = base.child_ids, // hierarchy is never patched here
+        .tags = pick([][]const u8, p.tags, base.tags),
+        .due_at = pick(?i64, p.due, base.due_at),
+        .scheduled_at = pick(?i64, p.scheduled, base.scheduled_at),
+    };
+}
+
+pub const ValidationError = error{EmptyTitle};
+pub fn validate(c: Content) ValidationError!void {
+    if (c.title.len == 0) return error.EmptyTitle;
+}
+
 test "ymdToEpochDay matches known epoch days" {
     try std.testing.expectEqual(@as(i64, 0), try ymdToEpochDay(1970, 1, 1));
     try std.testing.expectEqual(@as(i64, 31), try ymdToEpochDay(1970, 2, 1));
@@ -221,4 +259,56 @@ test "parseDate: rejects garbage" {
     try std.testing.expectError(error.BadDate, parseDate("+d", 0, .due));
     // a signed numeric field is rejected, not silently normalized
     try std.testing.expectError(error.BadDate, parseDate("2026-+6-14", 0, .due));
+}
+
+test "applyPatch: unchanged keeps base, set overrides" {
+    const base = Content{ .title = "old", .priority = .low };
+    var p = Patch{};
+    p.title = .{ .set = "new" };
+    p.priority = .{ .set = .high };
+    const out = applyPatch(base, p);
+    try std.testing.expectEqualStrings("new", out.title);
+    try std.testing.expect(out.priority == .high);
+    try std.testing.expect(out.status == .todo); // untouched -> base default
+}
+
+test "applyPatch: dates clear vs set; tags wholesale incl clear" {
+    var base = Content{ .title = "t", .due_at = 123, .scheduled_at = 5 };
+    var keep = [_][]const u8{ "x", "y" };
+    base.tags = &keep;
+    var p = Patch{};
+    p.due = .{ .set = null }; // clear
+    p.scheduled = .{ .set = 999 }; // set
+    var empty: [0][]const u8 = .{};
+    p.tags = .{ .set = &empty }; // clear all tags
+    const out = applyPatch(base, p);
+    try std.testing.expectEqual(@as(?i64, null), out.due_at);
+    try std.testing.expectEqual(@as(?i64, 999), out.scheduled_at);
+    try std.testing.expectEqual(@as(usize, 0), out.tags.len);
+}
+
+test "applyPatch over default Content is the add path" {
+    const out = applyPatch(.{ .title = "made" }, .{});
+    try std.testing.expectEqualStrings("made", out.title);
+    try std.testing.expect(out.status == .todo);
+    try std.testing.expectEqual(@as(usize, 0), out.child_ids.len);
+}
+
+test "applyPatch preserves child_ids (never patched)" {
+    var kids = [_][]const u8{"child1"};
+    var base = Content{ .title = "p" };
+    base.child_ids = &kids;
+    const out = applyPatch(base, .{ .title = .{ .set = "renamed" } });
+    try std.testing.expectEqual(@as(usize, 1), out.child_ids.len);
+}
+
+test "Patch.isEmpty" {
+    try std.testing.expect((Patch{}).isEmpty());
+    try std.testing.expect(!(Patch{ .due = .{ .set = null } }).isEmpty());
+    try std.testing.expect(!(Patch{ .title = .{ .set = "x" } }).isEmpty());
+}
+
+test "validate rejects empty title" {
+    try std.testing.expectError(error.EmptyTitle, validate(.{ .title = "" }));
+    try validate(.{ .title = "ok" });
 }
