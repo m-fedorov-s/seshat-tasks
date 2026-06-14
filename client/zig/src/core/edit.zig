@@ -171,6 +171,48 @@ pub fn validate(c: Content) ValidationError!void {
     if (c.title.len == 0) return error.EmptyTitle;
 }
 
+pub const flag_specs = [_]args.OptionSpec{
+    .{ .name = "title", .kind = .value },
+    .{ .name = "description", .kind = .value },
+    .{ .name = "status", .kind = .value },
+    .{ .name = "priority", .kind = .value },
+    .{ .name = "due", .kind = .value },
+    .{ .name = "scheduled", .kind = .value },
+    .{ .name = "tags", .kind = .value },
+    .{ .name = "dry-run", .kind = .boolean },
+    .{ .name = "verbose", .kind = .boolean },
+};
+
+pub const BuildError = error{ BadStatus, BadPriority, BadDate, OutOfMemory };
+
+// raw=="" -> cleared (&.{}); otherwise comma-split, trimmed, empty segments dropped.
+fn splitTags(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![][]const u8 {
+    if (raw.len == 0) return &.{};
+    var list = std.ArrayList([]const u8).empty;
+    errdefer list.deinit(allocator);
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |seg| {
+        const trimmed = std.mem.trim(u8, seg, " ");
+        if (trimmed.len == 0) continue;
+        try list.append(allocator, trimmed);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, now: i64) BuildError!Patch {
+    var patch = Patch{};
+    if (p.getValue("title")) |v| patch.title = .{ .set = v };
+    if (p.getValue("description")) |v| patch.description = .{ .set = v };
+    if (p.getValue("status")) |v|
+        patch.status = .{ .set = std.meta.stringToEnum(Status, v) orelse return error.BadStatus };
+    if (p.getValue("priority")) |v|
+        patch.priority = .{ .set = std.meta.stringToEnum(Priority, v) orelse return error.BadPriority };
+    if (p.getValue("tags")) |v| patch.tags = .{ .set = try splitTags(allocator, v) };
+    if (p.getValue("due")) |v| patch.due = try parseDate(v, now, .due);
+    if (p.getValue("scheduled")) |v| patch.scheduled = try parseDate(v, now, .scheduled);
+    return patch;
+}
+
 test "ymdToEpochDay matches known epoch days" {
     try std.testing.expectEqual(@as(i64, 0), try ymdToEpochDay(1970, 1, 1));
     try std.testing.expectEqual(@as(i64, 31), try ymdToEpochDay(1970, 2, 1));
@@ -311,4 +353,61 @@ test "Patch.isEmpty" {
 test "validate rejects empty title" {
     try std.testing.expectError(error.EmptyTitle, validate(.{ .title = "" }));
     try validate(.{ .title = "ok" });
+}
+
+test "splitTags: empty clears, drops empty segments, trims" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(@as(usize, 0), (try splitTags(a, "")).len);
+    const t = try splitTags(a, " work , , home ,");
+    try std.testing.expectEqual(@as(usize, 2), t.len);
+    try std.testing.expectEqualStrings("work", t[0]);
+    try std.testing.expectEqualStrings("home", t[1]);
+}
+
+test "patchFromArgs builds a patch from parsed flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const argv = [_][]const u8{ "cd34", "--status", "done", "--priority", "high", "--tags", "a,b", "--due", "none" };
+    const parsed = try args.parse(a, &argv, &flag_specs);
+    const p = try patchFromArgs(a, &parsed, 0);
+    try std.testing.expect(switch (p.status) {
+        .set => |s| s == .done,
+        else => false,
+    });
+    try std.testing.expect(switch (p.priority) {
+        .set => |pr| pr == .high,
+        else => false,
+    });
+    try std.testing.expect(switch (p.tags) {
+        .set => |tg| tg.len == 2,
+        else => false,
+    });
+    try std.testing.expect(switch (p.due) {
+        .set => |v| v == null,
+        else => false,
+    });
+    try std.testing.expect(isUnchanged([]const u8, p.title)); // not provided
+}
+
+test "patchFromArgs: tags empty string clears, unknown enums error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        const argv = [_][]const u8{ "id", "--tags", "" };
+        const parsed = try args.parse(a, &argv, &flag_specs);
+        const p = try patchFromArgs(a, &parsed, 0);
+        try std.testing.expect(switch (p.tags) {
+            .set => |tg| tg.len == 0,
+            else => false,
+        });
+    }
+    {
+        const argv = [_][]const u8{ "id", "--status", "wat" };
+        const parsed = try args.parse(a, &argv, &flag_specs);
+        try std.testing.expectError(error.BadStatus, patchFromArgs(a, &parsed, 0));
+    }
 }
