@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const priority = if (args.len >= 4) std.meta.stringToEnum(task.Priority, args[3]) orelse .none else .none;
         const content = task.Content{ .title = args[2], .priority = priority };
-        try client.addTask(content, null);
+        _ = try client.addTask(content, null);
     } else if (std.mem.eql(u8, cmd, "delete")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat delete <id>\n", .{});
@@ -206,10 +206,10 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
     var content = t.content;
     content.status = .done;
     const ops = [_]types.UpdateOp{.{ .id = t.id, .content = content, .expected_version = t.meta.version }};
-    client.updateTasks(&ops) catch |err| {
+    _ = client.updateTasks(&ops) catch |err| {
         if (err == error.Conflict) {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
-            return;
+            return err;
         }
         return err;
     };

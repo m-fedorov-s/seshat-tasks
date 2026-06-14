@@ -42,23 +42,32 @@ pub const Client = struct {
         return parsed.tasks;
     }
 
-    pub fn addTask(self: *Client, content: types.Content, parent_id: ?[]const u8) !void {
+    pub fn addTask(self: *Client, content: types.Content, parent_id: ?[]const u8) !Task {
         const payload = types.AddRequest{ .content = content, .parent_id = parent_id };
-        try self.postJson("/api/tasks/add", payload, &.{ .ok, .created });
+        const body = try self.postJson("/api/tasks/add", payload, &.{ .ok, .created });
+        const parsed = try std.json.parseFromSliceLeaky(types.AddResponse, self.allocator, body, .{
+            .ignore_unknown_fields = true,
+        });
+        return parsed.task;
     }
 
-    pub fn updateTasks(self: *Client, updates: []const types.UpdateOp) !void {
+    pub fn updateTasks(self: *Client, updates: []const types.UpdateOp) ![]Task {
         const payload = types.UpdateRequest{ .updates = updates };
-        try self.postJson("/api/tasks/update", payload, &.{.ok});
+        const body = try self.postJson("/api/tasks/update", payload, &.{.ok});
+        const parsed = try std.json.parseFromSliceLeaky(types.UpdateResponse, self.allocator, body, .{
+            .ignore_unknown_fields = true,
+        });
+        return parsed.tasks;
     }
 
     pub fn deleteTask(self: *Client, id: []const u8) !void {
         const payload = types.DeleteRequest{ .id = id };
-        try self.postJson("/api/tasks/delete", payload, &.{ .ok, .no_content });
+        _ = try self.postJson("/api/tasks/delete", payload, &.{ .ok, .no_content });
     }
 
-    // postJson serializes payload, POSTs it, checks status. 409 -> error.Conflict.
-    fn postJson(self: *Client, path: []const u8, payload: anytype, ok_statuses: []const std.http.Status) !void {
+    // postJson serializes payload, POSTs it, checks status, returns the response body.
+    // 409 -> error.Conflict.
+    fn postJson(self: *Client, path: []const u8, payload: anytype, ok_statuses: []const std.http.Status) ![]u8 {
         var client = std.http.Client{ .io = self.io, .allocator = self.allocator };
         defer client.deinit();
 
@@ -82,9 +91,13 @@ pub const Client = struct {
         try req.sendBodyComplete(body);
 
         var rb: [1024]u8 = undefined;
-        const resp = try req.receiveHead(&rb);
+        var resp = try req.receiveHead(&rb);
         if (resp.head.status == .conflict) return error.Conflict;
-        for (ok_statuses) |s| if (resp.head.status == s) return;
-        return error.HttpError;
+        var ok = false;
+        for (ok_statuses) |s| {
+            if (resp.head.status == s) ok = true;
+        }
+        if (!ok) return error.HttpError;
+        return try resp.reader(&.{}).allocRemaining(self.allocator, .unlimited);
     }
 };
