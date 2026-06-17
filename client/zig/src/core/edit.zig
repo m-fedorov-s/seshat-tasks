@@ -97,6 +97,19 @@ fn parseAbsolute(s: []const u8, kind: DateKind) DateError!DatePatch {
     return .{ .set = secs };
 }
 
+// Largest timestamp we allow (end of 9999-12-31 UTC). Beyond this, epoch decomposition would
+// overflow its u16 year. Keeps every accepted date formattable.
+fn maxSecs() i64 {
+    const max_day = ymdToEpochDay(9999, 12, 31) catch unreachable;
+    return max_day * secs_per_day + 86399;
+}
+
+// Wrap a computed timestamp in a DatePatch, rejecting out-of-range values as BadDate.
+fn boundedSet(secs: i64) DateError!DatePatch {
+    if (secs > maxSecs()) return error.BadDate;
+    return .{ .set = secs };
+}
+
 // "+Nd" / "+Nw" / "+Nm" relative to `now` (UTC), at this kind's time-of-day.
 fn parseRelative(s: []const u8, now: i64, kind: DateKind) DateError!DatePatch {
     if (s.len < 2) return error.BadDate;
@@ -108,8 +121,8 @@ fn parseRelative(s: []const u8, now: i64, kind: DateKind) DateError!DatePatch {
     const base = today_day * secs_per_day + timeOfDay(kind);
 
     switch (unit) {
-        'd' => return .{ .set = try addChecked(base, try mulChecked(n, secs_per_day)) },
-        'w' => return .{ .set = try addChecked(base, try mulChecked(n, 7 * secs_per_day)) },
+        'd' => return boundedSet(try addChecked(base, try mulChecked(n, secs_per_day))),
+        'w' => return boundedSet(try addChecked(base, try mulChecked(n, 7 * secs_per_day))),
         'm' => {
             const ymd = epochDayToYmd(today_day);
             const total = @as(i64, ymd.m - 1) + n;
@@ -301,6 +314,15 @@ test "parseDate: rejects garbage" {
     try std.testing.expectError(error.BadDate, parseDate("+d", 0, .due));
     // a signed numeric field is rejected, not silently normalized
     try std.testing.expectError(error.BadDate, parseDate("2026-+6-14", 0, .due));
+}
+
+test "parseDate: huge relative offset is rejected (no overflow panic)" {
+    // would overflow the u16 year in epoch decomposition if unbounded -> must be BadDate, not a panic
+    try std.testing.expectError(error.BadDate, parseDate("+9999999999d", 0, .due));
+    try std.testing.expectError(error.BadDate, parseDate("+9999999999w", 0, .due));
+    try std.testing.expectError(error.BadDate, parseDate("+999999999999999999999d", 0, .due));
+    // a large-but-representable offset still works (+3650d ~ 10 years)
+    try std.testing.expect((try parseDate("+3650d", 0, .due)).set != null);
 }
 
 test "applyPatch: unchanged keeps base, set overrides" {
