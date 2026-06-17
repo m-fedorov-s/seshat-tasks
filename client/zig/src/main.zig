@@ -388,7 +388,13 @@ fn usage() void {
         \\                      --detailed    rich output (tags, dates, ids, description)
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
-        \\  add <title> [prio] Add a top-level task
+        \\  add <title> [edits]   Add a top-level task. Accepts the edit flags below.
+        \\  update <id> [edits]   Edit a task (id tail / #handle). Edit flags:
+        \\                      --title S  --description S  --status S  --priority S
+        \\                      --due DATE|none  --scheduled DATE|none  --tags a,b,c
+        \\                      DATE = YYYY-MM-DD | YYYY-MM-DDTHH:MM | +Nd|+Nw|+Nm
+        \\                      --dry-run   preview the result, do not write
+        \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
         \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
         \\
@@ -402,4 +408,5 @@ test {
     _ = @import("core/args.zig");
     _ = @import("formatter.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/edit.zig");
 }
