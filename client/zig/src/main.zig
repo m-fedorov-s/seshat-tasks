@@ -32,13 +32,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "show")) {
         try runShow(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "add")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: seshat add <title> [priority]\n", .{});
-            return error.InvalidArgs;
-        }
-        const priority = if (args.len >= 4) std.meta.stringToEnum(task.Priority, args[3]) orelse .none else .none;
-        const content = task.Content{ .title = args[2], .priority = priority };
-        _ = try client.addTask(content, null);
+        try runAdd(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "delete")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat delete <id>\n", .{});
@@ -260,6 +254,51 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
         }
         return err;
     };
+}
+
+fn runAdd(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    client: *Client,
+    out: *std.Io.Writer,
+    flag_argv: []const []const u8,
+) !void {
+    var parsed = argparse.parse(allocator, flag_argv, &edit.flag_specs) catch |err| {
+        std.debug.print("Bad arguments to `add`: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer argparse.deinit(allocator, &parsed);
+
+    if (parsed.positionals.items.len < 1) {
+        std.debug.print("Usage: seshat add <title> [edits...]\n", .{});
+        return error.InvalidArgs;
+    }
+    const title = parsed.positionals.items[0];
+    const now = nowSeconds(init.io);
+
+    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+        reportPatchError(err);
+        return err;
+    };
+    const new_content = edit.applyPatch(.{ .title = title }, patch);
+    edit.validate(new_content) catch |err| {
+        std.debug.print("Invalid task: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    if (parsed.getBool("dry-run")) {
+        // No server id yet; use a placeholder so the preview renders a (meaningless) handle.
+        const placeholder = "??????????????????????????"; // 26 chars, ULID width
+        const preview = task.Task{ .id = placeholder, .content = new_content, .meta = .{} };
+        try renderOne(allocator, init, out, client, &.{preview}, preview, .detailed, now);
+        return;
+    }
+
+    const created = try client.addTask(new_content, null);
+    if (parsed.getBool("verbose")) {
+        const one = [_]task.Task{created};
+        try renderOne(allocator, init, out, client, &one, created, .compact, now);
+    }
 }
 
 fn runUpdate(
