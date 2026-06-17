@@ -6,6 +6,7 @@ const types = @import("api/types.zig");
 const formatter = @import("formatter.zig");
 const view = @import("core/view.zig");
 const argparse = @import("core/args.zig");
+const edit = @import("core/edit.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -55,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidArgs;
         }
         try markDone(&client, args[2]);
+    } else if (std.mem.eql(u8, cmd, "update")) {
+        try runUpdate(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "help")) {
         return usage();
     } else {
@@ -156,14 +159,7 @@ fn runShow(
     }
 
     var opts = if (parsed.getBool("detailed")) formatter.RenderOptions.detailed() else formatter.RenderOptions.compact();
-    opts.width = width_blk: {
-        if (init.environ_map.get("COLUMNS")) |c| {
-            if (std.fmt.parseInt(usize, c, 10)) |w| {
-                if (w > 0) break :width_blk w;
-            } else |_| {}
-        }
-        break :width_blk @as(usize, client.config.width);
-    };
+    opts.width = resolveWidth(init, client);
     if (parsed.getBool("flat")) opts.show_children = false;
     opts.color = resolveColor(init, parsed.getBool("no-color"));
 
@@ -186,6 +182,57 @@ fn resolveColor(init: std.process.Init, no_color_flag: bool) formatter.ColorMode
     const is_tty = std.Io.File.stdout().isTty(init.io) catch false;
     if (is_tty) return .on;
     return .off;
+}
+
+fn nowSeconds(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
+fn resolveWidth(init: std.process.Init, client: *Client) usize {
+    if (init.environ_map.get("COLUMNS")) |c| {
+        if (std.fmt.parseInt(usize, c, 10)) |w| {
+            if (w > 0) return w;
+        } else |_| {}
+    }
+    return @as(usize, client.config.width);
+}
+
+fn reportPatchError(err: edit.BuildError) void {
+    switch (err) {
+        error.BadStatus => std.debug.print("Unknown status (todo|in_progress|done|cancelled)\n", .{}),
+        error.BadPriority => std.debug.print("Unknown priority (none|low|medium|high)\n", .{}),
+        error.BadDate => std.debug.print("Bad date. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, +Nd/+Nw/+Nm, or none\n", .{}),
+        error.OutOfMemory => std.debug.print("Out of memory\n", .{}),
+    }
+}
+
+// Render a single task. `handle_tasks` sizes the #handle (full fetched set for update;
+// just `t` for add). `layout` picks compact/detailed.
+fn renderOne(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    out: *std.Io.Writer,
+    client: *Client,
+    handle_tasks: []const task.Task,
+    t: task.Task,
+    layout: formatter.Layout,
+    now: i64,
+) !void {
+    var idx = try view.Index.build(allocator, handle_tasks);
+    defer idx.deinit();
+
+    var opts = if (layout == .detailed) formatter.RenderOptions.detailed() else formatter.RenderOptions.compact();
+    opts.width = resolveWidth(init, client);
+    opts.color = resolveColor(init, false);
+
+    var ids = std.ArrayList([]const u8).empty;
+    defer ids.deinit(allocator);
+    for (handle_tasks) |x| try ids.append(allocator, x.id);
+    opts.handle_len = try view.minUniqueSuffixLen(allocator, ids.items);
+
+    const one = [_]task.Task{t};
+    try formatter.render(out, opts, now, &one, &idx);
+    try out.flush();
 }
 
 fn reportResolveError(err: view.ResolveError, id_prefix: []const u8) void {
@@ -213,6 +260,67 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
         }
         return err;
     };
+}
+
+fn runUpdate(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    client: *Client,
+    out: *std.Io.Writer,
+    flag_argv: []const []const u8,
+) !void {
+    var parsed = argparse.parse(allocator, flag_argv, &edit.flag_specs) catch |err| {
+        std.debug.print("Bad arguments to `update`: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer argparse.deinit(allocator, &parsed);
+
+    if (parsed.positionals.items.len < 1) {
+        std.debug.print("Usage: seshat update <id> [edits...]\n", .{});
+        return error.InvalidArgs;
+    }
+    const id = parsed.positionals.items[0];
+    const now = nowSeconds(init.io);
+
+    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+        reportPatchError(err);
+        return err;
+    };
+    if (patch.isEmpty()) {
+        std.debug.print("nothing to update\n", .{});
+        return error.InvalidArgs;
+    }
+
+    const tasks = try client.fetchTasks();
+    const t = view.resolve(tasks, id) catch |err| {
+        reportResolveError(err, id);
+        return err;
+    };
+
+    const new_content = edit.applyPatch(t.content, patch);
+    edit.validate(new_content) catch |err| {
+        std.debug.print("Invalid task: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    if (parsed.getBool("dry-run")) {
+        const preview = task.Task{ .id = t.id, .content = new_content, .meta = t.meta };
+        try renderOne(allocator, init, out, client, tasks, preview, .detailed, now);
+        return;
+    }
+
+    const ops = [_]types.UpdateOp{.{ .id = t.id, .content = new_content, .expected_version = t.meta.version }};
+    const updated = client.updateTasks(&ops) catch |err| {
+        if (err == error.Conflict) {
+            std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
+            return err;
+        }
+        return err;
+    };
+
+    if (parsed.getBool("verbose") and updated.len > 0) {
+        try renderOne(allocator, init, out, client, updated, updated[0], .compact, now);
+    }
 }
 
 fn usage() void {
