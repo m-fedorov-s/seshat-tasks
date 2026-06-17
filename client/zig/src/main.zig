@@ -9,6 +9,18 @@ const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |err| switch (err) {
+        // run()/its callees already printed a user-facing message for expected failures.
+        error.Reported => std.process.exit(1),
+        // Unexpected (network, render, OOM, ...): one clean line, no stack trace.
+        else => {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
@@ -18,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
 
     const parsed_config = Config.load(init.io, allocator, home, config_path) catch |err| {
         std.debug.print("Error loading config from {s}: {any}\n", .{ config_path, err });
-        return err;
+        return error.Reported;
     };
     defer parsed_config.deinit();
     const config = parsed_config.value;
@@ -36,18 +48,18 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "delete")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat delete <id>\n", .{});
-            return error.InvalidArgs;
+            return error.Reported;
         }
         const tasks = try client.fetchTasks();
         const t = view.resolve(tasks, args[2]) catch |err| {
             reportResolveError(err, args[2]);
-            return;
+            return error.Reported;
         };
         try client.deleteTask(t.id);
     } else if (std.mem.eql(u8, cmd, "done")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat done <id>\n", .{});
-            return error.InvalidArgs;
+            return error.Reported;
         }
         try markDone(&client, args[2]);
     } else if (std.mem.eql(u8, cmd, "update")) {
@@ -56,7 +68,8 @@ pub fn main(init: std.process.Init) !void {
         return usage();
     } else {
         std.debug.print("Unknown command\n", .{});
-        return usage();
+        usage();
+        return error.Reported;
     }
 }
 
@@ -79,7 +92,7 @@ fn runShow(
 ) !void {
     var parsed = argparse.parse(allocator, flag_argv, &show_specs) catch |err| {
         std.debug.print("Bad arguments to `show`: {s}\n", .{@errorName(err)});
-        return err;
+        return error.Reported;
     };
     defer argparse.deinit(allocator, &parsed);
 
@@ -109,14 +122,14 @@ fn runShow(
                     try status_list.append(allocator, st);
                 } else {
                     std.debug.print("Unknown status in filter: {s}\n", .{s});
-                    return error.InvalidArgs;
+                    return error.Reported;
                 }
             }
         } else if (std.mem.eql(u8, expr, "overdue")) {
             overdue = true;
         } else {
             std.debug.print("Unknown filter: {s}\n", .{expr});
-            return error.InvalidArgs;
+            return error.Reported;
         }
     }
 
@@ -132,7 +145,7 @@ fn runShow(
         const s = parsed.getValue("sort") orelse break :blk .urgency;
         break :blk std.meta.stringToEnum(view.Strategy, s) orelse {
             std.debug.print("Unknown sort strategy: {s}\n", .{s});
-            return error.InvalidArgs;
+            return error.Reported;
         };
     };
 
@@ -242,7 +255,7 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
     const tasks = try client.fetchTasks();
     const t = view.resolve(tasks, id_prefix) catch |err| {
         reportResolveError(err, id_prefix);
-        return;
+        return error.Reported;
     };
     var content = t.content;
     content.status = .done;
@@ -250,7 +263,7 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
     _ = client.updateTasks(&ops) catch |err| {
         if (err == error.Conflict) {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
-            return err;
+            return error.Reported;
         }
         return err;
     };
@@ -265,25 +278,25 @@ fn runAdd(
 ) !void {
     var parsed = argparse.parse(allocator, flag_argv, &edit.flag_specs) catch |err| {
         std.debug.print("Bad arguments to `add`: {s}\n", .{@errorName(err)});
-        return err;
+        return error.Reported;
     };
     defer argparse.deinit(allocator, &parsed);
 
     if (parsed.positionals.items.len < 1) {
         std.debug.print("Usage: seshat add <title> [edits...]\n", .{});
-        return error.InvalidArgs;
+        return error.Reported;
     }
     const title = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
     const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
         reportPatchError(err);
-        return err;
+        return error.Reported;
     };
     const new_content = edit.applyPatch(.{ .title = title }, patch);
     edit.validate(new_content) catch |err| {
         std.debug.print("Invalid task: {s}\n", .{@errorName(err)});
-        return err;
+        return error.Reported;
     };
 
     if (parsed.getBool("dry-run")) {
@@ -310,36 +323,36 @@ fn runUpdate(
 ) !void {
     var parsed = argparse.parse(allocator, flag_argv, &edit.flag_specs) catch |err| {
         std.debug.print("Bad arguments to `update`: {s}\n", .{@errorName(err)});
-        return err;
+        return error.Reported;
     };
     defer argparse.deinit(allocator, &parsed);
 
     if (parsed.positionals.items.len < 1) {
         std.debug.print("Usage: seshat update <id> [edits...]\n", .{});
-        return error.InvalidArgs;
+        return error.Reported;
     }
     const id = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
     const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
         reportPatchError(err);
-        return err;
+        return error.Reported;
     };
     if (patch.isEmpty()) {
         std.debug.print("nothing to update\n", .{});
-        return error.InvalidArgs;
+        return error.Reported;
     }
 
     const tasks = try client.fetchTasks();
     const t = view.resolve(tasks, id) catch |err| {
         reportResolveError(err, id);
-        return err;
+        return error.Reported;
     };
 
     const new_content = edit.applyPatch(t.content, patch);
     edit.validate(new_content) catch |err| {
         std.debug.print("Invalid task: {s}\n", .{@errorName(err)});
-        return err;
+        return error.Reported;
     };
 
     if (parsed.getBool("dry-run")) {
@@ -352,7 +365,7 @@ fn runUpdate(
     const updated = client.updateTasks(&ops) catch |err| {
         if (err == error.Conflict) {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
-            return err;
+            return error.Reported;
         }
         return err;
     };
