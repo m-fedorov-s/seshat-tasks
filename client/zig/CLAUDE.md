@@ -24,15 +24,31 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 ## Layout
 
-- `src/main.zig` — entry point + subcommand dispatch (`show`, `add`, `delete <id>`, `done <id>`,
-  `help`). Uses the 0.16 `std.process.Init` entry signature: `pub fn main(init: std.process.Init)
-  !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env from
-  `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
+- `src/main.zig` — entry point + subcommand dispatch (`show`, `add`, `update <id>`, `delete <id>`,
+  `done <id>`, `help`). Uses the 0.16 `std.process.Init` entry signature: `pub fn main(init:
+  std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
+  from `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
   `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline (parse →
   fetch → `view.select` → `view.rank` → `formatter.render`|`renderJson`), resolves color
   (`.auto`→on/off via `std.Io.File.stdout().isTty`), width (`COLUMNS` env → `config.width`), and the
   `#handle` length (`view.minUniqueSuffixLen` over *all* fetched tasks, so handles resolve uniquely).
   `done`/`delete` resolve an id **tail/suffix** (or `#handle`) via `view.resolve`.
+  - **`add`/`update`** share one flag set (`edit.flag_specs`) and the flag→patch builder
+    (`edit.patchFromArgs`): `runAdd`/`runUpdate` build an `edit.Patch`, apply it client-side
+    (`edit.applyPatch` — `add` over a default `Content` seeded with the positional title; `update`
+    over the freshly-fetched task), `edit.validate` it, then add / optimistic-update via the server.
+    Flags: `--title/--description/--status/--priority/--due/--scheduled/--tags`, plus `--dry-run`
+    (render the result **detailed**, no write) and `--verbose` (render the server-returned task
+    **compact**). `--tags a,b,c` is a wholesale set (`--tags ""` clears). `update` needs ≥1 edit
+    (else "nothing to update", nonzero). The old bare `add <title> [prio]` positional was removed
+    (use `--priority`). Shared render helper `renderOne` + `resolveWidth`/`nowSeconds`.
+  - **Error model:** `main` calls `run` and catches: `error.Reported` (an expected failure whose
+    friendly message was already printed) → `std.process.exit(1)` silently; any other error → one
+    line `error: <name>` + exit 1. So all commands fail **nonzero and trace-free** — every
+    user-facing error site prints its message then `return error.Reported` (bad args, unknown
+    enum/date, no-such-id, conflict, empty title, unknown command). `delete`/`done` now exit
+    nonzero on not-found (previously exited 0). (Known gap: piping output to a consumer that closes
+    early still aborts with `error.WriteFailed`; see repo `plans/todo.md` → Client robustness.)
 - `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
   children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
   sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
@@ -40,6 +56,16 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   unique tail length). All pure, `now: i64` passed in.
 - `src/core/args.zig` — a generic, declaration-driven flag parser: `OptionSpec` table in →
   `ParsedArgs` (query by name with `getBool`/`getValue`/`getMulti`). No seshat flag names baked in.
+- `src/core/edit.zig` — the **pure edit core** (no I/O), shared by `add`/`update` and the future
+  TUI. `Edit(T) = union(enum){ unchanged, set: T }` is the uniform per-field patch; `Patch` is one
+  `Edit` per editable `Content` field (`DatePatch = Edit(?i64)`, `.set = null` clears; tags `.set`
+  is a wholesale replace, empty = cleared); `applyPatch(base, patch)` is pure (carries `child_ids`
+  through — hierarchy is never patched here); `validate` (non-empty title). `parseDate(input, now,
+  kind)` parses the UTC date grammar — `YYYY-MM-DD` (date-only → **end-of-day for `.due`**,
+  **start-of-day for `.scheduled`**), `YYYY-MM-DDTHH:MM`, `+Nd/+Nw/+Nm` (relative, `+Nm` clamps to
+  month end), `none` → clear — via a hand-rolled `ymdToEpochDay` (std has no date parser; see
+  `plans/todo.md`). `flag_specs` + `patchFromArgs` turn `ParsedArgs` into a `Patch` (`--tags`
+  comma-split here; unknown status/priority/date → `BuildError`).
 - `src/formatter.zig` — `RenderOptions` (one struct, `compact()`/`detailed()` constructors, a
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
@@ -52,8 +78,11 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/core/task.zig` — `Task = { id, content, meta }` matching `schema/SCHEMA.md`. `Status`/
   `Priority` are string enums with an unknown-value `jsonParse` fallback.
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
-  No cache (scope A) — every fetch hits the server.
-- `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, etc.).
+  No cache (scope A) — every fetch hits the server. `postJson` returns the response body; `addTask`
+  returns the created `Task` and `updateTasks` returns the updated `[]Task` (server echoes the
+  authoritative result — used by `--verbose`). 409 → `error.Conflict`.
+- `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
+  `UpdateResponse`, etc.).
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by
   `make schema-test` alongside the Go side).
 

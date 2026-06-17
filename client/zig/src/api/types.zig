@@ -30,3 +30,15 @@ pub const UpdateRequest = struct {
 pub const DeleteRequest = struct {
     id: []const u8,
 };
+
+// POST /api/tasks/add response
+pub const AddResponse = struct {
+    state_version: u64 = 0,
+    task: Task,
+};
+
+// POST /api/tasks/update response
+pub const UpdateResponse = struct {
+    state_version: u64 = 0,
+    tasks: []Task,
+};
