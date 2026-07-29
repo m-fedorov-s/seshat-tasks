@@ -210,3 +210,21 @@ func TestNewServerHonoursConfiguredRate(t *testing.T) {
 		t.Errorf("limiter burst = %d, want 100", got)
 	}
 }
+
+func TestOversizedBodyIs413NotBadRequest(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// A structurally VALID request that is simply too large — so a 400 here would
+	// prove the size limit was misclassified as a JSON syntax error.
+	huge := strings.Repeat("a", (1<<20)+1024)
+	body := `{"content":{"title":"` + huge + `","status":"todo","priority":"none"}}`
+	rr := do(t, srv, "POST", "/api/tasks/add", "s3cr3t", body, nil)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		// Truncate: the response echoes the task, so the untruncated body would dump
+		// more than a megabyte into the test log.
+		snippet := rr.Body.String()
+		if len(snippet) > 200 {
+			snippet = snippet[:200] + "...(truncated)"
+		}
+		t.Fatalf("expected 413, got %d: %s", rr.Code, snippet)
+	}
+}

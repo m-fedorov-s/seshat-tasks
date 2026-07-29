@@ -24,6 +24,11 @@ type ConflictError struct{ Conflicts []Task }
 
 func (e *ConflictError) Error() string { return "version conflict" }
 
+// TooLargeError reports a request body over the size limit (HTTP 413).
+type TooLargeError struct{}
+
+func (e *TooLargeError) Error() string { return "request body too large" }
+
 type Store struct {
 	mu     sync.RWMutex
 	state  State
