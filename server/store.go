@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -55,7 +56,11 @@ func NewStore(path string) (*Store, error) {
 func (st *Store) load() error {
 	b, err := os.ReadFile(st.path)
 	if errors.Is(err, os.ErrNotExist) {
-		st.state = State{StateVersion: 0, Tasks: map[string]Task{}}
+		st.state = State{
+			DataFormatVersion: CurrentDataFormatVersion,
+			StateVersion:      0,
+			Tasks:             map[string]Task{},
+		}
 		st.rebuildIndex()
 		return st.saveState(st.state)
 	}
@@ -68,6 +73,16 @@ func (st *Store) load() error {
 	}
 	if s.Tasks == nil {
 		s.Tasks = map[string]Task{}
+	}
+	// Absent (or 0) means a file written before the field existed; v1 is the only
+	// shape that has ever existed, so adopt it and stamp on the next write.
+	if s.DataFormatVersion == 0 {
+		s.DataFormatVersion = 1
+	}
+	if s.DataFormatVersion > CurrentDataFormatVersion {
+		return fmt.Errorf(
+			"data file %s has data_format_version %d, but this binary supports at most %d — upgrade seshat",
+			st.path, s.DataFormatVersion, CurrentDataFormatVersion)
 	}
 	if err := validateState(s); err != nil {
 		return err
@@ -137,7 +152,11 @@ func cloneState(s State) State {
 		v.Content.Tags = append([]string{}, v.Content.Tags...)
 		ts[k] = v
 	}
-	return State{StateVersion: s.StateVersion, Tasks: ts}
+	return State{
+		DataFormatVersion: s.DataFormatVersion,
+		StateVersion:      s.StateVersion,
+		Tasks:             ts,
+	}
 }
 
 type AddRequest struct {

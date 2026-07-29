@@ -202,3 +202,66 @@ func TestAddChildAtPosition(t *testing.T) {
 		t.Fatalf("clamp-to-append: expected last=%s, got %v", d.ID, got)
 	}
 }
+
+func writeDataFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "data.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestNewFileGetsCurrentDataFormatVersion(t *testing.T) {
+	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
+		t.Fatalf("expected version %d on a fresh store, got %d", CurrentDataFormatVersion, got)
+	}
+}
+
+func TestAbsentDataFormatVersionAssumedCurrent(t *testing.T) {
+	// Files written before this field existed: the only shape that ever existed is v1.
+	path := writeDataFile(t, `{"state_version":3,"tasks":{}}`)
+	st, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("a legacy file must load, got error: %v", err)
+	}
+	if got := st.Snapshot().DataFormatVersion; got != 1 {
+		t.Fatalf("expected legacy file to be treated as v1, got %d", got)
+	}
+}
+
+func TestFutureDataFormatVersionRefusesToLoad(t *testing.T) {
+	// Without this, an older binary silently mangles a newer file.
+	path := writeDataFile(t, `{"data_format_version":2,"state_version":0,"tasks":{}}`)
+	if _, err := NewStore(path); err == nil {
+		t.Fatal("expected NewStore to refuse a future data_format_version, got nil error")
+	}
+}
+
+func TestDataFormatVersionSurvivesAWrite(t *testing.T) {
+	// Guards the cloneState trap: cloneState rebuilds State field-by-field, so a
+	// field it forgets is zeroed on the first mutation.
+	path := filepath.Join(t.TempDir(), "data.json")
+	st, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
+		t.Fatalf("in-memory version zeroed by a write: got %d", got)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
+		t.Fatalf("on-disk version zeroed by a write: got %d", got)
+	}
+}
