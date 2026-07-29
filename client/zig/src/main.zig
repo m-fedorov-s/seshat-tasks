@@ -12,6 +12,13 @@ pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // run()/its callees already printed a user-facing message for expected failures.
         error.Reported => std.process.exit(1),
+        // Broken pipe: the consumer closed stdout early (`seshat show | head`, quitting
+        // a pager, `| grep -q`). Unix convention is a clean stop, not an error.
+        // Zig 0.16's writer errors are coarse, so a genuine write failure (e.g. a full
+        // disk when redirecting to a file) also lands here and exits 0 — wrong in
+        // principle, harmless in practice, and the alternative is plumbing errno
+        // through the whole writer stack.
+        error.WriteFailed => std.process.exit(0),
         // Unexpected (network, render, OOM, ...): one clean line, no stack trace.
         else => {
             std.debug.print("error: {s}\n", .{@errorName(err)});

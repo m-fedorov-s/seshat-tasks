@@ -1,4 +1,4 @@
-.PHONY: schema-test server-test dev-server dev-seed
+.PHONY: schema-test server-test dev-server dev-seed client-integration-test
 
 server-test:
 	cd server && go test ./...
@@ -14,3 +14,7 @@ dev-seed:
 schema-test:
 	cd server && go test ./... -run 'TestFixtures|TestFixtureRoundTrip|TestUnknownFields'
 	cd client/zig && zig test src/schema_test.zig
+
+# End-to-end client tests that need a real server + real pipes.
+client-integration-test:
+	./test/broken-pipe.sh
