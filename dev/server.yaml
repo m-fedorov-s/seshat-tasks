@@ -1,5 +1,6 @@
 # Dev server config (throwaway secret — local use only).
 # Run from the repo root: ./server/seshat -config dev/server.yaml
 secret: devsecret
+bind: 127.0.0.1
 port: 8799
 data_file: dev/seshat-dev-data.json
