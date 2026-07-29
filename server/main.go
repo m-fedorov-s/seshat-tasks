@@ -14,6 +14,8 @@ type Config struct {
 	Secret   string `yaml:"secret"`
 	Port     uint   `yaml:"port"`
 	DataFile string `yaml:"data_file"`
+	// RateLimit is the requests-per-second ceiling. 0 means use defaultRateLimit.
+	RateLimit int `yaml:"rate_limit"`
 }
 
 func main() {
@@ -31,12 +33,18 @@ func main() {
 	if cfg.DataFile == "" {
 		cfg.DataFile = "seshat-data.json"
 	}
+	if cfg.RateLimit == 0 {
+		cfg.RateLimit = defaultRateLimit
+	}
+	if cfg.RateLimit < 0 {
+		log.Fatalf("config rate_limit must be positive, got %d", cfg.RateLimit)
+	}
 
 	store, err := NewStore(cfg.DataFile)
 	if err != nil {
 		log.Fatalf("load store: %v", err)
 	}
-	srv := NewServer(store, cfg.Secret)
+	srv := NewServer(store, cfg.Secret, cfg.RateLimit)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("seshat server listening on %s, data=%s", addr, cfg.DataFile)

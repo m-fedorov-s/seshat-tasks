@@ -7,7 +7,15 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"golang.org/x/time/rate"
 )
+
+// defaultRateLimit is the requests-per-second ceiling when config omits one.
+// Generous: no interactive CLI use comes near it with a handful of clients, so it
+// only trips on an actual flood. Global for now — with one shared secret, per-token
+// IS global. Stage 2 makes it a per-user lookup.
+const defaultRateLimit = 10
 
 type Server struct {
 	store *Store
@@ -16,18 +24,23 @@ type Server struct {
 	// subtle.ConstantTimeCompare would still have (it returns early on length
 	// mismatch). Stage 3 will read this digest from config instead of computing it.
 	secretHash [32]byte
+	limiter    *rate.Limiter
 }
 
-func NewServer(store *Store, secret string) *Server {
-	return &Server{store: store, secretHash: sha256.Sum256([]byte(secret))}
+func NewServer(store *Store, secret string, ratePerSecond int) *Server {
+	return &Server{
+		store:      store,
+		secretHash: sha256.Sum256([]byte(secret)),
+		limiter:    rate.NewLimiter(rate.Limit(ratePerSecond), 2*ratePerSecond),
+	}
 }
 
 // Handler returns the full middleware chain. The ORDER IS LOAD-BEARING — see
 // docs/superpowers/specs/2026-07-29-stage-0-hardening-design.md §2.1. In particular
-// auth runs BEFORE the rate limiter (added in a later task) so that unauthenticated
-// traffic cannot exhaust the bucket and lock the real user out.
+// auth runs BEFORE the rate limiter so that unauthenticated traffic cannot exhaust
+// the bucket and lock the real user out.
 func (s *Server) Handler() http.Handler {
-	return s.auth(s.mux())
+	return s.auth(s.rateLimit(s.mux()))
 }
 
 func (s *Server) mux() *http.ServeMux {
@@ -44,6 +57,19 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		presented := sha256.Sum256([]byte(r.Header.Get("Authorization")))
 		if subtle.ConstantTimeCompare(presented[:], s.secretHash[:]) != 1 {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rateLimit guards the expensive paths: handleGet deep-copies the whole task map on
+// every call (cloneState), and every write fsyncs and rewrites the entire JSON file.
+// It runs after auth deliberately; see Handler.
+func (s *Server) rateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.limiter.Allow() {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 			return
 		}
 		next.ServeHTTP(w, r)
