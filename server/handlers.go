@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,27 +10,44 @@ import (
 )
 
 type Server struct {
-	store  *Store
-	secret string
+	store *Store
+	// secretHash is sha256(secret), precomputed once so the per-request compare is
+	// over fixed-size digests. Hashing both sides closes the length leak that a raw
+	// subtle.ConstantTimeCompare would still have (it returns early on length
+	// mismatch). Stage 3 will read this digest from config instead of computing it.
+	secretHash [32]byte
+}
+
+func NewServer(store *Store, secret string) *Server {
+	return &Server{store: store, secretHash: sha256.Sum256([]byte(secret))}
+}
+
+// Handler returns the full middleware chain. The ORDER IS LOAD-BEARING — see
+// docs/superpowers/specs/2026-07-29-stage-0-hardening-design.md §2.1. In particular
+// auth runs BEFORE the rate limiter (added in a later task) so that unauthenticated
+// traffic cannot exhaust the bucket and lock the real user out.
+func (s *Server) Handler() http.Handler {
+	return s.auth(s.mux())
 }
 
 func (s *Server) mux() *http.ServeMux {
 	m := http.NewServeMux()
-	m.HandleFunc("/api/tasks/get", s.auth(s.handleGet))
-	m.HandleFunc("/api/tasks/add", s.auth(s.handleAdd))
-	m.HandleFunc("/api/tasks/update", s.auth(s.handleUpdate))
-	m.HandleFunc("/api/tasks/delete", s.auth(s.handleDelete))
+	m.HandleFunc("/api/tasks/get", s.handleGet)
+	m.HandleFunc("/api/tasks/add", s.handleAdd)
+	m.HandleFunc("/api/tasks/update", s.handleUpdate)
+	m.HandleFunc("/api/tasks/delete", s.handleDelete)
 	return m
 }
 
-func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != s.secret {
+func (s *Server) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+		if subtle.ConstantTimeCompare(presented[:], s.secretHash[:]) != 1 {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
 			return
 		}
-		h(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

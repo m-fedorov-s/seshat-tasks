@@ -15,8 +15,7 @@ func newTestServer(t *testing.T) (*Server, *Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{store: st, secret: "s3cr3t"}
-	return srv, st
+	return NewServer(st, "s3cr3t"), st
 }
 
 func do(t *testing.T, srv *Server, method, path, secret, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -29,7 +28,7 @@ func do(t *testing.T, srv *Server, method, path, secret, body string, hdr map[st
 		req.Header.Set(k, v)
 	}
 	rr := httptest.NewRecorder()
-	srv.mux().ServeHTTP(rr, req)
+	srv.Handler().ServeHTTP(rr, req)
 	return rr
 }
 
@@ -119,5 +118,29 @@ func TestDeleteHandler(t *testing.T) {
 	rr := do(t, srv, "POST", "/api/tasks/delete", "s3cr3t", body, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestAuthEmptySecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for absent Authorization header, got %d", rr.Code)
+	}
+}
+
+func TestAuthShorterSecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for truncated secret, got %d", rr.Code)
+	}
+}
+
+func TestAuthLongerSecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t-extra", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for over-long secret, got %d", rr.Code)
 	}
 }

@@ -36,11 +36,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load store: %v", err)
 	}
-	srv := &Server{store: store, secret: cfg.Secret}
+	srv := NewServer(store, cfg.Secret)
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("seshat server listening on %s, data=%s", addr, cfg.DataFile)
-	if err := http.ListenAndServe(addr, srv.mux()); err != nil {
+	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
 }
