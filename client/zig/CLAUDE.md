@@ -79,11 +79,12 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   `Edit` per editable `Content` field (`DatePatch = Edit(?i64)`, `.set = null` clears; tags `.set`
   is a wholesale replace, empty = cleared); `applyPatch(base, patch)` is pure (carries `child_ids`
   through — hierarchy is never patched here); `validate` (non-empty title). `parseDate(input, now,
-  kind)` parses the UTC date grammar — `YYYY-MM-DD` (date-only → **end-of-day for `.due`**,
-  **start-of-day for `.scheduled`**), `YYYY-MM-DDTHH:MM`, `+Nd/+Nw/+Nm` (relative, `+Nm` clamps to
-  month end), `none` → clear — via a hand-rolled `ymdToEpochDay` (std has no date parser; see
-  `plans/todo.md`). `flag_specs` + `patchFromArgs` turn `ParsedArgs` into a `Patch` (`--tags`
-  comma-split here; unknown status/priority/date → `BuildError`).
+  kind, offset_minutes)` parses ISO dates/times — `YYYY-MM-DD` (date-only → **local** **end-of-day
+  for `.due`**, **local** **start-of-day for `.scheduled`**, stored as UTC), `YYYY-MM-DDTHH:MM`,
+  `+Nd/+Nw/+Nm` (relative to the **local** day, `+Nm` clamps to month end), `none` → clear — via
+  a hand-rolled `ymdToEpochDay` (std has no date parser; see `plans/todo.md`). `flag_specs` +
+  `patchFromArgs` (takes `offset_minutes`) turn `ParsedArgs` into a `Patch` (`--tags` comma-split
+  here; unknown status/priority/date → `BuildError`).
 - `src/formatter.zig` — `RenderOptions` (one struct, `compact()`/`detailed()` constructors, a
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
@@ -92,7 +93,8 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
-  `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred).
+  `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`
+  (ISO±HH:MM, defaults to `"+00:00"`), `offset_minutes` (derived from `utc_offset`).
 - `src/core/task.zig` — `Task = { id, content, meta }` matching `schema/SCHEMA.md`. `Status`/
   `Priority` are string enums with an unknown-value `jsonParse` fallback.
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
