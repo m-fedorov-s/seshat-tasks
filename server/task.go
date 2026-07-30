@@ -73,7 +73,7 @@ const CurrentDataFormatVersion = 1
 
 // State is the whole server state and the on-disk JSON shape.
 type State struct {
-	DataFormatVersion uint            `json:"data_format_version"`
+	DataFormatVersion uint64          `json:"data_format_version"`
 	StateVersion      uint64          `json:"state_version"`
 	Tasks             map[string]Task `json:"tasks"`
 }

@@ -13,6 +13,10 @@ zig build test         # runs the whole suite (main.zig aggregates the other fil
 zig test src/<file>.zig # run a single file's unit tests directly (fastest iteration)
 ```
 
+**Requires a git checkout.** `build.zig` derives the `--version` string by shelling out to `git
+describe --tags --always --dirty` and aborts the build if that fails (e.g. building from a
+tarball with no `.git`). Override with `-Dversion=<string>` when building outside a checkout.
+
 **Gotcha:** `zig build test` uses `src/main.zig` as the test root, so a file's tests only run if
 reachable from main's import graph. `src/main.zig` ends with a `test { _ = @import("core/view.zig");
 … }` aggregator block precisely so `zig build test` exercises view/args/formatter/config. If you add
@@ -30,8 +34,10 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 ## Layout
 
-- `src/main.zig` — entry point + subcommand dispatch (`show`, `add`, `update <id>`, `delete <id>`,
-  `done <id>`, `help`). Uses the 0.16 `std.process.Init` entry signature: `pub fn main(init:
+- `src/main.zig` — entry point + subcommand dispatch (`--version`, `show`, `add`, `update <id>`,
+  `delete <id>`, `done <id>`, `help`). `--version` is checked before the config load (and prints
+  `build_options.version`), so it works on a machine with no config file. Uses the 0.16
+  `std.process.Init` entry signature: `pub fn main(init:
   std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
   from `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
   `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline (parse →
@@ -92,7 +98,12 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
   No cache (scope A) — every fetch hits the server. `postJson` returns the response body; `addTask`
   returns the created `Task` and `updateTasks` returns the updated `[]Task` (server echoes the
-  authoritative result — used by `--verbose`). 409 → `error.Conflict`.
+  authoritative result — used by `--verbose`). 409 → `error.Conflict`. Every other non-2xx response
+  goes through `fail()`, which prints `server error (<code>): <message>` and returns
+  `error.Reported` — matching the client-wide error model. `<message>` is the server's own
+  `{"error": "..."}` body via `parseServerError`, falling back to `defaultMessage(code)` (a small
+  switch over the statuses Stage 0 introduced: 429/413/403/404, else a generic message) when the
+  body isn't parseable.
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by

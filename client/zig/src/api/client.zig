@@ -20,8 +20,11 @@ pub const Client = struct {
     // then returns error.Reported — matching the client-wide error model (print the
     // user-facing message at the failure site, exit nonzero without a trace).
     // The return type is error{Reported}, NOT anyerror: anyerror would collapse the
-    // inferred error sets of fetchTasks/postJson and their callers all the way up to
-    // run(), silently disabling compile-time error-set checking across the client.
+    // inferred error sets of fetchTasks/postJson themselves, widening what callers within
+    // this file must account for and losing compile-time error-set checking at those call
+    // sites. (main.zig's stdoutErr helper already widens run()'s own inferred set via
+    // anyerror, so the narrow type here no longer protects all the way up to run() — but
+    // it still keeps this file's API surface precise and documents intent.)
     fn fail(self: *Client, status: std.http.Status, body: []const u8) error{Reported} {
         const code = @intFromEnum(status);
         const msg = parseServerError(self.allocator, body) orelse defaultMessage(code);

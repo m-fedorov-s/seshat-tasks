@@ -222,7 +222,7 @@ func TestNewFileGetsCurrentDataFormatVersion(t *testing.T) {
 	}
 }
 
-func TestAbsentDataFormatVersionAssumedCurrent(t *testing.T) {
+func TestAbsentDataFormatVersionTreatedAsV1(t *testing.T) {
 	// Files written before this field existed: the only shape that ever existed is v1.
 	path := writeDataFile(t, `{"state_version":3,"tasks":{}}`)
 	st, err := NewStore(path)

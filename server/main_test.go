@@ -25,6 +25,41 @@ func TestTooPermissive(t *testing.T) {
 	}
 }
 
+func TestValidateConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       Config
+		wantErr   bool
+		wantLimit int
+	}{
+		{"empty secret rejected", Config{Secret: "", RateLimit: 0}, true, 0},
+		// Consciously deferred, not a bug: only the exact empty string is rejected.
+		// Pin the current behavior rather than change it.
+		{"whitespace-only secret currently accepted", Config{Secret: "   ", RateLimit: 0}, false, defaultRateLimit},
+		{"valid config accepted", Config{Secret: "s3cr3t", RateLimit: 0}, false, defaultRateLimit},
+		{"rate limit zero defaults", Config{Secret: "s3cr3t", RateLimit: 0}, false, defaultRateLimit},
+		{"positive rate limit passes through", Config{Secret: "s3cr3t", RateLimit: 25}, false, 25},
+		{"negative rate limit rejected", Config{Secret: "s3cr3t", RateLimit: -1}, true, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := validateConfig(c.cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("validateConfig(%+v) err = nil, want error", c.cfg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateConfig(%+v) unexpected err: %v", c.cfg, err)
+			}
+			if got != c.wantLimit {
+				t.Fatalf("validateConfig(%+v) = %d, want %d", c.cfg, got, c.wantLimit)
+			}
+		})
+	}
+}
+
 func TestResolveRateLimit(t *testing.T) {
 	cases := []struct {
 		name       string

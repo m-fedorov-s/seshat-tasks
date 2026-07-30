@@ -80,6 +80,25 @@ func resolveRateLimit(configured int) (int, error) {
 	return configured, nil
 }
 
+// validateConfig checks a loaded Config for fatal problems and resolves the rate-limit
+// default, returning the resolved requests-per-second ceiling. Pulled out of main as a
+// pure function (same pattern as resolveRateLimit) so it's unit-testable without
+// spinning up a server.
+//
+// Note: a whitespace-only secret (e.g. " ") is currently ACCEPTED — only the exact
+// empty string is rejected. That's a conscious, reviewed gap, not an oversight: pin it
+// with a test rather than "fixing" it here.
+func validateConfig(cfg Config) (int, error) {
+	// An empty secret authenticates every request that omits the Authorization header,
+	// because sha256("") == sha256(""). Refuse to start rather than serve wide open.
+	// This is the one place refusing (rather than warning) is correct: a warning here
+	// would scroll past while the server ran unauthenticated.
+	if cfg.Secret == "" {
+		return 0, fmt.Errorf("empty secret; refusing to start (every request would authenticate)")
+	}
+	return resolveRateLimit(cfg.RateLimit)
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
@@ -98,19 +117,15 @@ func main() {
 	if cfg.Bind == "" {
 		cfg.Bind = defaultBind
 	}
-	rateLimit, err := resolveRateLimit(cfg.RateLimit)
+	// Runs before the fatal validation below so an operator with both a bad secret and a
+	// too-permissive config file sees both problems in one pass, not one fix-and-retry
+	// cycle per issue.
+	warnIfPermissive(*configPath)
+	rateLimit, err := validateConfig(cfg)
 	if err != nil {
-		log.Fatalf("%v", err)
+		log.Fatalf("config %s: %v", *configPath, err)
 	}
 	cfg.RateLimit = rateLimit
-	// An empty secret authenticates every request that omits the Authorization header,
-	// because sha256("") == sha256(""). Refuse to start rather than serve wide open.
-	// This is the one place refusing (rather than warning) is correct: a warning here
-	// would scroll past while the server ran unauthenticated.
-	if cfg.Secret == "" {
-		log.Fatalf("config %s has an empty secret; refusing to start (every request would authenticate)", *configPath)
-	}
-	warnIfPermissive(*configPath)
 
 	store, err := NewStore(cfg.DataFile)
 	if err != nil {

@@ -39,7 +39,8 @@ cat -v out.txt   # reveal the raw ANSI escape bytes
 ```
 
 ## Files
-- `server.yaml` — dev server config (secret/port/data_file).
+- `server.yaml` — dev server config (secret/port/data_file/bind/rate_limit; `bind` defaults to
+  `127.0.0.1`, `rate_limit` defaults to 10 req/s with burst 2x).
 - `client.json` — dev client config (`SESHAT_CONFIG` points here).
 - `run-server.sh` — build + run the server.
 - `seed.sh` — POST a realistic dataset to the running server.
