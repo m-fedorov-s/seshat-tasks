@@ -14,17 +14,29 @@ pub fn main(init: std.process.Init) !void {
         error.Reported => std.process.exit(1),
         // Broken pipe: the consumer closed stdout early (`seshat show | head`, quitting
         // a pager, `| grep -q`). Unix convention is a clean stop, not an error.
-        // Zig 0.16's writer errors are coarse, so a genuine write failure (e.g. a full
-        // disk when redirecting to a file) also lands here and exits 0 — wrong in
-        // principle, harmless in practice, and the alternative is plumbing errno
-        // through the whole writer stack.
-        error.WriteFailed => std.process.exit(0),
+        // `error.StdoutClosed` is a distinct error deliberately mapped from
+        // `error.WriteFailed` ONLY at stdout write/flush sites (see `stdoutErr` below) —
+        // never at api/client.zig's HTTP writes, which raise the exact same
+        // `error.WriteFailed` (a one-member error set per Zig 0.16's std.Io.Writer) for a
+        // dropped connection. A raw `error.WriteFailed` reaching this switch therefore did
+        // NOT come from stdout and must fall through to the catch-all below, propagating
+        // nonzero — otherwise `seshat done <id>` on a dropped connection would exit 0 while
+        // silently never reaching the server.
+        error.StdoutClosed => std.process.exit(0),
         // Unexpected (network, render, OOM, ...): one clean line, no stack trace.
         else => {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         },
     };
+}
+
+// Maps a stdout write/flush failure (`error.WriteFailed`) to the distinct
+// `error.StdoutClosed`, so `main`'s broken-pipe exit-0 path cannot accidentally swallow a
+// `error.WriteFailed` raised elsewhere (e.g. a network write in api/client.zig). Call this
+// ONLY at stdout write/flush sites — never wrap a `client.*` call with it.
+fn stdoutErr(err: anyerror) anyerror {
+    return if (err == error.WriteFailed) error.StdoutClosed else err;
 }
 
 fn run(init: std.process.Init) !void {
@@ -162,8 +174,8 @@ fn runShow(
     view.rank(selected, strategy, now);
 
     if (parsed.getBool("json")) {
-        try formatter.renderJson(out, selected);
-        try out.flush();
+        formatter.renderJson(out, selected) catch |err| return stdoutErr(err);
+        out.flush() catch |err| return stdoutErr(err);
         return;
     }
 
@@ -184,8 +196,8 @@ fn runShow(
     for (tasks) |t| try all_ids.append(allocator, t.id);
     opts.handle_len = try view.minUniqueSuffixLen(allocator, all_ids.items);
 
-    try formatter.render(out, opts, now, selected, &idx);
-    try out.flush();
+    formatter.render(out, opts, now, selected, &idx) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
 }
 
 // auto -> on only if stdout is a TTY and NO_COLOR is unset; --no-color forces off.
@@ -245,8 +257,8 @@ fn renderOne(
     opts.handle_len = try view.minUniqueSuffixLen(allocator, ids.items);
 
     const one = [_]task.Task{t};
-    try formatter.render(out, opts, now, &one, &idx);
-    try out.flush();
+    formatter.render(out, opts, now, &one, &idx) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
 }
 
 fn reportResolveError(err: view.ResolveError, id_prefix: []const u8) void {

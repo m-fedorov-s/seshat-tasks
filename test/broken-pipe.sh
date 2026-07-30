@@ -64,6 +64,21 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
+# Guard against the fixture silently shrinking below the pipe buffer over time (e.g. a
+# future edit trims the task count). If the unpiped output doesn't comfortably exceed the
+# ~64 KiB pipe buffer, `head -1` below would never see EPIPE and this test would pass for
+# the wrong reason — testing nothing. Require > 2x the buffer as a safety margin.
+min_bytes=131072
+actual_bytes=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$root/client/zig/zig-out/bin/seshat" show | wc -c)
+if [ "$actual_bytes" -le "$min_bytes" ]; then
+  echo "FAIL: unpiped 'show' output is only $actual_bytes bytes (need > $min_bytes)."
+  echo "      The fixture is too small to reliably exceed the pipe buffer, which makes"
+  echo "      the EPIPE assertion below vacuous — it would pass without exercising the"
+  echo "      broken-pipe path at all. Raise the task count or title length in the fixture."
+  exit 1
+fi
+echo "unpiped show output: $actual_bytes bytes (> $min_bytes, non-vacuous)"
+
 # The pipeline itself is expected to "fail" under pipefail, so disable errexit and
 # read the client's own status out of PIPESTATUS.
 set +e

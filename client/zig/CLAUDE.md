@@ -47,8 +47,14 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     line `error: <name>` + exit 1. So all commands fail **nonzero and trace-free** — every
     user-facing error site prints its message then `return error.Reported` (bad args, unknown
     enum/date, no-such-id, conflict, empty title, unknown command). `delete`/`done` now exit
-    nonzero on not-found (previously exited 0). (Known gap: piping output to a consumer that closes
-    early still aborts with `error.WriteFailed`; see repo `plans/todo.md` → Client robustness.)
+    nonzero on not-found (previously exited 0). Piping output to a consumer that closes early
+    (`seshat show | head`, quitting a pager) exits **0** with no message — Unix convention treats
+    EPIPE as a clean stop. This is scoped to stdout only: each stdout write/flush site in
+    `main.zig` maps `error.WriteFailed` to a distinct `error.StdoutClosed` via the `stdoutErr`
+    helper before it can reach `main`'s catch; a `error.WriteFailed` from anywhere else (notably a
+    dropped network connection in `api/client.zig`, which raises the identical error) is left
+    unmapped and still fails nonzero with the one-line message, so a network failure can never be
+    mistaken for a successful mutation.
 - `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
   children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
   sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
