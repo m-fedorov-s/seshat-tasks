@@ -58,7 +58,14 @@ fn run(init: std.process.Init) !void {
         try std.fs.path.join(allocator, &.{ home, ".config", "seshat", "config.json" });
 
     const parsed_config = Config.load(init.io, allocator, home, config_path) catch |err| {
-        std.debug.print("Error loading config from {s}: {any}\n", .{ config_path, err });
+        if (err == error.BadOffset) {
+            std.debug.print(
+                "Error loading config from {s}: utc_offset must be +HH:MM or -HH:MM (e.g. +03:00, -05:00), range +14:00 to -14:00\n",
+                .{config_path},
+            );
+        } else {
+            std.debug.print("Error loading config from {s}: {any}\n", .{ config_path, err });
+        }
         return error.Reported;
     };
     defer parsed_config.deinit();
@@ -423,6 +430,8 @@ fn usage() void {
         \\                      --title S  --description S  --status S  --priority S
         \\                      --due DATE|none  --scheduled DATE|none  --tags a,b,c
         \\                      DATE = YYYY-MM-DD | YYYY-MM-DDTHH:MM | +Nd|+Nw|+Nm
+        \\                      (interpreted in the configured local offset; see utc_offset
+        \\                       in config.json)
         \\                      --dry-run   preview the result, do not write
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
