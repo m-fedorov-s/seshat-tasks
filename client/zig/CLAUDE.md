@@ -90,8 +90,10 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
   OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Plus `renderJson`,
-  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD), a
-  tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
+  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD,
+  shifted by `RenderOptions.offset_minutes` before splitting into Y/M/D — rendering is local, same
+  as parsing), a tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]`
+  for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
   `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`

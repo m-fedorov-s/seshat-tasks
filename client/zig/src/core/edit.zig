@@ -525,9 +525,7 @@ test "patchFromArgs: tags empty string clears, unknown enums error" {
 
 test "patchFromArgs threads the offset into date flags" {
     const a = std.testing.allocator;
-    // args.parse(allocator, argv, specs) — argv BEFORE specs (args.zig:62).
     var parsed = try args.parse(a, &[_][]const u8{ "--due", "2026-08-02" }, &flag_specs);
-    // ParsedArgs has no deinit method; it is a free function (args.zig:129).
     defer args.deinit(a, &parsed);
 
     const p = try patchFromArgs(a, &parsed, 0, 180);
