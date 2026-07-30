@@ -1,0 +1,79 @@
+const std = @import("std");
+const task = @import("task.zig");
+const Status = task.Status;
+const Priority = task.Priority;
+
+pub fn statusGlyph(s: Status) []const u8 {
+    return switch (s) {
+        .todo => "○",
+        .in_progress => "◐",
+        .done => "✓",
+        .cancelled => "✗",
+    };
+}
+
+pub fn priorityLabel(p: Priority) []const u8 {
+    return @tagName(p);
+}
+
+// Truncate to at most `max_cols` Unicode codepoints, never splitting a codepoint.
+// (Codepoint count, not grapheme width — wide chars may still misalign; documented v1 limit.)
+pub fn truncate(s: []const u8, max_cols: usize) []const u8 {
+    if (max_cols == 0) return s; // 0 = no width budget -> don't truncate (avoid blanking titles)
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        if (cols + 1 > max_cols) return s[0..i];
+        i += len;
+        cols += 1;
+    }
+    return s;
+}
+
+// Format a unix-seconds timestamp as YYYY-MM-DD in the local offset (minutes east
+// of UTC), returning a slice of `buf`. Instants that fall before the epoch in local
+// terms clamp to 1970-01-01.
+pub fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 {
+    const local = unix_seconds + @as(i64, offset_minutes) * 60;
+    const secs: u64 = if (local < 0) 0 else @intCast(local);
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u32, month_day.day_index) + 1,
+    }) catch buf[0..0];
+}
+
+test "statusGlyph covers every status" {
+    try std.testing.expectEqualStrings("○", statusGlyph(.todo));
+    try std.testing.expectEqualStrings("◐", statusGlyph(.in_progress));
+    try std.testing.expectEqualStrings("✓", statusGlyph(.done));
+    try std.testing.expectEqualStrings("✗", statusGlyph(.cancelled));
+}
+
+test "priorityLabel matches the tag names the CLI already prints" {
+    try std.testing.expectEqualStrings("none", priorityLabel(.none));
+    try std.testing.expectEqualStrings("low", priorityLabel(.low));
+    try std.testing.expectEqualStrings("medium", priorityLabel(.medium));
+    try std.testing.expectEqualStrings("high", priorityLabel(.high));
+}
+
+test "truncate is codepoint-safe and never splits a multi-byte character" {
+    try std.testing.expectEqualStrings("abc", truncate("abc", 10));
+    try std.testing.expectEqualStrings("ab", truncate("abcdef", 2));
+    // 'é' is two bytes; truncating to 1 column must not emit half of it.
+    const s = "é" ++ "x";
+    const got = truncate(s, 1);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+}
+
+test "formatDate renders in the local offset" {
+    var buf: [16]u8 = undefined;
+    const utc: i64 = 1785708000; // 2026-08-02T22:00:00Z
+    try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, 0));
+    try std.testing.expectEqualStrings("2026-08-03", formatDate(&buf, utc, 180));
+}

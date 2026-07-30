@@ -4,6 +4,7 @@ const Task = taskmod.Task;
 const view = @import("core/view.zig");
 const Status = taskmod.Status;
 const Priority = taskmod.Priority;
+const display = @import("core/display.zig");
 
 pub const ColorMode = enum { on, off, auto };
 
@@ -79,38 +80,12 @@ const Sgr = struct {
     }
 };
 
-fn statusGlyph(s: Status) []const u8 {
-    return switch (s) {
-        .todo => "○",
-        .in_progress => "◐",
-        .done => "✓",
-        .cancelled => "✗",
-    };
-}
-
 // Write a dim "#<tail>" handle: last `len` chars of id, lower-cased. Emits its own
 // reset so the handle is dim regardless of the surrounding row color.
 fn writeHandle(out: *std.Io.Writer, sgr: Sgr, id: []const u8, len: usize) !void {
     try out.print("{s}{s}#", .{ sgr.reset, sgr.faint });
     for (id[id.len -| len ..]) |c| try out.writeByte(std.ascii.toLower(c));
     try out.writeAll(sgr.reset);
-}
-
-// Format a unix-seconds timestamp as YYYY-MM-DD in the local offset (minutes east
-// of UTC), returning a slice of `buf`. Instants that fall before the epoch in local
-// terms clamp to 1970-01-01.
-fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 {
-    const local = unix_seconds + @as(i64, offset_minutes) * 60;
-    const secs: u64 = if (local < 0) 0 else @intCast(local);
-    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
-    const epoch_day = epoch_secs.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
-        year_day.year,
-        month_day.month.numeric(),
-        @as(u32, month_day.day_index) + 1,
-    }) catch buf[0..0];
 }
 
 // Render the already-selected, already-ranked top-level list. `idx` is the full
@@ -126,7 +101,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
             for (toplevel) |t| {
                 // Root line: <glyph> <title> #<tail>
                 const root_col = sgr.priority(t.content.priority);
-                try out.print("{s}{s} {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
+                try out.print("{s}{s} {s}", .{ root_col, display.statusGlyph(t.content.status), display.truncate(t.content.title, opts.width) });
                 try out.writeAll(" ");
                 try writeHandle(out, sgr, t.id, opts.handle_len);
                 try out.writeAll("\n");
@@ -140,7 +115,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                         if (idx.by_id.get(cid)) |child| {
                             const dim = isCompleted(child);
                             const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
-                            try out.print("  {s} {s}{s} {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
+                            try out.print("  {s} {s}{s} {s}", .{ connector, child_col, display.statusGlyph(child.content.status), display.truncate(child.content.title, opts.width) });
                             try out.writeAll(" ");
                             try writeHandle(out, sgr, child.id, opts.handle_len);
                             try out.writeAll("\n");
@@ -159,7 +134,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
             for (toplevel) |t| {
                 // Root header line: {open}{glyph}  {title} #handle\n
                 const root_col = if (isCompleted(t)) sgr.faint else sgr.priority(t.content.priority);
-                try out.print("{s}{s}  {s}", .{ root_col, statusGlyph(t.content.status), truncateTitle(t.content.title, opts.width) });
+                try out.print("{s}{s}  {s}", .{ root_col, display.statusGlyph(t.content.status), display.truncate(t.content.title, opts.width) });
                 try out.writeAll(" ");
                 try writeHandle(out, sgr, t.id, opts.handle_len);
                 try out.writeAll("\n");
@@ -169,7 +144,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
 
                 // Root description (if any)
                 if (opts.show_description and t.content.description.len > 0) {
-                    try out.print("   {s}{s}{s}\n", .{ sgr.faint, truncateTitle(t.content.description, opts.width), sgr.reset });
+                    try out.print("   {s}{s}{s}\n", .{ sgr.faint, display.truncate(t.content.description, opts.width), sgr.reset });
                 }
 
                 // Children
@@ -186,7 +161,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                         if (idx.by_id.get(cid)) |child| {
                             const dim = isCompleted(child);
                             const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
-                            try out.print("   {s}{s}{s}  {s}", .{ connector, child_col, statusGlyph(child.content.status), truncateTitle(child.content.title, opts.width) });
+                            try out.print("   {s}{s}{s}  {s}", .{ connector, child_col, display.statusGlyph(child.content.status), display.truncate(child.content.title, opts.width) });
                             try out.writeAll(" ");
                             try writeHandle(out, sgr, child.id, opts.handle_len);
                             try out.writeAll("\n");
@@ -199,7 +174,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
 
                             // Child description
                             if (opts.show_description and child.content.description.len > 0) {
-                                try out.print("{s}{s}{s}{s}\n", .{ child_prefix, sgr.faint, truncateTitle(child.content.description, opts.width), sgr.reset });
+                                try out.print("{s}{s}{s}{s}\n", .{ child_prefix, sgr.faint, display.truncate(child.content.description, opts.width), sgr.reset });
                             }
                         } else {
                             // Dangling child id
@@ -251,12 +226,12 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
         var date_buf: [16]u8 = undefined;
         if (due < now and !isCompleted(t)) {
             const days_overdue = @divTrunc(now - due, 86400);
-            const date_str = formatDate(&date_buf, due, offset_minutes);
+            const date_str = display.formatDate(&date_buf, due, offset_minutes);
             try out.print("{s}⚠ OVERDUE ({d}d, due {s}){s}", .{ sgr.overdue, days_overdue, date_str, sgr.reset });
             // After overdue token, surrounding faint was interrupted; restore it.
             if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
         } else {
-            const date_str = formatDate(&date_buf, due, offset_minutes);
+            const date_str = display.formatDate(&date_buf, due, offset_minutes);
             try out.print("due {s}", .{date_str});
         }
     }
@@ -265,7 +240,7 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
     if (t.content.scheduled_at) |sched| {
         try beginPart(out, sgr, prefix, &started);
         var date_buf: [16]u8 = undefined;
-        const date_str = formatDate(&date_buf, sched, offset_minutes);
+        const date_str = display.formatDate(&date_buf, sched, offset_minutes);
         try out.print("sched {s}", .{date_str});
     }
 
@@ -327,21 +302,6 @@ test "render: color-on emits SGR escapes" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Important") != null);
 }
 
-// Truncate to at most `max_cols` Unicode codepoints, never splitting a codepoint.
-// (Codepoint count, not grapheme width — wide chars may still misalign; documented v1 limit.)
-pub fn truncateTitle(s: []const u8, max_cols: usize) []const u8 {
-    if (max_cols == 0) return s; // 0 = no width budget -> don't truncate (avoid blanking titles)
-    var cols: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        if (cols + 1 > max_cols) return s[0..i];
-        i += len;
-        cols += 1;
-    }
-    return s;
-}
-
 pub fn renderJson(out: *std.Io.Writer, tasks: []const Task) !void {
     var w = std.json.Stringify{ .writer = out, .options = .{} };
     try w.write(tasks);
@@ -351,13 +311,13 @@ pub fn renderJson(out: *std.Io.Writer, tasks: []const Task) !void {
 test "truncateTitle never splits a UTF-8 codepoint" {
     // "héllo" where é is 2 bytes; truncating to 3 codepoints yields exactly "hél".
     const s = "h\u{00e9}llo";
-    const out = truncateTitle(s, 3);
+    const out = display.truncate(s, 3);
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
     try std.testing.expectEqualStrings("h\u{00e9}l", out);
     // fits-entirely returns the whole string
-    try std.testing.expectEqualStrings(s, truncateTitle(s, 99));
+    try std.testing.expectEqualStrings(s, display.truncate(s, 99));
     // 0 = no budget -> full string (not blank)
-    try std.testing.expectEqualStrings(s, truncateTitle(s, 0));
+    try std.testing.expectEqualStrings(s, display.truncate(s, 0));
 }
 
 test "renderJson emits a Task array" {
@@ -376,24 +336,24 @@ test "renderJson emits a Task array" {
 test "formatDate renders YYYY-MM-DD" {
     var buf: [16]u8 = undefined;
     // 2021-01-01T00:00:00Z = 1609459200
-    try std.testing.expectEqualStrings("2021-01-01", formatDate(&buf, 1609459200, 0));
+    try std.testing.expectEqualStrings("2021-01-01", display.formatDate(&buf, 1609459200, 0));
     // 1970-01-01
-    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0, 0));
+    try std.testing.expectEqualStrings("1970-01-01", display.formatDate(&buf, 0, 0));
 }
 
 test "formatDate renders in the configured local offset" {
     var buf: [16]u8 = undefined;
     // 2026-08-02 22:00:00 UTC is 2026-08-03 01:00 local at +03:00.
     const utc: i64 = 1785708000; // 2026-08-02T22:00:00Z
-    try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, 0));
-    try std.testing.expectEqualStrings("2026-08-03", formatDate(&buf, utc, 180));
+    try std.testing.expectEqualStrings("2026-08-02", display.formatDate(&buf, utc, 0));
+    try std.testing.expectEqualStrings("2026-08-03", display.formatDate(&buf, utc, 180));
     // ...and 2026-08-02 17:00 local at -05:00, still the 2nd.
-    try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, -300));
+    try std.testing.expectEqualStrings("2026-08-02", display.formatDate(&buf, utc, -300));
 }
 
 test "formatDate clamps a pre-epoch local instant to 1970-01-01" {
     var buf: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0, -300));
+    try std.testing.expectEqualStrings("1970-01-01", display.formatDate(&buf, 0, -300));
 }
 
 test "render threads the offset all the way to the meta line" {

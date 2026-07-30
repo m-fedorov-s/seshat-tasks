@@ -446,6 +446,7 @@ test {
     // (the build test root is this file; see client/zig/CLAUDE.md).
     _ = @import("core/view.zig");
     _ = @import("core/args.zig");
+    _ = @import("core/display.zig");
     _ = @import("formatter.zig");
     _ = @import("core/config.zig");
     _ = @import("core/edit.zig");
