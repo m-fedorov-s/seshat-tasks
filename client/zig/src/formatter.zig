@@ -83,9 +83,8 @@ const Sgr = struct {
 // Write a dim "#<tail>" handle: last `len` chars of id, lower-cased. Emits its own
 // reset so the handle is dim regardless of the surrounding row color.
 fn writeHandle(out: *std.Io.Writer, sgr: Sgr, id: []const u8, len: usize) !void {
-    try out.print("{s}{s}#", .{ sgr.reset, sgr.faint });
-    for (id[id.len -| len ..]) |c| try out.writeByte(std.ascii.toLower(c));
-    try out.writeAll(sgr.reset);
+    var hbuf: [64]u8 = undefined;
+    try out.print("{s}{s}{s}{s}", .{ sgr.reset, sgr.faint, display.handleText(&hbuf, id, len), sgr.reset });
 }
 
 // Render the already-selected, already-ranked top-level list. `idx` is the full
@@ -121,10 +120,10 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                             try out.writeAll("\n");
                         } else {
                             // Dangling child id
-                            try out.print("  {s} {s}[missing: ", .{ connector, sgr.faint });
-                            try out.writeByte('#');
-                            for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
-                            try out.print("]{s}\n", .{sgr.reset});
+                            var hbuf: [64]u8 = undefined;
+                            try out.print("  {s} {s}[missing: {s}]{s}\n", .{
+                                connector, sgr.faint, display.handleText(&hbuf, cid, opts.handle_len), sgr.reset,
+                            });
                         }
                     }
                 }
@@ -178,10 +177,10 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                             }
                         } else {
                             // Dangling child id
-                            try out.print("   {s}{s}[missing: ", .{ connector, sgr.faint });
-                            try out.writeByte('#');
-                            for (cid[cid.len -| opts.handle_len ..]) |c| try out.writeByte(std.ascii.toLower(c));
-                            try out.print("]{s}\n", .{sgr.reset});
+                            var hbuf: [64]u8 = undefined;
+                            try out.print("   {s}{s}[missing: {s}]{s}\n", .{
+                                connector, sgr.faint, display.handleText(&hbuf, cid, opts.handle_len), sgr.reset,
+                            });
                         }
                     }
                 }

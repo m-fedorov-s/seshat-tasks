@@ -48,6 +48,21 @@ pub fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 
     }) catch buf[0..0];
 }
 
+// "#<tail>" — the last `len` characters of `id`, lower-cased — with no styling.
+// Callers wrap it in whatever their medium uses for "dim". `buf` must hold
+// len + 1 bytes; a shorter buf truncates rather than erroring.
+pub fn handleText(buf: []u8, id: []const u8, len: usize) []const u8 {
+    if (buf.len == 0) return buf[0..0];
+    buf[0] = '#';
+    var n: usize = 1;
+    for (id[id.len -| len ..]) |c| {
+        if (n == buf.len) break;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 test "statusGlyph covers every status" {
     try std.testing.expectEqualStrings("○", statusGlyph(.todo));
     try std.testing.expectEqualStrings("◐", statusGlyph(.in_progress));
@@ -76,4 +91,14 @@ test "formatDate renders in the local offset" {
     const utc: i64 = 1785708000; // 2026-08-02T22:00:00Z
     try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, 0));
     try std.testing.expectEqualStrings("2026-08-03", formatDate(&buf, utc, 180));
+}
+
+test "handleText returns an unstyled #tail, lower-cased" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("#abcd", handleText(&buf, "01JROOTA0000000000000ABCD", 4));
+}
+
+test "handleText clamps a len longer than the id" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("#ab", handleText(&buf, "ab", 8));
 }
