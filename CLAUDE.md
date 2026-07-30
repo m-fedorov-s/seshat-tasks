@@ -9,7 +9,8 @@ truth; clients fetch task data from it.
   / `handlers.go` / `main.go`). Stores tasks in memory, persisted to an atomic-rewrite JSON file,
   with a global `state_version`. Auth via a shared `secret` sent in the `Authorization` header.
   Config (secret, port, data_file) from YAML. Endpoints under `/api/tasks/` (`get`, `add`,
-  `update`, `delete`). Optimistic concurrency via per-task `meta.version`.
+  `update`, `delete`). Optimistic concurrency via per-task `meta.version`. Requests pass through
+  `MaxBytesHandler → auth → rateLimit → mux`; the data file carries a `data_format_version`.
 - `schema/` — the shared `Task` contract: `task.schema.json`, `SCHEMA.md`, golden `fixtures/`.
   Enforced across server + client by `make schema-test`.
 - `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
@@ -38,6 +39,8 @@ The Zig client:
    `--detailed` = git-log-style multi-line blocks (meta line + description + `│`-rail subtasks).
 3. Supports `add <title> [priority]`, `delete <id>`, and `done <id>` — `<id>` accepts a short id
    **tail** / `#handle` — mutating via the server with optimistic concurrency.
+4. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
+   server's error message on failure.
 
 ## Conventions
 

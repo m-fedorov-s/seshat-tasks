@@ -18,6 +18,12 @@ reachable from main's import graph. `src/main.zig` ends with a `test { _ = @impo
 … }` aggregator block precisely so `zig build test` exercises view/args/formatter/config. If you add
 a new test-bearing file, add it to that block (or run `zig test src/<file>.zig` directly).
 
+**Gotcha:** `zig test src/<file>.zig` only works for files directly under `src/`. For files under
+`src/api/*.zig` or `src/core/*.zig`, a bare `zig test` roots the module at that file's own
+directory, so its `@import`s of sibling top-level modules fail with `error: import of file outside
+module path`. For those files, use `zig build test` (or add the file to the `main.zig` aggregator
+block) instead of `zig test` directly.
+
 **Local dev (server + client + sample data):** see `dev/` at the repo root — `dev/run-server.sh`
 starts a dev server, `dev/seed.sh` loads a realistic dataset, `dev/seshat.sh show --detailed` runs
 this client against it. Handy for eyeballing rendering. (`make dev-server` / `make dev-seed`.)

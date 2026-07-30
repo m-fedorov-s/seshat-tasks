@@ -6,6 +6,7 @@ Throwaway configs + scripts to run the seshat **server + client** locally and ey
 
 ## One-time prerequisites
 - Go (for the server), Zig 0.16 (for the client), and `jq` (for the seed script).
+- `curl`, `awk`, and `seq` — needed by `test/broken-pipe.sh` (`make client-integration-test`).
 
 ## Quick start
 
@@ -43,6 +44,7 @@ cat -v out.txt   # reveal the raw ANSI escape bytes
 - `run-server.sh` — build + run the server.
 - `seed.sh` — POST a realistic dataset to the running server.
 - `seshat.sh` — build + run the client against the dev server.
+- `../test/broken-pipe.sh` — integration test: piped output must exit 0 (`make client-integration-test`).
 
 ## Reset
 ```sh
