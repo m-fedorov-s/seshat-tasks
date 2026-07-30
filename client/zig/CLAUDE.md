@@ -13,10 +13,20 @@ zig build test         # runs the whole suite (main.zig aggregates the other fil
 zig test src/<file>.zig # run a single file's unit tests directly (fastest iteration)
 ```
 
+**Requires a git checkout.** `build.zig` derives the `--version` string by shelling out to `git
+describe --tags --always --dirty` and aborts the build if that fails (e.g. building from a
+tarball with no `.git`). Override with `-Dversion=<string>` when building outside a checkout.
+
 **Gotcha:** `zig build test` uses `src/main.zig` as the test root, so a file's tests only run if
 reachable from main's import graph. `src/main.zig` ends with a `test { _ = @import("core/view.zig");
 … }` aggregator block precisely so `zig build test` exercises view/args/formatter/config. If you add
 a new test-bearing file, add it to that block (or run `zig test src/<file>.zig` directly).
+
+**Gotcha:** `zig test src/<file>.zig` only works for files directly under `src/`. For files under
+`src/api/*.zig` or `src/core/*.zig`, a bare `zig test` roots the module at that file's own
+directory, so its `@import`s of sibling top-level modules fail with `error: import of file outside
+module path`. For those files, use `zig build test` (or add the file to the `main.zig` aggregator
+block) instead of `zig test` directly.
 
 **Local dev (server + client + sample data):** see `dev/` at the repo root — `dev/run-server.sh`
 starts a dev server, `dev/seed.sh` loads a realistic dataset, `dev/seshat.sh show --detailed` runs
@@ -24,8 +34,10 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 ## Layout
 
-- `src/main.zig` — entry point + subcommand dispatch (`show`, `add`, `update <id>`, `delete <id>`,
-  `done <id>`, `help`). Uses the 0.16 `std.process.Init` entry signature: `pub fn main(init:
+- `src/main.zig` — entry point + subcommand dispatch (`--version`, `show`, `add`, `update <id>`,
+  `delete <id>`, `done <id>`, `help`). `--version` is checked before the config load (and prints
+  `build_options.version`), so it works on a machine with no config file. Uses the 0.16
+  `std.process.Init` entry signature: `pub fn main(init:
   std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
   from `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
   `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline (parse →
@@ -47,8 +59,14 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     line `error: <name>` + exit 1. So all commands fail **nonzero and trace-free** — every
     user-facing error site prints its message then `return error.Reported` (bad args, unknown
     enum/date, no-such-id, conflict, empty title, unknown command). `delete`/`done` now exit
-    nonzero on not-found (previously exited 0). (Known gap: piping output to a consumer that closes
-    early still aborts with `error.WriteFailed`; see repo `plans/todo.md` → Client robustness.)
+    nonzero on not-found (previously exited 0). Piping output to a consumer that closes early
+    (`seshat show | head`, quitting a pager) exits **0** with no message — Unix convention treats
+    EPIPE as a clean stop. This is scoped to stdout only: each stdout write/flush site in
+    `main.zig` maps `error.WriteFailed` to a distinct `error.StdoutClosed` via the `stdoutErr`
+    helper before it can reach `main`'s catch; a `error.WriteFailed` from anywhere else (notably a
+    dropped network connection in `api/client.zig`, which raises the identical error) is left
+    unmapped and still fails nonzero with the one-line message, so a network failure can never be
+    mistaken for a successful mutation.
 - `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
   children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
   sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
@@ -80,7 +98,12 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
   No cache (scope A) — every fetch hits the server. `postJson` returns the response body; `addTask`
   returns the created `Task` and `updateTasks` returns the updated `[]Task` (server echoes the
-  authoritative result — used by `--verbose`). 409 → `error.Conflict`.
+  authoritative result — used by `--verbose`). 409 → `error.Conflict`. Every other non-2xx response
+  goes through `fail()`, which prints `server error (<code>): <message>` and returns
+  `error.Reported` — matching the client-wide error model. `<message>` is the server's own
+  `{"error": "..."}` body via `parseServerError`, falling back to `defaultMessage(code)` (a small
+  switch over the statuses Stage 0 introduced: 429/413/403/404, else a generic message) when the
+  body isn't parseable.
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by

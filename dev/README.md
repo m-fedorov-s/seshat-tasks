@@ -6,6 +6,7 @@ Throwaway configs + scripts to run the seshat **server + client** locally and ey
 
 ## One-time prerequisites
 - Go (for the server), Zig 0.16 (for the client), and `jq` (for the seed script).
+- `curl`, `awk`, and `seq` — needed by `test/broken-pipe.sh` (`make client-integration-test`).
 
 ## Quick start
 
@@ -38,11 +39,13 @@ cat -v out.txt   # reveal the raw ANSI escape bytes
 ```
 
 ## Files
-- `server.yaml` — dev server config (secret/port/data_file).
+- `server.yaml` — dev server config (secret/port/data_file/bind/rate_limit; `bind` defaults to
+  `127.0.0.1`, `rate_limit` defaults to 10 req/s with burst 2x).
 - `client.json` — dev client config (`SESHAT_CONFIG` points here).
 - `run-server.sh` — build + run the server.
 - `seed.sh` — POST a realistic dataset to the running server.
 - `seshat.sh` — build + run the client against the dev server.
+- `../test/broken-pipe.sh` — integration test: piped output must exit 0 (`make client-integration-test`).
 
 ## Reset
 ```sh

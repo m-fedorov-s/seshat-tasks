@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/time/rate"
 )
 
 func newTestServer(t *testing.T) (*Server, *Store) {
@@ -15,8 +17,7 @@ func newTestServer(t *testing.T) (*Server, *Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{store: st, secret: "s3cr3t"}
-	return srv, st
+	return NewServer(st, "s3cr3t", defaultRateLimit), st
 }
 
 func do(t *testing.T, srv *Server, method, path, secret, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -29,7 +30,7 @@ func do(t *testing.T, srv *Server, method, path, secret, body string, hdr map[st
 		req.Header.Set(k, v)
 	}
 	rr := httptest.NewRecorder()
-	srv.mux().ServeHTTP(rr, req)
+	srv.Handler().ServeHTTP(rr, req)
 	return rr
 }
 
@@ -119,5 +120,111 @@ func TestDeleteHandler(t *testing.T) {
 	rr := do(t, srv, "POST", "/api/tasks/delete", "s3cr3t", body, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestAuthEmptySecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for absent Authorization header, got %d", rr.Code)
+	}
+}
+
+func TestAuthShorterSecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for truncated secret, got %d", rr.Code)
+	}
+}
+
+func TestAuthLongerSecretRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t-extra", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for over-long secret, got %d", rr.Code)
+	}
+}
+
+func TestRateLimitReturns429(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// Zero refill, single token: request 1 consumes it, request 2 must be rejected.
+	srv.limiter = rate.NewLimiter(0, 1)
+
+	if rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t", "", nil); rr.Code != http.StatusOK {
+		t.Fatalf("first request should pass, got %d", rr.Code)
+	}
+	rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t", "", nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on second request, got %d", rr.Code)
+	}
+	var body map[string]string
+	json.Unmarshal(rr.Body.Bytes(), &body)
+	if body["error"] == "" {
+		t.Fatalf("expected an error message in the 429 body, got %q", rr.Body.String())
+	}
+}
+
+// The limiter must sit AFTER auth, so an unauthenticated flood cannot drain the
+// bucket and lock out the legitimate user.
+func TestRateLimitNotConsumedByUnauthenticatedRequests(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.limiter = rate.NewLimiter(0, 1)
+
+	for i := 0; i < 5; i++ {
+		if rr := do(t, srv, "GET", "/api/tasks/get", "wrong", "", nil); rr.Code != http.StatusForbidden {
+			t.Fatalf("unauthenticated request %d: expected 403, got %d", i, rr.Code)
+		}
+	}
+	// The single token must still be available to the authenticated user.
+	if rr := do(t, srv, "GET", "/api/tasks/get", "s3cr3t", "", nil); rr.Code != http.StatusOK {
+		t.Fatalf("authenticated request after unauthenticated flood: expected 200, got %d", rr.Code)
+	}
+}
+
+// Both tests above override the limiter, so they would still pass if NewServer
+// configured it wrongly (swapped arguments, zero burst). Pin the wiring instead.
+func TestNewServerLimiterConfiguration(t *testing.T) {
+	srv, _ := newTestServer(t) // constructed with defaultRateLimit
+	if got := srv.limiter.Limit(); got != defaultRateLimit {
+		t.Errorf("limiter rate = %v, want %v", got, float64(defaultRateLimit))
+	}
+	if got := srv.limiter.Burst(); got != 2*defaultRateLimit {
+		t.Errorf("limiter burst = %d, want %d", got, 2*defaultRateLimit)
+	}
+}
+
+// The threshold is configurable, so verify the value is actually plumbed through
+// rather than hardcoded.
+func TestNewServerHonoursConfiguredRate(t *testing.T) {
+	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(st, "s3cr3t", 50)
+	if got := srv.limiter.Limit(); got != 50 {
+		t.Errorf("limiter rate = %v, want 50", got)
+	}
+	if got := srv.limiter.Burst(); got != 100 {
+		t.Errorf("limiter burst = %d, want 100", got)
+	}
+}
+
+func TestOversizedBodyIs413NotBadRequest(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// A structurally VALID request that is simply too large — so a 400 here would
+	// prove the size limit was misclassified as a JSON syntax error.
+	huge := strings.Repeat("a", (1<<20)+1024)
+	body := `{"content":{"title":"` + huge + `","status":"todo","priority":"none"}}`
+	rr := do(t, srv, "POST", "/api/tasks/add", "s3cr3t", body, nil)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		// Truncate: the response echoes the task, so the untruncated body would dump
+		// more than a megabyte into the test log.
+		snippet := rr.Body.String()
+		if len(snippet) > 200 {
+			snippet = snippet[:200] + "...(truncated)"
+		}
+		t.Fatalf("expected 413, got %d: %s", rr.Code, snippet)
 	}
 }
