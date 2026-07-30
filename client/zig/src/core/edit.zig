@@ -117,16 +117,18 @@ fn boundedSet(secs: i64) DateError!DatePatch {
     return .{ .set = secs };
 }
 
-// "+Nd" / "+Nw" / "+Nm" relative to `now` (UTC), at this kind's time-of-day.
+// "+Nd" / "+Nw" / "+Nm" relative to the LOCAL day containing `now`, at this
+// kind's local time-of-day, returned as UTC seconds.
 fn parseRelative(s: []const u8, now: i64, kind: DateKind, offset_minutes: i32) DateError!DatePatch {
-    _ = offset_minutes;
     if (s.len < 2) return error.BadDate;
     const unit = s[s.len - 1];
     const n = std.fmt.parseInt(i64, s[0 .. s.len - 1], 10) catch return error.BadDate;
     if (n < 0) return error.BadDate;
 
-    const today_day = @divFloor(now, secs_per_day);
-    const base = today_day * secs_per_day + timeOfDay(kind);
+    const offset_secs = @as(i64, offset_minutes) * 60;
+    const today_day = @divFloor(now + offset_secs, secs_per_day);
+    if (today_day < 0) return error.BadDate; // epochDayToYmd asserts day >= 0
+    const base = today_day * secs_per_day + timeOfDay(kind) - offset_secs;
 
     switch (unit) {
         'd' => return boundedSet(try addChecked(base, try mulChecked(n, secs_per_day))),
@@ -142,7 +144,7 @@ fn parseRelative(s: []const u8, now: i64, kind: DateKind, offset_minutes: i32) D
             const dim = epoch.getDaysInMonth(ny16, @enumFromInt(nm8));
             const nd: u8 = if (ymd.d > dim) dim else ymd.d;
             const new_day = try ymdToEpochDay(ny16, nm8, nd);
-            return .{ .set = new_day * secs_per_day + timeOfDay(kind) };
+            return boundedSet(new_day * secs_per_day + timeOfDay(kind) - offset_secs);
         },
         else => return error.BadDate,
     }
@@ -331,6 +333,40 @@ test "parseDate: huge relative offset is rejected (no overflow panic)" {
     try std.testing.expectError(error.BadDate, parseDate("+999999999999999999999d", 0, .due, 0));
     // a large-but-representable offset still works (+3650d ~ 10 years)
     try std.testing.expect((try parseDate("+3650d", 0, .due, 0)).set != null);
+}
+
+test "parseRelative: +0d uses the LOCAL day, not the UTC day" {
+    // 2026-08-02 22:00:00 UTC == 2026-08-03 01:00 local at +03:00.
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug3: i64 = (try ymdToEpochDay(2026, 8, 3)) * secs_per_day;
+
+    const p = try parseDate("+0d", now, .due, 180);
+    // End of local Aug 3 == Aug 3 23:59:59 local == Aug 3 20:59:59 UTC.
+    try std.testing.expectEqual(@as(?i64, aug3 + 86399 - 180 * 60), p.set);
+}
+
+test "parseRelative: +0d at offset 0 keeps the old UTC behaviour" {
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug2: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    const p = try parseDate("+0d", now, .due, 0);
+    try std.testing.expectEqual(@as(?i64, aug2 + 86399), p.set);
+}
+
+test "parseRelative: +1w and +1m are computed from the local day" {
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug10: i64 = (try ymdToEpochDay(2026, 8, 10)) * secs_per_day;
+    const w = try parseDate("+1w", now, .scheduled, 180);
+    // local day is Aug 3; +1w == Aug 10 local start == Aug 9 21:00 UTC.
+    try std.testing.expectEqual(@as(?i64, aug10 - 180 * 60), w.set);
+
+    const sep3: i64 = (try ymdToEpochDay(2026, 9, 3)) * secs_per_day;
+    const m = try parseDate("+1m", now, .scheduled, 180);
+    try std.testing.expectEqual(@as(?i64, sep3 - 180 * 60), m.set);
+}
+
+test "parseRelative: a negative local day is rejected, not asserted" {
+    // now = epoch 0, offset -05:00 => local day -1. epochDayToYmd asserts day >= 0.
+    try std.testing.expectError(error.BadDate, parseDate("+1m", 0, .due, -300));
 }
 
 test "parseDate: date-only resolves to local end/start of day, stored as UTC" {
