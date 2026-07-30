@@ -438,4 +438,5 @@ test {
     _ = @import("formatter.zig");
     _ = @import("core/config.zig");
     _ = @import("core/edit.zig");
+    _ = @import("api/client.zig");
 }

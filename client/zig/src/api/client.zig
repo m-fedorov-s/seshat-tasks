@@ -16,6 +16,19 @@ pub const Client = struct {
         return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.config.url, path });
     }
 
+    // fail reports a non-2xx response using the server's own message where available,
+    // then returns error.Reported — matching the client-wide error model (print the
+    // user-facing message at the failure site, exit nonzero without a trace).
+    // The return type is error{Reported}, NOT anyerror: anyerror would collapse the
+    // inferred error sets of fetchTasks/postJson and their callers all the way up to
+    // run(), silently disabling compile-time error-set checking across the client.
+    fn fail(self: *Client, status: std.http.Status, body: []const u8) error{Reported} {
+        const code = @intFromEnum(status);
+        const msg = parseServerError(self.allocator, body) orelse defaultMessage(code);
+        std.debug.print("server error ({d}): {s}\n", .{ code, msg });
+        return error.Reported;
+    }
+
     // GET all tasks. self.allocator is the process arena, so parse "leaky" into it
     // and return the slice directly — valid until the CLI exits, no frees.
     pub fn fetchTasks(self: *Client) ![]Task {
@@ -33,7 +46,10 @@ pub const Client = struct {
 
         var rb: [1024]u8 = undefined;
         var resp = try req.receiveHead(&rb);
-        if (resp.head.status != .ok) return error.HttpError;
+        if (resp.head.status != .ok) {
+            const err_body = resp.reader(&.{}).allocRemaining(self.allocator, .unlimited) catch "";
+            return self.fail(resp.head.status, err_body);
+        }
 
         const body = try resp.reader(&.{}).allocRemaining(self.allocator, .unlimited);
         const parsed = try std.json.parseFromSliceLeaky(types.GetResponse, self.allocator, body, .{
@@ -97,7 +113,76 @@ pub const Client = struct {
         for (ok_statuses) |s| {
             if (resp.head.status == s) ok = true;
         }
-        if (!ok) return error.HttpError;
+        if (!ok) {
+            const err_body = resp.reader(&.{}).allocRemaining(self.allocator, .unlimited) catch "";
+            return self.fail(resp.head.status, err_body);
+        }
         return try resp.reader(&.{}).allocRemaining(self.allocator, .unlimited);
     }
 };
+
+// parseServerError extracts the message from the server's `{"error": "..."}` body.
+// Returns null when the body is not a JSON object carrying a string `error` field.
+//
+// LIFETIME: ParseOptions.allocate defaults to .alloc_if_needed for parseFromSlice*,
+// so for an unescaped string the result is a SLICE INTO `body`, not a fresh
+// allocation — it lives exactly as long as body does. Safe here because callers pass
+// an arena-allocated body and print the message immediately. If you ever store the
+// result beyond the body's lifetime, pass .allocate = .alloc_always.
+//
+// Note: `error` is a Zig keyword, hence the @"error" field name.
+pub fn parseServerError(allocator: std.mem.Allocator, body: []const u8) ?[]const u8 {
+    const Envelope = struct { @"error": []const u8 };
+    const parsed = std.json.parseFromSliceLeaky(Envelope, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    return parsed.@"error";
+}
+
+// defaultMessage is the fallback when the server sent no parseable body. Switches on
+// the numeric code rather than std.http.Status tags, whose names have churned across
+// Zig releases.
+pub fn defaultMessage(code: u16) []const u8 {
+    return switch (code) {
+        429 => "rate limited; try again shortly",
+        413 => "request too large",
+        403 => "access denied (check your secret)",
+        404 => "not found",
+        else => "unexpected response from server",
+    };
+}
+
+test "parseServerError extracts the message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const msg = parseServerError(arena.allocator(), "{\"error\":\"rate limited\"}");
+    try std.testing.expect(msg != null);
+    try std.testing.expectEqualStrings("rate limited", msg.?);
+}
+
+test "parseServerError ignores unknown fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const msg = parseServerError(arena.allocator(), "{\"error\":\"not found\",\"ids\":[\"a\"]}");
+    try std.testing.expectEqualStrings("not found", msg.?);
+}
+
+test "parseServerError returns null on a body with no error field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect(parseServerError(arena.allocator(), "{\"state_version\":1}") == null);
+}
+
+test "parseServerError returns null on malformed input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect(parseServerError(arena.allocator(), "not json at all") == null);
+    try std.testing.expect(parseServerError(arena.allocator(), "") == null);
+}
+
+test "defaultMessage covers the statuses Stage 0 introduced" {
+    try std.testing.expectEqualStrings("rate limited; try again shortly", defaultMessage(429));
+    try std.testing.expectEqualStrings("request too large", defaultMessage(413));
+    try std.testing.expectEqualStrings("access denied (check your secret)", defaultMessage(403));
+    try std.testing.expectEqualStrings("unexpected response from server", defaultMessage(500));
+}
