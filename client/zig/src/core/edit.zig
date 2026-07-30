@@ -370,6 +370,14 @@ test "parseDate: year-9999 local date with a negative offset is rejected" {
     try std.testing.expectError(error.BadDate, parseDate("9999-12-31", 0, .due, -300));
 }
 
+test "parseDate: a local date whose UTC instant precedes the epoch is rejected" {
+    // 1970-01-01 00:00:00 local at +03:00 is 1969-12-31 21:00:00 UTC.
+    try std.testing.expectError(error.BadDate, parseDate("1970-01-01", 0, .scheduled, 180));
+    // The same date at offset 0 is still accepted (epoch second 0).
+    const ok = try parseDate("1970-01-01", 0, .scheduled, 0);
+    try std.testing.expectEqual(@as(?i64, 0), ok.set);
+}
+
 test "applyPatch: unchanged keeps base, set overrides" {
     const base = Content{ .title = "old", .priority = .low };
     var p = Patch{};
