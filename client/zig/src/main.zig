@@ -197,6 +197,7 @@ fn runShow(
     opts.width = resolveWidth(init, client);
     if (parsed.getBool("flat")) opts.show_children = false;
     opts.color = resolveColor(init, parsed.getBool("no-color"));
+    opts.offset_minutes = client.config.offset_minutes;
 
     // Handle length computed over ALL fetched tasks so every printed #handle is
     // globally unique and resolvable by view.resolve (which scans all tasks).
@@ -259,6 +260,7 @@ fn renderOne(
     var opts = if (layout == .detailed) formatter.RenderOptions.detailed() else formatter.RenderOptions.compact();
     opts.width = resolveWidth(init, client);
     opts.color = resolveColor(init, false);
+    opts.offset_minutes = client.config.offset_minutes;
 
     var ids = std.ArrayList([]const u8).empty;
     defer ids.deinit(allocator);
