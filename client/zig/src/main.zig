@@ -48,8 +48,8 @@ fn run(init: std.process.Init) !void {
     // Handled before the config load on purpose: a machine with no config is exactly
     // where you need to ask which binary this is.
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--version")) {
-        try out.interface.print("seshat {s}\n", .{build_options.version});
-        try out.flush();
+        out.interface.print("seshat {s}\n", .{build_options.version}) catch |err| return stdoutErr(err);
+        out.flush() catch |err| return stdoutErr(err);
         return;
     }
 
