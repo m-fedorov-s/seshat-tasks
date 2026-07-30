@@ -317,7 +317,7 @@ fn runAdd(
     const title = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
-    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+    const patch = edit.patchFromArgs(allocator, &parsed, now, client.config.offset_minutes) catch |err| {
         reportPatchError(err);
         return error.Reported;
     };
@@ -362,7 +362,7 @@ fn runUpdate(
     const id = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
-    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+    const patch = edit.patchFromArgs(allocator, &parsed, now, client.config.offset_minutes) catch |err| {
         reportPatchError(err);
         return error.Reported;
     };

@@ -222,7 +222,7 @@ fn splitTags(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![
     return list.toOwnedSlice(allocator);
 }
 
-pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, now: i64) BuildError!Patch {
+pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, now: i64, offset_minutes: i32) BuildError!Patch {
     var patch = Patch{};
     if (p.getValue("title")) |v| patch.title = .{ .set = v };
     if (p.getValue("description")) |v| patch.description = .{ .set = v };
@@ -231,8 +231,8 @@ pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, no
     if (p.getValue("priority")) |v|
         patch.priority = .{ .set = std.meta.stringToEnum(Priority, v) orelse return error.BadPriority };
     if (p.getValue("tags")) |v| patch.tags = .{ .set = try splitTags(allocator, v) };
-    if (p.getValue("due")) |v| patch.due = try parseDate(v, now, .due, 0);
-    if (p.getValue("scheduled")) |v| patch.scheduled = try parseDate(v, now, .scheduled, 0);
+    if (p.getValue("due")) |v| patch.due = try parseDate(v, now, .due, offset_minutes);
+    if (p.getValue("scheduled")) |v| patch.scheduled = try parseDate(v, now, .scheduled, offset_minutes);
     return patch;
 }
 
@@ -483,7 +483,7 @@ test "patchFromArgs builds a patch from parsed flags" {
     const a = arena.allocator();
     const argv = [_][]const u8{ "cd34", "--status", "done", "--priority", "high", "--tags", "a,b", "--due", "none" };
     const parsed = try args.parse(a, &argv, &flag_specs);
-    const p = try patchFromArgs(a, &parsed, 0);
+    const p = try patchFromArgs(a, &parsed, 0, 0);
     try std.testing.expect(switch (p.status) {
         .set => |s| s == .done,
         else => false,
@@ -510,7 +510,7 @@ test "patchFromArgs: tags empty string clears, unknown enums error" {
     {
         const argv = [_][]const u8{ "id", "--tags", "" };
         const parsed = try args.parse(a, &argv, &flag_specs);
-        const p = try patchFromArgs(a, &parsed, 0);
+        const p = try patchFromArgs(a, &parsed, 0, 0);
         try std.testing.expect(switch (p.tags) {
             .set => |tg| tg.len == 0,
             else => false,
@@ -519,6 +519,18 @@ test "patchFromArgs: tags empty string clears, unknown enums error" {
     {
         const argv = [_][]const u8{ "id", "--status", "wat" };
         const parsed = try args.parse(a, &argv, &flag_specs);
-        try std.testing.expectError(error.BadStatus, patchFromArgs(a, &parsed, 0));
+        try std.testing.expectError(error.BadStatus, patchFromArgs(a, &parsed, 0, 0));
     }
+}
+
+test "patchFromArgs threads the offset into date flags" {
+    const a = std.testing.allocator;
+    // args.parse(allocator, argv, specs) — argv BEFORE specs (args.zig:62).
+    var parsed = try args.parse(a, &[_][]const u8{ "--due", "2026-08-02" }, &flag_specs);
+    // ParsedArgs has no deinit method; it is a free function (args.zig:129).
+    defer args.deinit(a, &parsed);
+
+    const p = try patchFromArgs(a, &parsed, 0, 180);
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    try std.testing.expectEqual(@as(?i64, day_start + 86399 - 180 * 60), p.due.set);
 }
