@@ -21,7 +21,16 @@ awk 'BEGIN {
   for (i = 0; i < 2000; i++) {
     id = sprintf("01ABCDEFGHJKMNPQRSTV%06d", i)
     if (i > 0) printf ",\n"
-    printf "    \"%s\": {\"id\": \"%s\", \"content\": {\"title\": \"integration fixture task %d, deliberately long so the rendered output overflows the pipe buffer\", \"description\": \"\", \"status\": \"todo\", \"priority\": \"none\", \"child_ids\": [], \"tags\": [], \"due_at\": null, \"scheduled_at\": null}, \"meta\": {\"created_at\": 1750000000, \"updated_at\": 1750000000, \"completed_at\": null, \"version\": 1}}", id, id, i
+    if (i == 0) {
+      # This one task carries a real due_at (2026-08-02T22:00:00Z = 1785708000) and a
+      # "tzcheck" tag, so it doubles as coverage for the client config -> CLI ->
+      # formatter offset seam: 22:00 UTC is late enough in the day that the +03:00
+      # offset configured in client.json below rolls it to the next local date
+      # (2026-08-03) — see the local-timezone assertion after the broken-pipe check.
+      printf "    \"%s\": {\"id\": \"%s\", \"content\": {\"title\": \"integration fixture task %d, deliberately long so the rendered output overflows the pipe buffer\", \"description\": \"\", \"status\": \"todo\", \"priority\": \"none\", \"child_ids\": [], \"tags\": [\"tzcheck\"], \"due_at\": 1785708000, \"scheduled_at\": null}, \"meta\": {\"created_at\": 1750000000, \"updated_at\": 1750000000, \"completed_at\": null, \"version\": 1}}", id, id, i
+    } else {
+      printf "    \"%s\": {\"id\": \"%s\", \"content\": {\"title\": \"integration fixture task %d, deliberately long so the rendered output overflows the pipe buffer\", \"description\": \"\", \"status\": \"todo\", \"priority\": \"none\", \"child_ids\": [], \"tags\": [], \"due_at\": null, \"scheduled_at\": null}, \"meta\": {\"created_at\": 1750000000, \"updated_at\": 1750000000, \"completed_at\": null, \"version\": 1}}", id, id, i
+    }
   }
   printf "\n  }\n}\n"
 }' > "$tmp/data.json"
@@ -36,7 +45,7 @@ EOF
 chmod 600 "$tmp/server.yaml"
 
 cat > "$tmp/client.json" <<EOF
-{"url": "http://127.0.0.1:$port", "secret": "$secret"}
+{"url": "http://127.0.0.1:$port", "secret": "$secret", "utc_offset": "+03:00"}
 EOF
 
 echo "building server + client..."
@@ -99,3 +108,22 @@ if [ -s "$tmp/client.err" ]; then
 fi
 
 echo "PASS: broken pipe exits 0 with no stack trace"
+
+# Coverage for the client config -> CLI -> formatter offset seam (client.json's
+# utc_offset above): the fixture task's due_at is 2026-08-02T22:00:00Z, which the
+# configured +03:00 offset rolls to 2026-08-03 local. If any of the main.zig call
+# sites that thread client.config.offset_minutes into RenderOptions were dropped,
+# this would render the UTC date (2026-08-02) instead.
+detailed_out=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 \
+  "$root/client/zig/zig-out/bin/seshat" show --detailed --filter tag:tzcheck)
+if [[ "$detailed_out" != *"due 2026-08-03"* ]]; then
+  echo "FAIL: expected 'due 2026-08-03' (local, +03:00) in --detailed output, got:"
+  echo "$detailed_out"
+  exit 1
+fi
+if [[ "$detailed_out" == *"due 2026-08-02"* ]]; then
+  echo "FAIL: --detailed rendered the UTC date (2026-08-02) instead of the local (+03:00) date:"
+  echo "$detailed_out"
+  exit 1
+fi
+echo "PASS: --detailed renders due_at in the configured local (+03:00) offset"

@@ -398,14 +398,26 @@ test "formatDate clamps a pre-epoch local instant to 1970-01-01" {
 
 test "render threads the offset all the way to the meta line" {
     // Without this, dropping either writeMetaLine call site still passes every
-    // formatDate unit test. Follow whatever writer-capture pattern the existing
-    // render tests in this file already use.
+    // formatDate unit test.
     const a = std.testing.allocator;
-    var tasks = [_]Task{.{
-        .id = "01JTESTA0000000000000ABCD",
-        .content = .{ .title = "x", .status = .todo, .due_at = 1785708000 },
-        .meta = .{ .created_at = 1 },
-    }};
+    // Parent: 2026-08-02T22:00:00Z -> 2026-08-03 local at +03:00.
+    const parent_due: i64 = 1785708000;
+    // Child: 2026-07-30T22:00:00Z -> 2026-07-31 local at +03:00. A distinct date
+    // from the parent's so the child assertion can't pass on the parent's output.
+    const child_due: i64 = 1785448800;
+    var tasks = [_]Task{
+        .{
+            .id = "01JTESTA0000000000000ABCD",
+            .content = .{ .title = "x", .status = .todo, .due_at = parent_due },
+            .meta = .{ .created_at = 1 },
+        },
+        .{
+            .id = "01JTESTB0000000000000EFGH",
+            .content = .{ .title = "child", .status = .todo, .due_at = child_due },
+            .meta = .{ .created_at = 1 },
+        },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"01JTESTB0000000000000EFGH"});
     var idx = try view.Index.build(a, &tasks);
     defer idx.deinit();
 
@@ -414,8 +426,10 @@ test "render threads the offset all the way to the meta line" {
     var opts = RenderOptions.detailed();
     opts.color = .off;
     opts.offset_minutes = 180;
-    try render(&w, opts, 1785708000 - 86400, &tasks, &idx);
+    const top = [_]Task{tasks[0]};
+    try render(&w, opts, 1785708000 - 86400, &top, &idx);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "due 2026-08-03") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "due 2026-07-31") != null);
 }
 
 test "compact color: row color spans glyph+title; done child dimmed" {
