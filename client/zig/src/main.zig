@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Config = @import("core/config.zig").Config;
 const Client = @import("api/client.zig").Client;
 const task = @import("core/task.zig");
@@ -42,6 +43,15 @@ fn stdoutErr(err: anyerror) anyerror {
 fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    var out = std.Io.File.stdout().writer(init.io, &.{});
+
+    // Handled before the config load on purpose: a machine with no config is exactly
+    // where you need to ask which binary this is.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--version")) {
+        try out.interface.print("seshat {s}\n", .{build_options.version});
+        try out.flush();
+        return;
+    }
 
     const home = init.environ_map.get("HOME") orelse return error.HomeNotFound;
     const config_path = init.environ_map.get("SESHAT_CONFIG") orelse
@@ -55,7 +65,6 @@ fn run(init: std.process.Init) !void {
     const config = parsed_config.value;
 
     var client = Client.init(init.io, allocator, &config);
-    var out = std.Io.File.stdout().writer(init.io, &.{});
 
     if (args.len < 2) return usage();
     const cmd = args[1];
@@ -416,6 +425,7 @@ fn usage() void {
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
         \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
+        \\  --version         Print the client version and exit
         \\
     , .{});
 }
