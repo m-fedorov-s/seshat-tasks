@@ -49,7 +49,7 @@ A `Task` is `{ id (ULID), content, meta }`. `content` (user-editable) = title, d
 ## Client behaviour
 
 The Zig client:
-1. Reads config (server URL, secret, optional `width`) from JSON (`SESHAT_CONFIG` or
+1. Reads config (server URL, secret, optional `width`, `utc_offset`) from JSON (`SESHAT_CONFIG` or
    `~/.config/seshat/config.json`).
 2. On `show`, fetches all tasks and renders the forest through a `select → rank → render`
    pipeline. Flags: `--sort <priority|due|title|created|urgency>` (default urgency),

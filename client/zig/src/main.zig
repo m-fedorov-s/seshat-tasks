@@ -58,7 +58,14 @@ fn run(init: std.process.Init) !void {
         try std.fs.path.join(allocator, &.{ home, ".config", "seshat", "config.json" });
 
     const parsed_config = Config.load(init.io, allocator, home, config_path) catch |err| {
-        std.debug.print("Error loading config from {s}: {any}\n", .{ config_path, err });
+        if (err == error.BadOffset) {
+            std.debug.print(
+                "Error loading config from {s}: utc_offset must be +HH:MM or -HH:MM (e.g. +03:00, -05:00), range +14:00 to -14:00\n",
+                .{config_path},
+            );
+        } else {
+            std.debug.print("Error loading config from {s}: {any}\n", .{ config_path, err });
+        }
         return error.Reported;
     };
     defer parsed_config.deinit();
@@ -197,6 +204,7 @@ fn runShow(
     opts.width = resolveWidth(init, client);
     if (parsed.getBool("flat")) opts.show_children = false;
     opts.color = resolveColor(init, parsed.getBool("no-color"));
+    opts.offset_minutes = client.config.offset_minutes;
 
     // Handle length computed over ALL fetched tasks so every printed #handle is
     // globally unique and resolvable by view.resolve (which scans all tasks).
@@ -259,6 +267,7 @@ fn renderOne(
     var opts = if (layout == .detailed) formatter.RenderOptions.detailed() else formatter.RenderOptions.compact();
     opts.width = resolveWidth(init, client);
     opts.color = resolveColor(init, false);
+    opts.offset_minutes = client.config.offset_minutes;
 
     var ids = std.ArrayList([]const u8).empty;
     defer ids.deinit(allocator);
@@ -317,7 +326,7 @@ fn runAdd(
     const title = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
-    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+    const patch = edit.patchFromArgs(allocator, &parsed, now, client.config.offset_minutes) catch |err| {
         reportPatchError(err);
         return error.Reported;
     };
@@ -362,7 +371,7 @@ fn runUpdate(
     const id = parsed.positionals.items[0];
     const now = nowSeconds(init.io);
 
-    const patch = edit.patchFromArgs(allocator, &parsed, now) catch |err| {
+    const patch = edit.patchFromArgs(allocator, &parsed, now, client.config.offset_minutes) catch |err| {
         reportPatchError(err);
         return error.Reported;
     };
@@ -421,6 +430,8 @@ fn usage() void {
         \\                      --title S  --description S  --status S  --priority S
         \\                      --due DATE|none  --scheduled DATE|none  --tags a,b,c
         \\                      DATE = YYYY-MM-DD | YYYY-MM-DDTHH:MM | +Nd|+Nw|+Nm
+        \\                      (interpreted in the configured local offset; see utc_offset
+        \\                       in config.json)
         \\                      --dry-run   preview the result, do not write
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)

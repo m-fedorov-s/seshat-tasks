@@ -77,8 +77,9 @@ fn addChecked(a: i64, b: i64) DateError!i64 {
     return std.math.add(i64, a, b) catch error.BadDate;
 }
 
-// "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" (UTC).
-fn parseAbsolute(s: []const u8, kind: DateKind) DateError!DatePatch {
+// "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM", interpreted in local time (offset_minutes
+// east of UTC), returned as UTC seconds.
+fn parseAbsolute(s: []const u8, kind: DateKind, offset_minutes: i32) DateError!DatePatch {
     if (s.len < 10 or s[4] != '-' or s[7] != '-') return error.BadDate;
     const y = try parseUint(u16, s[0..4]);
     const m = try parseUint(u8, s[5..7]);
@@ -94,7 +95,13 @@ fn parseAbsolute(s: []const u8, kind: DateKind) DateError!DatePatch {
         if (hh > 23 or mm > 59) return error.BadDate;
         secs += @as(i64, hh) * 3600 + @as(i64, mm) * 60;
     }
-    return .{ .set = secs };
+    // `secs` is the local wall-clock instant expressed as if it were UTC.
+    const utc = try addChecked(secs, -@as(i64, offset_minutes) * 60);
+    // New rejection: a local date whose UTC instant lands before the epoch. This makes
+    // `--scheduled 1970-01-01` fail at any positive offset, where it previously
+    // succeeded. Deliberate — everything downstream assumes non-negative epoch days.
+    if (utc < 0) return error.BadDate;
+    return boundedSet(utc);
 }
 
 // Largest timestamp we allow (end of 9999-12-31 UTC). Beyond this, epoch decomposition would
@@ -110,15 +117,18 @@ fn boundedSet(secs: i64) DateError!DatePatch {
     return .{ .set = secs };
 }
 
-// "+Nd" / "+Nw" / "+Nm" relative to `now` (UTC), at this kind's time-of-day.
-fn parseRelative(s: []const u8, now: i64, kind: DateKind) DateError!DatePatch {
+// "+Nd" / "+Nw" / "+Nm" relative to the LOCAL day containing `now`, at this
+// kind's local time-of-day, returned as UTC seconds.
+fn parseRelative(s: []const u8, now: i64, kind: DateKind, offset_minutes: i32) DateError!DatePatch {
     if (s.len < 2) return error.BadDate;
     const unit = s[s.len - 1];
     const n = std.fmt.parseInt(i64, s[0 .. s.len - 1], 10) catch return error.BadDate;
     if (n < 0) return error.BadDate;
 
-    const today_day = @divFloor(now, secs_per_day);
-    const base = today_day * secs_per_day + timeOfDay(kind);
+    const offset_secs = @as(i64, offset_minutes) * 60;
+    const today_day = @divFloor(now + offset_secs, secs_per_day);
+    if (today_day < 0) return error.BadDate; // epochDayToYmd asserts day >= 0
+    const base = today_day * secs_per_day + timeOfDay(kind) - offset_secs;
 
     switch (unit) {
         'd' => return boundedSet(try addChecked(base, try mulChecked(n, secs_per_day))),
@@ -134,16 +144,16 @@ fn parseRelative(s: []const u8, now: i64, kind: DateKind) DateError!DatePatch {
             const dim = epoch.getDaysInMonth(ny16, @enumFromInt(nm8));
             const nd: u8 = if (ymd.d > dim) dim else ymd.d;
             const new_day = try ymdToEpochDay(ny16, nm8, nd);
-            return .{ .set = new_day * secs_per_day + timeOfDay(kind) };
+            return boundedSet(new_day * secs_per_day + timeOfDay(kind) - offset_secs);
         },
         else => return error.BadDate,
     }
 }
 
-pub fn parseDate(input: []const u8, now: i64, kind: DateKind) DateError!DatePatch {
+pub fn parseDate(input: []const u8, now: i64, kind: DateKind, offset_minutes: i32) DateError!DatePatch {
     if (std.mem.eql(u8, input, "none")) return .{ .set = null };
-    if (input.len >= 1 and input[0] == '+') return parseRelative(input[1..], now, kind);
-    return parseAbsolute(input, kind);
+    if (input.len >= 1 and input[0] == '+') return parseRelative(input[1..], now, kind, offset_minutes);
+    return parseAbsolute(input, kind, offset_minutes);
 }
 
 pub const Patch = struct {
@@ -212,7 +222,7 @@ fn splitTags(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![
     return list.toOwnedSlice(allocator);
 }
 
-pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, now: i64) BuildError!Patch {
+pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, now: i64, offset_minutes: i32) BuildError!Patch {
     var patch = Patch{};
     if (p.getValue("title")) |v| patch.title = .{ .set = v };
     if (p.getValue("description")) |v| patch.description = .{ .set = v };
@@ -221,8 +231,8 @@ pub fn patchFromArgs(allocator: std.mem.Allocator, p: *const args.ParsedArgs, no
     if (p.getValue("priority")) |v|
         patch.priority = .{ .set = std.meta.stringToEnum(Priority, v) orelse return error.BadPriority };
     if (p.getValue("tags")) |v| patch.tags = .{ .set = try splitTags(allocator, v) };
-    if (p.getValue("due")) |v| patch.due = try parseDate(v, now, .due);
-    if (p.getValue("scheduled")) |v| patch.scheduled = try parseDate(v, now, .scheduled);
+    if (p.getValue("due")) |v| patch.due = try parseDate(v, now, .due, offset_minutes);
+    if (p.getValue("scheduled")) |v| patch.scheduled = try parseDate(v, now, .scheduled, offset_minutes);
     return patch;
 }
 
@@ -257,7 +267,7 @@ test "epochDayToYmd round-trips ymdToEpochDay" {
 }
 
 test "parseDate: none clears" {
-    const r = try parseDate("none", 0, .due);
+    const r = try parseDate("none", 0, .due, 0);
     try std.testing.expect(switch (r) {
         .set => |v| v == null,
         else => false,
@@ -267,8 +277,8 @@ test "parseDate: none clears" {
 test "parseDate: date-only is end-of-day for due, start-of-day for scheduled" {
     // 2026-06-14 = epoch day 20618 -> 20618*86400 = 1781395200
     const start: i64 = 1781395200;
-    const due = try parseDate("2026-06-14", 0, .due);
-    const sched = try parseDate("2026-06-14", 0, .scheduled);
+    const due = try parseDate("2026-06-14", 0, .due, 0);
+    const sched = try parseDate("2026-06-14", 0, .scheduled, 0);
     try std.testing.expectEqual(@as(?i64, start + 86399), due.set);
     try std.testing.expectEqual(@as(?i64, start), sched.set);
 }
@@ -276,14 +286,14 @@ test "parseDate: date-only is end-of-day for due, start-of-day for scheduled" {
 test "parseDate: due-today is NOT before a mid-day now" {
     const start: i64 = 1781395200; // 2026-06-14 00:00 UTC
     const now: i64 = start + 12 * 3600; // noon
-    const due = try parseDate("2026-06-14", now, .due);
+    const due = try parseDate("2026-06-14", now, .due, 0);
     try std.testing.expect(due.set.? >= now); // would be overdue if midnight
 }
 
 test "parseDate: explicit time ignores kind" {
     const start: i64 = 1781395200;
-    const a = try parseDate("2026-06-14T13:30", 0, .due);
-    const b = try parseDate("2026-06-14T13:30", 0, .scheduled);
+    const a = try parseDate("2026-06-14T13:30", 0, .due, 0);
+    const b = try parseDate("2026-06-14T13:30", 0, .scheduled, 0);
     try std.testing.expectEqual(@as(?i64, start + 13 * 3600 + 30 * 60), a.set);
     try std.testing.expectEqual(a.set, b.set);
 }
@@ -291,38 +301,117 @@ test "parseDate: explicit time ignores kind" {
 test "parseDate: relative offsets from today" {
     const start: i64 = 1781395200; // 2026-06-14
     const now: i64 = start + 9 * 3600; // any time today
-    try std.testing.expectEqual(@as(?i64, start + 86399), (try parseDate("+0d", now, .due)).set);
-    try std.testing.expectEqual(@as(?i64, start + 86399 + 86400), (try parseDate("+1d", now, .due)).set);
-    try std.testing.expectEqual(@as(?i64, start + 14 * 86400), (try parseDate("+2w", now, .scheduled)).set);
+    try std.testing.expectEqual(@as(?i64, start + 86399), (try parseDate("+0d", now, .due, 0)).set);
+    try std.testing.expectEqual(@as(?i64, start + 86399 + 86400), (try parseDate("+1d", now, .due, 0)).set);
+    try std.testing.expectEqual(@as(?i64, start + 14 * 86400), (try parseDate("+2w", now, .scheduled, 0)).set);
 }
 
 test "parseDate: +Nm clamps to month end" {
     // 2026-01-31 = epoch day 20484 -> *86400 = 1769817600
     const jan31: i64 = 1769817600;
     // +1m -> 2026-02-28 (2026 not leap) end-of-day
-    const r = try parseDate("+1m", jan31, .due);
+    const r = try parseDate("+1m", jan31, .due, 0);
     // 2026-02-28 = epoch day 20512 -> *86400 = 1772236800, +86399
     try std.testing.expectEqual(@as(?i64, 1772236800 + 86399), r.set);
 }
 
 test "parseDate: rejects garbage" {
-    try std.testing.expectError(error.BadDate, parseDate("", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("2026/06/14", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("2026-13-01", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("+1y", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("-1d", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("+d", 0, .due));
+    try std.testing.expectError(error.BadDate, parseDate("", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("2026/06/14", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("2026-13-01", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("+1y", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("-1d", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("+d", 0, .due, 0));
     // a signed numeric field is rejected, not silently normalized
-    try std.testing.expectError(error.BadDate, parseDate("2026-+6-14", 0, .due));
+    try std.testing.expectError(error.BadDate, parseDate("2026-+6-14", 0, .due, 0));
 }
 
 test "parseDate: huge relative offset is rejected (no overflow panic)" {
     // would overflow the u16 year in epoch decomposition if unbounded -> must be BadDate, not a panic
-    try std.testing.expectError(error.BadDate, parseDate("+9999999999d", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("+9999999999w", 0, .due));
-    try std.testing.expectError(error.BadDate, parseDate("+999999999999999999999d", 0, .due));
+    try std.testing.expectError(error.BadDate, parseDate("+9999999999d", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("+9999999999w", 0, .due, 0));
+    try std.testing.expectError(error.BadDate, parseDate("+999999999999999999999d", 0, .due, 0));
     // a large-but-representable offset still works (+3650d ~ 10 years)
-    try std.testing.expect((try parseDate("+3650d", 0, .due)).set != null);
+    try std.testing.expect((try parseDate("+3650d", 0, .due, 0)).set != null);
+}
+
+test "parseRelative: +0d uses the LOCAL day, not the UTC day" {
+    // 2026-08-02 22:00:00 UTC == 2026-08-03 01:00 local at +03:00.
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug3: i64 = (try ymdToEpochDay(2026, 8, 3)) * secs_per_day;
+
+    const p = try parseDate("+0d", now, .due, 180);
+    // End of local Aug 3 == Aug 3 23:59:59 local == Aug 3 20:59:59 UTC.
+    try std.testing.expectEqual(@as(?i64, aug3 + 86399 - 180 * 60), p.set);
+}
+
+test "parseRelative: +0d at offset 0 keeps the old UTC behaviour" {
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug2: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    const p = try parseDate("+0d", now, .due, 0);
+    try std.testing.expectEqual(@as(?i64, aug2 + 86399), p.set);
+}
+
+test "parseRelative: +1w and +1m are computed from the local day" {
+    const now: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day + 22 * 3600;
+    const aug10: i64 = (try ymdToEpochDay(2026, 8, 10)) * secs_per_day;
+    const w = try parseDate("+1w", now, .scheduled, 180);
+    // local day is Aug 3; +1w == Aug 10 local start == Aug 9 21:00 UTC.
+    try std.testing.expectEqual(@as(?i64, aug10 - 180 * 60), w.set);
+
+    const sep3: i64 = (try ymdToEpochDay(2026, 9, 3)) * secs_per_day;
+    const m = try parseDate("+1m", now, .scheduled, 180);
+    try std.testing.expectEqual(@as(?i64, sep3 - 180 * 60), m.set);
+}
+
+test "parseRelative: a negative local day is rejected, not asserted" {
+    // now = epoch 0, offset -05:00 => local day -1. epochDayToYmd asserts day >= 0.
+    try std.testing.expectError(error.BadDate, parseDate("+1m", 0, .due, -300));
+}
+
+test "parseDate: date-only resolves to local end/start of day, stored as UTC" {
+    // 2026-08-02 at +03:00. Local end-of-day 23:59:59 is 20:59:59 UTC.
+    const due = try parseDate("2026-08-02", 0, .due, 180);
+    // 2026-08-02 00:00:00 UTC as epoch seconds:
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    try std.testing.expectEqual(@as(?i64, day_start + 86399 - 180 * 60), due.set);
+
+    // Local start-of-day 00:00:00 at +03:00 is 21:00:00 UTC the previous day.
+    const sched = try parseDate("2026-08-02", 0, .scheduled, 180);
+    try std.testing.expectEqual(@as(?i64, day_start - 180 * 60), sched.set);
+}
+
+test "parseDate: negative offset shifts the other way" {
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    // -05:00: local 00:00 is 05:00 UTC the same day.
+    const sched = try parseDate("2026-08-02", 0, .scheduled, -300);
+    try std.testing.expectEqual(@as(?i64, day_start + 300 * 60), sched.set);
+}
+
+test "parseDate: explicit wall time is local, stored as UTC" {
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    // 14:30 local at +03:00 == 11:30 UTC.
+    const p = try parseDate("2026-08-02T14:30", 0, .due, 180);
+    try std.testing.expectEqual(@as(?i64, day_start + 14 * 3600 + 30 * 60 - 180 * 60), p.set);
+}
+
+test "parseDate: offset zero is byte-identical to the old UTC behaviour" {
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    const p = try parseDate("2026-08-02", 0, .due, 0);
+    try std.testing.expectEqual(@as(?i64, day_start + 86399), p.set);
+}
+
+test "parseDate: year-9999 local date with a negative offset is rejected" {
+    // Local end-of-9999-12-31 at -05:00 is 05:00 UTC on 10000-01-01 — past maxSecs().
+    try std.testing.expectError(error.BadDate, parseDate("9999-12-31", 0, .due, -300));
+}
+
+test "parseDate: a local date whose UTC instant precedes the epoch is rejected" {
+    // 1970-01-01 00:00:00 local at +03:00 is 1969-12-31 21:00:00 UTC.
+    try std.testing.expectError(error.BadDate, parseDate("1970-01-01", 0, .scheduled, 180));
+    // The same date at offset 0 is still accepted (epoch second 0).
+    const ok = try parseDate("1970-01-01", 0, .scheduled, 0);
+    try std.testing.expectEqual(@as(?i64, 0), ok.set);
 }
 
 test "applyPatch: unchanged keeps base, set overrides" {
@@ -394,7 +483,7 @@ test "patchFromArgs builds a patch from parsed flags" {
     const a = arena.allocator();
     const argv = [_][]const u8{ "cd34", "--status", "done", "--priority", "high", "--tags", "a,b", "--due", "none" };
     const parsed = try args.parse(a, &argv, &flag_specs);
-    const p = try patchFromArgs(a, &parsed, 0);
+    const p = try patchFromArgs(a, &parsed, 0, 0);
     try std.testing.expect(switch (p.status) {
         .set => |s| s == .done,
         else => false,
@@ -421,7 +510,7 @@ test "patchFromArgs: tags empty string clears, unknown enums error" {
     {
         const argv = [_][]const u8{ "id", "--tags", "" };
         const parsed = try args.parse(a, &argv, &flag_specs);
-        const p = try patchFromArgs(a, &parsed, 0);
+        const p = try patchFromArgs(a, &parsed, 0, 0);
         try std.testing.expect(switch (p.tags) {
             .set => |tg| tg.len == 0,
             else => false,
@@ -430,6 +519,16 @@ test "patchFromArgs: tags empty string clears, unknown enums error" {
     {
         const argv = [_][]const u8{ "id", "--status", "wat" };
         const parsed = try args.parse(a, &argv, &flag_specs);
-        try std.testing.expectError(error.BadStatus, patchFromArgs(a, &parsed, 0));
+        try std.testing.expectError(error.BadStatus, patchFromArgs(a, &parsed, 0, 0));
     }
+}
+
+test "patchFromArgs threads the offset into date flags" {
+    const a = std.testing.allocator;
+    var parsed = try args.parse(a, &[_][]const u8{ "--due", "2026-08-02" }, &flag_specs);
+    defer args.deinit(a, &parsed);
+
+    const p = try patchFromArgs(a, &parsed, 0, 180);
+    const day_start: i64 = (try ymdToEpochDay(2026, 8, 2)) * secs_per_day;
+    try std.testing.expectEqual(@as(?i64, day_start + 86399 - 180 * 60), p.due.set);
 }

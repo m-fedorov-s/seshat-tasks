@@ -19,6 +19,7 @@ pub const RenderOptions = struct {
     width: usize,
     layout: Layout,
     handle_len: usize,
+    offset_minutes: i32 = 0,
 
     pub fn compact() RenderOptions {
         return .{
@@ -95,10 +96,12 @@ fn writeHandle(out: *std.Io.Writer, sgr: Sgr, id: []const u8, len: usize) !void 
     try out.writeAll(sgr.reset);
 }
 
-// Format a unix-seconds timestamp as YYYY-MM-DD into `buf`, returning the slice.
-// Uses std.time.epoch (UTC). Negative timestamps (pre-1970) clamp to epoch 0.
-fn formatDate(buf: []u8, unix_seconds: i64) []const u8 {
-    const secs: u64 = if (unix_seconds < 0) 0 else @intCast(unix_seconds);
+// Format a unix-seconds timestamp as YYYY-MM-DD in the local offset (minutes east
+// of UTC), returning a slice of `buf`. Instants that fall before the epoch in local
+// terms clamp to 1970-01-01.
+fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 {
+    const local = unix_seconds + @as(i64, offset_minutes) * 60;
+    const secs: u64 = if (local < 0) 0 else @intCast(local);
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
     const epoch_day = epoch_secs.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
@@ -162,7 +165,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                 try out.writeAll("\n");
 
                 // Root meta line (3-space indent)
-                try writeMetaLine(out, sgr, "   ", t, now);
+                try writeMetaLine(out, sgr, "   ", t, now, opts.offset_minutes);
 
                 // Root description (if any)
                 if (opts.show_description and t.content.description.len > 0) {
@@ -192,7 +195,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                             //   non-last: "   │     " (3 spaces + │ + 5 spaces = 9 chars)
                             //   last:     "         " (9 spaces)
                             const child_prefix = if (!is_last) "   │     " else "         ";
-                            try writeMetaLine(out, sgr, child_prefix, child, now);
+                            try writeMetaLine(out, sgr, child_prefix, child, now, opts.offset_minutes);
 
                             // Child description
                             if (opts.show_description and child.content.description.len > 0) {
@@ -219,7 +222,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
 // nothing at all if `t` has no meta parts. `prefix` is the indent/gutter string
 // (e.g. "   " for a root, "   │     "/"         " for a child). Single source of
 // truth for which parts exist — no separate emptiness predicate to keep in sync.
-fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now: i64) !void {
+fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now: i64, offset_minutes: i32) !void {
     var started = false;
 
     // Ensures the prefix + dim wrapper is emitted exactly once, before the first part,
@@ -248,12 +251,12 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
         var date_buf: [16]u8 = undefined;
         if (due < now and !isCompleted(t)) {
             const days_overdue = @divTrunc(now - due, 86400);
-            const date_str = formatDate(&date_buf, due);
+            const date_str = formatDate(&date_buf, due, offset_minutes);
             try out.print("{s}⚠ OVERDUE ({d}d, due {s}){s}", .{ sgr.overdue, days_overdue, date_str, sgr.reset });
             // After overdue token, surrounding faint was interrupted; restore it.
             if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
         } else {
-            const date_str = formatDate(&date_buf, due);
+            const date_str = formatDate(&date_buf, due, offset_minutes);
             try out.print("due {s}", .{date_str});
         }
     }
@@ -262,7 +265,7 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
     if (t.content.scheduled_at) |sched| {
         try beginPart(out, sgr, prefix, &started);
         var date_buf: [16]u8 = undefined;
-        const date_str = formatDate(&date_buf, sched);
+        const date_str = formatDate(&date_buf, sched, offset_minutes);
         try out.print("sched {s}", .{date_str});
     }
 
@@ -373,9 +376,60 @@ test "renderJson emits a Task array" {
 test "formatDate renders YYYY-MM-DD" {
     var buf: [16]u8 = undefined;
     // 2021-01-01T00:00:00Z = 1609459200
-    try std.testing.expectEqualStrings("2021-01-01", formatDate(&buf, 1609459200));
+    try std.testing.expectEqualStrings("2021-01-01", formatDate(&buf, 1609459200, 0));
     // 1970-01-01
-    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
+    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0, 0));
+}
+
+test "formatDate renders in the configured local offset" {
+    var buf: [16]u8 = undefined;
+    // 2026-08-02 22:00:00 UTC is 2026-08-03 01:00 local at +03:00.
+    const utc: i64 = 1785708000; // 2026-08-02T22:00:00Z
+    try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, 0));
+    try std.testing.expectEqualStrings("2026-08-03", formatDate(&buf, utc, 180));
+    // ...and 2026-08-02 17:00 local at -05:00, still the 2nd.
+    try std.testing.expectEqualStrings("2026-08-02", formatDate(&buf, utc, -300));
+}
+
+test "formatDate clamps a pre-epoch local instant to 1970-01-01" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0, -300));
+}
+
+test "render threads the offset all the way to the meta line" {
+    // Without this, dropping either writeMetaLine call site still passes every
+    // formatDate unit test.
+    const a = std.testing.allocator;
+    // Parent: 2026-08-02T22:00:00Z -> 2026-08-03 local at +03:00.
+    const parent_due: i64 = 1785708000;
+    // Child: 2026-07-30T22:00:00Z -> 2026-07-31 local at +03:00. A distinct date
+    // from the parent's so the child assertion can't pass on the parent's output.
+    const child_due: i64 = 1785448800;
+    var tasks = [_]Task{
+        .{
+            .id = "01JTESTA0000000000000ABCD",
+            .content = .{ .title = "x", .status = .todo, .due_at = parent_due },
+            .meta = .{ .created_at = 1 },
+        },
+        .{
+            .id = "01JTESTB0000000000000EFGH",
+            .content = .{ .title = "child", .status = .todo, .due_at = child_due },
+            .meta = .{ .created_at = 1 },
+        },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"01JTESTB0000000000000EFGH"});
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var opts = RenderOptions.detailed();
+    opts.color = .off;
+    opts.offset_minutes = 180;
+    const top = [_]Task{tasks[0]};
+    try render(&w, opts, 1785708000 - 86400, &top, &idx);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "due 2026-08-03") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "due 2026-07-31") != null);
 }
 
 test "compact color: row color spans glyph+title; done child dimmed" {

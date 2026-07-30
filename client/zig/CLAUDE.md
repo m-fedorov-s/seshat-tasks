@@ -70,7 +70,8 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
   children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
   sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
-  `urgency` score, `resolve` (id **suffix/tail** → unique task), and `minUniqueSuffixLen` (shortest
+  `urgency` score (which compares durations, so the UTC offset cancels and must not be threaded
+  in), `resolve` (id **suffix/tail** → unique task), and `minUniqueSuffixLen` (shortest
   unique tail length). All pure, `now: i64` passed in.
 - `src/core/args.zig` — a generic, declaration-driven flag parser: `OptionSpec` table in →
   `ParsedArgs` (query by name with `getBool`/`getValue`/`getMulti`). No seshat flag names baked in.
@@ -79,20 +80,25 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   `Edit` per editable `Content` field (`DatePatch = Edit(?i64)`, `.set = null` clears; tags `.set`
   is a wholesale replace, empty = cleared); `applyPatch(base, patch)` is pure (carries `child_ids`
   through — hierarchy is never patched here); `validate` (non-empty title). `parseDate(input, now,
-  kind)` parses the UTC date grammar — `YYYY-MM-DD` (date-only → **end-of-day for `.due`**,
-  **start-of-day for `.scheduled`**), `YYYY-MM-DDTHH:MM`, `+Nd/+Nw/+Nm` (relative, `+Nm` clamps to
-  month end), `none` → clear — via a hand-rolled `ymdToEpochDay` (std has no date parser; see
-  `plans/todo.md`). `flag_specs` + `patchFromArgs` turn `ParsedArgs` into a `Patch` (`--tags`
-  comma-split here; unknown status/priority/date → `BuildError`).
+  kind, offset_minutes)` parses ISO dates/times — `YYYY-MM-DD` (date-only → **local end-of-day
+  for `.due`**, **local start-of-day for `.scheduled`**, stored as UTC), `YYYY-MM-DDTHH:MM`,
+  `+Nd/+Nw/+Nm` (relative to the **local** day, `+Nm` clamps to month end), `none` → clear — via
+  a hand-rolled `ymdToEpochDay` (std has no date parser; see `plans/todo.md`). `flag_specs` +
+  `patchFromArgs` (takes `offset_minutes`) turn `ParsedArgs` into a `Patch` (`--tags` comma-split
+  here; unknown status/priority/date → `BuildError`).
 - `src/formatter.zig` — `RenderOptions` (one struct, `compact()`/`detailed()` constructors, a
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
   OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Plus `renderJson`,
-  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD), a
-  tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
+  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD,
+  shifted by `RenderOptions.offset_minutes` before splitting into Y/M/D — rendering is local, same
+  as parsing), a tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]`
+  for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
-  `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred).
+  `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`
+  (format `±HH:MM`, range ±14:00, defaults to `"+00:00"`; malformed value is a hard startup
+  error, not a silent fallback), `offset_minutes` (derived from `utc_offset`).
 - `src/core/task.zig` — `Task = { id, content, meta }` matching `schema/SCHEMA.md`. `Status`/
   `Priority` are string enums with an unknown-value `jsonParse` fallback.
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
