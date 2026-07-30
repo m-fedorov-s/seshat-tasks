@@ -216,22 +216,20 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
     // 1. Priority word (omit if .none)
     if (t.content.priority != .none) {
         try beginPart(out, sgr, prefix, &started);
-        try out.writeAll(@tagName(t.content.priority));
+        try out.writeAll(display.priorityLabel(t.content.priority));
     }
 
     // 2. Due date
     if (t.content.due_at) |due| {
         try beginPart(out, sgr, prefix, &started);
-        var date_buf: [16]u8 = undefined;
-        if (due < now and !isCompleted(t)) {
-            const days_overdue = @divTrunc(now - due, 86400);
-            const date_str = display.formatDate(&date_buf, due, offset_minutes);
-            try out.print("{s}⚠ OVERDUE ({d}d, due {s}){s}", .{ sgr.overdue, days_overdue, date_str, sgr.reset });
-            // After overdue token, surrounding faint was interrupted; restore it.
-            if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
-        } else {
-            const date_str = display.formatDate(&date_buf, due, offset_minutes);
-            try out.print("due {s}", .{date_str});
+        var word_buf: [64]u8 = undefined;
+        switch (display.dueWording(&word_buf, due, now, isCompleted(t), offset_minutes)) {
+            .overdue => |o| {
+                try out.print("{s}{s}{s}", .{ sgr.overdue, o.text, sgr.reset });
+                // After the overdue token, surrounding faint was interrupted; restore it.
+                if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
+            },
+            .due => |s| try out.writeAll(s),
         }
     }
 

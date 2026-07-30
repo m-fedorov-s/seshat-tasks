@@ -48,6 +48,24 @@ pub fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 
     }) catch buf[0..0];
 }
 
+pub const DueWording = union(enum) {
+    due: []const u8,
+    overdue: struct { text: []const u8, days: i64 },
+};
+
+// Wording only — no styling. `buf` must be at least 64 bytes.
+pub fn dueWording(buf: []u8, due_at: i64, now: i64, completed: bool, offset_minutes: i32) DueWording {
+    var date_buf: [16]u8 = undefined;
+    const date_str = formatDate(&date_buf, due_at, offset_minutes);
+    if (due_at < now and !completed) {
+        const days = @divTrunc(now - due_at, 86400);
+        const text = std.fmt.bufPrint(buf, "⚠ OVERDUE ({d}d, due {s})", .{ days, date_str }) catch buf[0..0];
+        return .{ .overdue = .{ .text = text, .days = days } };
+    }
+    const text = std.fmt.bufPrint(buf, "due {s}", .{date_str}) catch buf[0..0];
+    return .{ .due = text };
+}
+
 // "#<tail>" — the last `len` characters of `id`, lower-cased — with no styling.
 // Callers wrap it in whatever their medium uses for "dim". `buf` must hold
 // len + 1 bytes; a shorter buf truncates rather than erroring.
@@ -101,4 +119,43 @@ test "handleText returns an unstyled #tail, lower-cased" {
 test "handleText clamps a len longer than the id" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("#ab", handleText(&buf, "ab", 8));
+}
+
+test "dueWording renders a future date plainly" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    switch (dueWording(&buf, due, due - 86400, false, 0)) {
+        .due => |s| try std.testing.expectEqualStrings("due 2026-08-02", s),
+        .overdue => return error.TestUnexpectedResult,
+    }
+}
+
+test "dueWording renders an overdue date with a day count" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    switch (dueWording(&buf, due, due + 3 * 86400, false, 0)) {
+        .due => return error.TestUnexpectedResult,
+        .overdue => |o| {
+            try std.testing.expectEqual(@as(i64, 3), o.days);
+            try std.testing.expectEqualStrings("⚠ OVERDUE (3d, due 2026-08-02)", o.text);
+        },
+    }
+}
+
+test "dueWording never reports a completed task as overdue" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    switch (dueWording(&buf, due, due + 3 * 86400, true, 0)) {
+        .due => |s| try std.testing.expectEqualStrings("due 2026-08-02", s),
+        .overdue => return error.TestUnexpectedResult,
+    }
+}
+
+test "dueWording renders the date in the local offset" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    switch (dueWording(&buf, due, due - 86400, false, 180)) {
+        .due => |s| try std.testing.expectEqualStrings("due 2026-08-03", s),
+        .overdue => return error.TestUnexpectedResult,
+    }
 }
