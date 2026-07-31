@@ -70,12 +70,14 @@ const Sgr = struct {
         };
     }
 
-    fn priority(self: Sgr, p: Priority) []const u8 {
-        return switch (p) {
-            .high => self.high,
-            .medium => self.medium,
-            .low => self.low,
-            .none => "", // no priority color
+    fn style(self: Sgr, s: display.Style) []const u8 {
+        return switch (s) {
+            .normal => "",
+            .dim => self.faint,
+            .overdue => self.overdue,
+            .prio_high => self.high,
+            .prio_medium => self.medium,
+            .prio_low => self.low,
         };
     }
 };
@@ -99,7 +101,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
         .compact => {
             for (toplevel) |t| {
                 // Root line: <glyph> <title> #<tail>
-                const root_col = sgr.priority(t.content.priority);
+                const root_col = sgr.style(display.priorityStyle(t.content.priority));
                 try out.print("{s}{s} {s}", .{ root_col, display.statusGlyph(t.content.status), display.truncate(t.content.title, opts.width) });
                 try out.writeAll(" ");
                 try writeHandle(out, sgr, t.id, opts.handle_len);
@@ -112,8 +114,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                         const is_last = (i == n - 1);
                         const connector = if (is_last) "└─" else "├─";
                         if (idx.by_id.get(cid)) |child| {
-                            const dim = isCompleted(child);
-                            const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
+                            const child_col = sgr.style(display.taskStyle(child.content.status, child.content.priority));
                             try out.print("  {s} {s}{s} {s}", .{ connector, child_col, display.statusGlyph(child.content.status), display.truncate(child.content.title, opts.width) });
                             try out.writeAll(" ");
                             try writeHandle(out, sgr, child.id, opts.handle_len);
@@ -132,7 +133,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
         .detailed => {
             for (toplevel) |t| {
                 // Root header line: {open}{glyph}  {title} #handle\n
-                const root_col = if (isCompleted(t)) sgr.faint else sgr.priority(t.content.priority);
+                const root_col = sgr.style(display.taskStyle(t.content.status, t.content.priority));
                 try out.print("{s}{s}  {s}", .{ root_col, display.statusGlyph(t.content.status), display.truncate(t.content.title, opts.width) });
                 try out.writeAll(" ");
                 try writeHandle(out, sgr, t.id, opts.handle_len);
@@ -158,8 +159,7 @@ pub fn render(out: *std.Io.Writer, opts: RenderOptions, now: i64, toplevel: []co
                         try out.writeAll("   │\n");
 
                         if (idx.by_id.get(cid)) |child| {
-                            const dim = isCompleted(child);
-                            const child_col = if (dim) sgr.faint else sgr.priority(child.content.priority);
+                            const child_col = sgr.style(display.taskStyle(child.content.status, child.content.priority));
                             try out.print("   {s}{s}{s}  {s}", .{ connector, child_col, display.statusGlyph(child.content.status), display.truncate(child.content.title, opts.width) });
                             try out.writeAll(" ");
                             try writeHandle(out, sgr, child.id, opts.handle_len);
@@ -498,5 +498,36 @@ test "detailed: exact block layout (rails, indentation, spacers)" {
         "\n",
         buf.written(),
     );
+}
+
+test "compact does not dim a completed root, detailed does" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "01HZZ0000000000000000ROOT1", .content = .{ .title = "Root Done", .status = .done, .priority = .high }, .meta = .{} },
+    };
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+
+    // Compact root line: no faint code, even though the task is done.
+    {
+        var buf: std.Io.Writer.Allocating = .init(a);
+        defer buf.deinit();
+        var opts = RenderOptions.compact();
+        opts.color = .on;
+        try render(&buf.writer, opts, 0, &tasks, &idx);
+        const out = buf.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2m✓ Root Done") == null);
+    }
+
+    // Detailed root line: same done task IS dimmed.
+    {
+        var buf: std.Io.Writer.Allocating = .init(a);
+        defer buf.deinit();
+        var opts = RenderOptions.detailed();
+        opts.color = .on;
+        try render(&buf.writer, opts, 0, &tasks, &idx);
+        const out = buf.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2m✓  Root Done") != null);
+    }
 }
 

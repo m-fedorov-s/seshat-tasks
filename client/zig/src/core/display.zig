@@ -81,6 +81,25 @@ pub fn handleText(buf: []u8, id: []const u8, len: usize) []const u8 {
     return buf[0..n];
 }
 
+// A semantic style, independent of how it is emitted. formatter.zig maps this to
+// SGR escape codes; the TUI maps it to a vaxis.Style. Adding a variant here is how
+// the two renderers stay in agreement.
+pub const Style = enum { normal, dim, overdue, prio_high, prio_medium, prio_low };
+
+pub fn priorityStyle(p: Priority) Style {
+    return switch (p) {
+        .high => .prio_high,
+        .medium => .prio_medium,
+        .low => .prio_low,
+        .none => .normal,
+    };
+}
+
+pub fn taskStyle(status: Status, priority: Priority) Style {
+    if (status == .done or status == .cancelled) return .dim;
+    return priorityStyle(priority);
+}
+
 test "statusGlyph covers every status" {
     try std.testing.expectEqualStrings("○", statusGlyph(.todo));
     try std.testing.expectEqualStrings("◐", statusGlyph(.in_progress));
@@ -158,4 +177,18 @@ test "dueWording renders the date in the local offset" {
         .due => |s| try std.testing.expectEqualStrings("due 2026-08-03", s),
         .overdue => return error.TestUnexpectedResult,
     }
+}
+
+test "priorityStyle maps each priority" {
+    try std.testing.expectEqual(Style.prio_high, priorityStyle(.high));
+    try std.testing.expectEqual(Style.prio_medium, priorityStyle(.medium));
+    try std.testing.expectEqual(Style.prio_low, priorityStyle(.low));
+    try std.testing.expectEqual(Style.normal, priorityStyle(.none));
+}
+
+test "taskStyle dims a completed task regardless of priority" {
+    try std.testing.expectEqual(Style.dim, taskStyle(.done, .high));
+    try std.testing.expectEqual(Style.dim, taskStyle(.cancelled, .high));
+    try std.testing.expectEqual(Style.prio_high, taskStyle(.todo, .high));
+    try std.testing.expectEqual(Style.normal, taskStyle(.in_progress, .none));
 }
