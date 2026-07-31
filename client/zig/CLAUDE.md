@@ -203,8 +203,16 @@ The 0.16 `std.Io`-threaded model applies throughout — same pattern as the rest
   opts: Vaxis.Options) !Vaxis`. `init.environ_map` from `std.process.Init` is already `*Environ.Map`
   so it passes straight through unchanged. `alloc` must be a real `std.mem.Allocator` —
   `init.arena` in `std.process.Init` is a `*std.heap.ArenaAllocator`, **not** an `Allocator`; pass
-  `init.arena.allocator()` (same pattern `main.zig` already uses). `Vaxis.Options{}` (empty) is
-  fine for a plain TUI; its only field today is an optional `system_clipboard_allocator`.
+  `init.arena.allocator()` (same pattern `main.zig` already uses). `Vaxis.Options` has **two**
+  fields, both optional to set: `kitty_keyboard_flags: KittyFlags = .{}` and an optional
+  `system_clipboard_allocator: ?std.mem.Allocator = null` (without it, system-clipboard requests
+  aren't possible). `Vaxis.Options{}` (empty) is fine for a plain TUI. `KittyFlags` is a `packed
+  struct(u5)` controlling what the Kitty keyboard protocol negotiation reports:
+  `disambiguate: bool = true` (distinguishes e.g. Ctrl+I from Tab), `report_events: bool = false`
+  (emit `key_release` events, not just `key_press` — off by default), `report_alternate_keys: bool
+  = true` (populates `shifted_codepoint`/`base_layout_codepoint`), `report_all_as_ctl_seqs: bool =
+  true`, `report_text: bool = true` (populates `Key.text`). A later task wanting key-release events
+  or tighter disambiguation tunes these via `Vaxis.Options{ .kitty_keyboard_flags = .{ ... } }`.
 - **`vx.deinit`:** `deinit(self: *Vaxis, alloc: ?std.mem.Allocator, tty: *std.Io.Writer) void` —
   resets terminal state (exits alt screen, shows cursor, etc.) and, if `alloc` is non-null, frees
   Vaxis-owned buffers. Pass the same `tty.writer()` used elsewhere.
@@ -260,7 +268,15 @@ The 0.16 `std.Io`-threaded model applies throughout — same pattern as the rest
   (`x_off/y_off = 0`, `width/height = screen.width/height`).
 - **`vaxis.Key` shape:** `{ codepoint: u21, text: ?[]const u8 = null, shifted_codepoint: ?u21 =
   null, base_layout_codepoint: ?u21 = null, mods: Modifiers = .{} }`. `Modifiers` is a packed
-  struct: `shift, alt, ctrl, super, hyper, meta, caps_lock, num_lock: bool`. Named key constants
+  struct: `shift, alt, ctrl, super, hyper, meta, caps_lock, num_lock: bool`. **`text` lifetime
+  hazard (upstream-documented, on `Key.matchText`):** `text` points into the parser's per-event
+  scratch buffer and is only valid until the next event is decoded — a caller that retains a `Key`
+  past that point (e.g. queues it to another thread) must copy `text` first, or it races the parser
+  overwriting its buffer. This is safe on the path Task 18 will actually use: `Loop`'s internal
+  `handleEventGeneric` runs `mut_key.text = cache.put(text)` through a `GraphemeCache` before
+  posting the event to the queue `nextEvent()` reads from, so `text` on an event you get back from
+  `loop.nextEvent()` is already a stable, cache-owned copy, not the raw scratch-buffer slice. Named
+  key constants
   are plain `u21` values on the `Key` (i.e. `vaxis.Key`) namespace — `vaxis.Key.enter` (`0x0D`),
   `.tab`, `.escape`, `.space`, `.backspace`, plus a large block of Kitty-protocol-encoded values in
   the Unicode private-use area for `.up/.down/.left/.right/.home/.end/.page_up/.page_down/.insert/
