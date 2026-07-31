@@ -110,12 +110,15 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
   OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Owns layout and SGR
-  emission only: `renderJson`, the 16-color `Sgr` helper (`Sgr.style` maps a `core/display.zig`
+  emission: `renderJson`, the 16-color `Sgr` helper (`Sgr.style` maps a `core/display.zig`
   `Style` to an escape code), a tail-based `writeHandle` (wraps `display.handleText`). The old
   `Sgr.priority` was deleted — `Sgr.style(display.priorityStyle(p))` is now the single source of
   truth for priority→colour. Glyphs, labels, truncation, and date/due-wording formatting live in
-  `core/display.zig`, not here. Immediate children only (depth 1); `[missing: #tail]` for dangling
-  ids.
+  `core/display.zig`, not here — but formatter.zig still owns most of the **meta-line vocabulary**:
+  the `" · "` separator, `"sched {s}"`, tag rendering, `"{d} subtasks"`, the `├─`/`└─` connectors,
+  and `"[missing: {s}]"`. None of that wording has moved into `core/display.zig` yet; it's
+  deliberately deferred until the TUI exists to reveal which strings actually need to be shared.
+  Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
   `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`
