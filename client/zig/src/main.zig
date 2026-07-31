@@ -444,4 +444,5 @@ test {
     _ = @import("api/client.zig");
     _ = @import("tui/ledger.zig");
     _ = @import("tui/editors.zig");
+    _ = @import("tui/model.zig");
 }
