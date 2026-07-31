@@ -95,16 +95,19 @@ pub const Model = struct {
     rows: []ledger.Row = &.{},
     folds: ledger.Folds,
 
+    // The selected task. ALWAYS a slice into the `ids` arena (see `internId`),
+    // never a borrow of `Task.id` or `Row.id` — both of those point into the
+    // live task arena, which the next `replaceTasks` resets.
     cursor_id: ?[]const u8 = null,
     // The cursor's last known ROW INDEX. Never a source of truth for what is
     // selected — `cursor_id` is — only the anchor `recompute` falls back to when
-    // the selected task has vanished, so the cursor drops to its old neighbour
-    // instead of jumping to the top. It has to be a stored field because
-    // `replaceTasks` retires `rows` (their ids point into the arena it is about
-    // to reset), so by the time `recompute` runs there is no row list left to
-    // derive the old position from. Written in exactly two places: snapshotted
-    // at the end of `replaceTasks`'s teardown, and refreshed at the end of
-    // `recompute`.
+    // the selected task cannot be resolved, so the cursor drops to its old
+    // neighbour instead of jumping to the top. It has to be a stored field
+    // because `replaceTasks` retires `rows` before `recompute` runs, leaving no
+    // row list to derive the old position from. Written in exactly two places:
+    // snapshotted just before `replaceTasks` frees `rows`, and refreshed at the
+    // end of `recompute`. May exceed `rows.len` after a shrink; every reader
+    // clamps.
     cursor_anchor: usize = 0,
     filters: view.Filters = .{},
     filter_expr: []const u8 = "", // interned; drives the header and empty state
@@ -333,22 +336,43 @@ fn recompute(m: *Model) !void {
 
     // Re-resolve the cursor BY ID; fall back to the nearest surviving position.
     if (m.cursorIndex() == null) {
-        m.cursor_id = if (m.rows.len == 0)
-            null
-        else blk: {
-            var i = @min(old_index, m.rows.len - 1);
-            // Skip non-task rows (a header or a missing child cannot be selected).
-            while (i > 0 and m.rows[i].kind != .task) i -= 1;
-            if (m.rows[i].kind != .task) break :blk null;
+        m.cursor_id = null;
+        if (nearestTaskRow(m.rows, old_index)) |i| {
             // Must be interned: `Row.id` borrows from the live task arena, which
             // the next replaceTasks resets.
-            break :blk try m.internId(m.rows[i].id);
-        };
+            m.cursor_id = try m.internId(m.rows[i].id);
+        }
     }
 
-    m.cursor_anchor = m.cursorIndex() orelse 0;
+    // Refresh the anchor from the resolved cursor. When the cursor cannot be
+    // resolved — filtered away, inside a collapsed subtree, or an empty list —
+    // KEEP the previous anchor rather than zeroing it. It is the only memory of
+    // where the user was, so clearing a filter that matched nothing must put
+    // them back there instead of at the top of the list.
+    m.cursor_anchor = m.cursorIndex() orelse m.cursor_anchor;
+
     const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules
-    m.scroll_top = ledger.ensureVisible(m.cursor_anchor, m.rows.len, layout.ledger_rows, m.scroll_top);
+    // Clamp into the current list: a stale anchor left over from a longer one
+    // must not drag the viewport past the end.
+    const focus = @min(m.cursor_anchor, m.rows.len -| 1);
+    m.scroll_top = ledger.ensureVisible(focus, m.rows.len, layout.ledger_rows, m.scroll_top);
+}
+
+// The `.task` row nearest to `anchor`, searched OUTWARD in both directions
+// (backward wins a tie). Returns null only when there is no selectable row at
+// all. Scanning backward only would strand the cursor at null whenever row 0 is
+// an `unreachable_header` — which is exactly what cyclic data produces, since
+// then there are no roots and the header leads the list.
+fn nearestTaskRow(rows: []const ledger.Row, anchor: usize) ?usize {
+    if (rows.len == 0) return null;
+    const start = @min(anchor, rows.len - 1);
+    var d: usize = 0;
+    while (d < rows.len) : (d += 1) {
+        if (d <= start and rows[start - d].kind == .task) return start - d;
+        const fwd = start + d;
+        if (d > 0 and fwd < rows.len and rows[fwd].kind == .task) return fwd;
+    }
+    return null;
 }
 
 fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![][]const u8 {
@@ -611,4 +635,131 @@ test "recompute keeps scroll_top inside the row list when it shrinks" {
 
     try loadInto(&m, many[0..3]);
     try std.testing.expect(m.scroll_top < m.rows.len);
+}
+
+// N tasks named t000.. that all tie on urgency, so the id tiebreak makes row i
+// always "t{i:0>3}" — which is what lets the scroll tests assert exact indices.
+fn fillSeq(tasks: []Task, ids: [][4]u8) void {
+    for (tasks, ids, 0..) |*task_, *idbuf, i| {
+        _ = std.fmt.bufPrint(idbuf, "t{d:0>3}", .{i}) catch unreachable;
+        task_.* = t(idbuf, .low, .todo, null, &.{});
+    }
+}
+
+// Defect 1. Cyclic data has no roots at all, so buildRows leads with an
+// `unreachable_header` at row 0. A fallback that only walks BACKWARD from the
+// anchor hits that header, gives up, and leaves the cursor null — permanently,
+// because with no cursor_id there is nothing left to re-resolve from — even
+// though every remaining row is selectable.
+test "recompute selects a task below the anchor when row 0 is an unreachable header" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+
+    var tasks = [_]Task{
+        t("x", .none, .todo, null, &.{"y"}),
+        t("y", .none, .todo, null, &.{"x"}),
+    };
+    try loadInto(&m, &tasks);
+
+    try std.testing.expectEqual(ledger.RowKind.unreachable_header, m.rows[0].kind);
+    try std.testing.expect(m.rows.len > 1);
+    try std.testing.expect(m.cursor_id != null); // not stranded
+    try std.testing.expectEqual(@as(usize, 1), m.cursorIndex().?);
+}
+
+// Defect 1, second half, plus the `.missing` skip. The anchor lands on a run of
+// `.missing` rows: the nearest `.task` is one row FORWARD, while the nearest one
+// backward is three rows away. A backward-only scan picks the far one.
+test "recompute picks the nearest task row, not the nearest one behind it" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+
+    // Both roots tie on urgency, so the id tiebreak orders aroot before zlater.
+    var before = [_]Task{
+        t("aroot", .none, .todo, null, &.{ "g1", "g2", "g3" }),
+        t("g1", .none, .todo, null, &.{}),
+        t("g2", .none, .todo, null, &.{}),
+        t("g3", .none, .todo, null, &.{}),
+        t("zlater", .none, .todo, null, &.{}),
+    };
+    try m.replaceTasks(&before);
+    try m.folds.put(try m.internId("aroot"), true); // force it open; nothing here needs attention
+    try recompute(&m);
+    m.cursor_id = try m.internId("g3");
+    try std.testing.expectEqual(@as(usize, 3), m.cursorIndex().?);
+
+    // The three children vanish but are still referenced, so they become
+    // `.missing` rows: [aroot, missing, missing, missing, zlater].
+    var after = [_]Task{
+        t("aroot", .none, .todo, null, &.{ "g1", "g2", "g3" }),
+        t("zlater", .none, .todo, null, &.{}),
+    };
+    try loadInto(&m, &after);
+
+    try std.testing.expectEqual(@as(usize, 5), m.rows.len);
+    try std.testing.expectEqual(ledger.RowKind.missing, m.rows[3].kind);
+    // Anchor 3: "zlater" is 1 row away, "aroot" is 3 rows back.
+    try std.testing.expectEqualStrings("zlater", m.cursor_id.?);
+}
+
+// Defect 2. Zeroing the anchor when the cursor cannot be resolved throws away
+// the user's position at the one moment it matters: an empty filtered view has
+// no cursor to re-derive it from, so clearing the filter would dump them at the
+// top of the list.
+test "recompute restores the cursor position after a filter that matched nothing" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    m.viewport = .{ .cols = 80, .rows = 10 }; // 7 ledger rows
+
+    var many: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    fillSeq(&many, &ids);
+    try loadInto(&m, &many);
+
+    m.cursor_id = try m.internId("t020");
+    try recompute(&m);
+    try std.testing.expectEqual(@as(usize, 14), m.scroll_top); // 20 + 1 - 7
+
+    // A filter nothing matches: no rows, so no cursor either.
+    m.filters = .{ .tags = &[_][]const u8{"nope"} };
+    m.filtering = true;
+    try recompute(&m);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.len);
+    try std.testing.expect(m.cursor_id == null);
+    try std.testing.expectEqual(@as(usize, 0), m.scroll_top); // clamped, not 20
+
+    // Clearing it must put the cursor back where it was, not at row 0.
+    m.filters = .{};
+    m.filtering = false;
+    try recompute(&m);
+    try std.testing.expectEqualStrings("t020", m.cursor_id.?);
+    try std.testing.expectEqual(@as(usize, 14), m.scroll_top);
+}
+
+// The brief's shrink test is satisfied by any clamp at all — even by passing a
+// cursor index of 0 to ensureVisible. This pins the actual arithmetic: the
+// viewport must follow the cursor, using the ledger height (viewport - 3).
+test "recompute scrolls the viewport down to the cursor row" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    m.viewport = .{ .cols = 80, .rows = 10 }; // 10 - 3 = 7 ledger rows
+
+    var many: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    fillSeq(&many, &ids);
+    try loadInto(&m, &many);
+    try std.testing.expectEqual(@as(usize, 0), m.scroll_top);
+
+    m.cursor_id = try m.internId("t035");
+    try recompute(&m);
+    try std.testing.expectEqual(@as(usize, 35), m.cursorIndex().?);
+    try std.testing.expectEqual(@as(usize, 29), m.scroll_top); // 35 + 1 - 7
 }
