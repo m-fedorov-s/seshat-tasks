@@ -96,6 +96,16 @@ pub const Model = struct {
     folds: ledger.Folds,
 
     cursor_id: ?[]const u8 = null,
+    // The cursor's last known ROW INDEX. Never a source of truth for what is
+    // selected — `cursor_id` is — only the anchor `recompute` falls back to when
+    // the selected task has vanished, so the cursor drops to its old neighbour
+    // instead of jumping to the top. It has to be a stored field because
+    // `replaceTasks` retires `rows` (their ids point into the arena it is about
+    // to reset), so by the time `recompute` runs there is no row list left to
+    // derive the old position from. Written in exactly two places: snapshotted
+    // at the end of `replaceTasks`'s teardown, and refreshed at the end of
+    // `recompute`.
+    cursor_anchor: usize = 0,
     filters: view.Filters = .{},
     filter_expr: []const u8 = "", // interned; drives the header and empty state
     filtering: bool = false,
@@ -189,6 +199,16 @@ pub const Model = struct {
         m.in_flight = .none;
     }
 
+    // Where the cursor currently sits in `rows`, or null if its task is not on
+    // screen at all (filtered out, inside a collapsed subtree, or gone).
+    pub fn cursorIndex(m: *const Model) ?usize {
+        const id = m.cursor_id orelse return null;
+        for (m.rows, 0..) |r, i| {
+            if (r.kind == .task and std.mem.eql(u8, r.id, id)) return i;
+        }
+        return null;
+    }
+
     pub fn status(m: *const Model) []const u8 {
         return m.status_buf.items;
     }
@@ -239,6 +259,12 @@ pub const Model = struct {
 
         // Past this point nothing can fail. Retire the old derived state, whose
         // ids all point into the arena that is about to be reset.
+        //
+        // Read the cursor's row index BEFORE `rows` goes away: this is the last
+        // instant it exists. `recompute` cannot recover it afterwards — it would
+        // see an empty row list and silently degrade to a "jump to row 0"
+        // fallback rather than to the nearest surviving row.
+        m.cursor_anchor = m.cursorIndex() orelse m.cursor_anchor;
         m.gpa.free(m.rows);
         m.rows = &.{};
         m.scores.clearRetainingCapacity();
@@ -255,6 +281,75 @@ pub const Model = struct {
         _ = m.spare.reset(.retain_capacity);
     }
 };
+
+// The single funnel: rebuilds every piece of derived state (selection, scores,
+// ranking, rows, cursor, scroll offset) after ANY change to tasks, filters,
+// folds or strategy. Every branch of `update` ends by calling it, and nothing
+// else may rebuild these fields piecemeal.
+fn recompute(m: *Model) !void {
+    // Where the cursor SAT, so a vanished task falls to its neighbour rather
+    // than to the top of the list. When `rows` is still valid (a fold, filter or
+    // strategy change) that is exact; after a `replaceTasks` the row list is
+    // already gone and the anchor `replaceTasks` snapshotted is all there is.
+    const old_index = m.cursorIndex() orelse m.cursor_anchor;
+
+    m.gpa.free(m.rows);
+    m.rows = &.{};
+    m.scores.deinit();
+    m.scores = ledger.Scores.init(m.gpa);
+
+    const roots = try view.select(m.gpa, m.tasks, &m.idx, m.filters, m.now);
+    defer m.gpa.free(roots);
+
+    m.scores = try ledger.computeScores(m.gpa, m.tasks, &m.idx, m.filters, m.now);
+
+    if (m.strategy == .urgency) {
+        const sc = try m.gpa.alloc(i64, roots.len);
+        defer m.gpa.free(sc);
+        const complete = try m.gpa.alloc(bool, roots.len);
+        defer m.gpa.free(complete);
+        for (roots, 0..) |r, i| {
+            // computeScores visits every task, so a miss is unreachable in
+            // practice — but `sc`/`complete` are uninitialised memory, and
+            // skipping an entry would hand rankByScore a garbage sort key.
+            const s = m.scores.get(r.id) orelse ledger.Score{
+                .own = 0,
+                .sub = 0,
+                .attention = 0,
+                .descendants = 0,
+                .all_complete = false,
+                .matches = true,
+                .self_matches = true,
+            };
+            sc[i] = s.sub;
+            complete[i] = s.all_complete;
+        }
+        try view.rankByScore(m.gpa, roots, sc, complete, m.strategy, m.now);
+    } else {
+        view.rank(roots, m.strategy, m.now);
+    }
+
+    m.rows = try ledger.buildRows(m.gpa, roots, m.tasks, &m.idx, &m.scores, &m.folds, m.filtering);
+
+    // Re-resolve the cursor BY ID; fall back to the nearest surviving position.
+    if (m.cursorIndex() == null) {
+        m.cursor_id = if (m.rows.len == 0)
+            null
+        else blk: {
+            var i = @min(old_index, m.rows.len - 1);
+            // Skip non-task rows (a header or a missing child cannot be selected).
+            while (i > 0 and m.rows[i].kind != .task) i -= 1;
+            if (m.rows[i].kind != .task) break :blk null;
+            // Must be interned: `Row.id` borrows from the live task arena, which
+            // the next replaceTasks resets.
+            break :blk try m.internId(m.rows[i].id);
+        };
+    }
+
+    m.cursor_anchor = m.cursorIndex() orelse 0;
+    const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules
+    m.scroll_top = ledger.ensureVisible(m.cursor_anchor, m.rows.len, layout.ledger_rows, m.scroll_top);
+}
 
 fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![][]const u8 {
     const out = try a.alloc([]const u8, src.len);
@@ -279,6 +374,11 @@ fn t(id: []const u8, prio: Priority, status: Status, due: ?i64, kids: []const []
         },
         .meta = .{ .created_at = NOW },
     };
+}
+
+fn loadInto(m: *Model, tasks: []const Task) !void {
+    try m.replaceTasks(tasks);
+    try recompute(m);
 }
 
 test "a model initialises, accepts a task set, and tears down with no leaks" {
@@ -414,4 +514,101 @@ test "clearMode and clearInFlight free the editor and reset the slot" {
     // A second editor installed after a clear is still owned and still freed by
     // deinit — the retag must not have made the slot un-ownable.
     m.mode = .{ .add = try editors.LineEditor.init(a, "a heap-allocated new-task title") };
+}
+
+test "recompute ranks roots by subtree score and selects the first as cursor" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+
+    var tasks = [_]Task{
+        t("calm", .low, .todo, null, &.{}),
+        t("quiet", .none, .todo, null, &.{"urgent"}),
+        t("urgent", .high, .todo, NOW - DAY, &.{}),
+    };
+    try loadInto(&m, &tasks);
+
+    // "quiet" scores 0 itself but holds an overdue high child, so it outranks "calm"
+    // and auto-expands.
+    try std.testing.expectEqualStrings("quiet", m.rows[0].id);
+    try std.testing.expectEqualStrings("urgent", m.rows[1].id);
+    try std.testing.expectEqualStrings("calm", m.rows[2].id);
+    try std.testing.expectEqualStrings("quiet", m.cursor_id.?);
+}
+
+test "recompute keeps the cursor on its task across a re-rank" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    var tasks = [_]Task{
+        t("aaa", .high, .todo, null, &.{}),
+        t("bbb", .low, .todo, null, &.{}),
+    };
+    try loadInto(&m, &tasks);
+    m.cursor_id = try m.internId("bbb");
+
+    // Re-rank with bbb now the more urgent one.
+    var next = [_]Task{
+        t("aaa", .low, .todo, null, &.{}),
+        t("bbb", .high, .todo, null, &.{}),
+    };
+    try loadInto(&m, &next);
+    try std.testing.expectEqualStrings("bbb", m.cursor_id.?);
+    try std.testing.expectEqual(@as(usize, 0), m.cursorIndex().?);
+}
+
+test "recompute moves the cursor to the NEAREST surviving row, not to row 0" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    var tasks = [_]Task{
+        t("a1", .high, .todo, null, &.{}),
+        t("a2", .medium, .todo, null, &.{}),
+        t("a3", .low, .todo, null, &.{}),
+    };
+    try loadInto(&m, &tasks);
+    m.cursor_id = try m.internId("a2"); // index 1
+
+    var next = [_]Task{
+        t("a1", .high, .todo, null, &.{}),
+        t("a3", .low, .todo, null, &.{}),
+    };
+    try loadInto(&m, &next);
+    // Index 1 survives as "a3" — NOT "a1", which a naive rows[0] fallback would give.
+    try std.testing.expectEqualStrings("a3", m.cursor_id.?);
+}
+
+test "recompute clears the cursor when nothing survives" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    var tasks = [_]Task{t("only", .high, .todo, null, &.{})};
+    try loadInto(&m, &tasks);
+    try loadInto(&m, &[_]Task{});
+    try std.testing.expect(m.cursor_id == null);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.len);
+}
+
+test "recompute keeps scroll_top inside the row list when it shrinks" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    m.viewport = .{ .cols = 80, .rows = 10 };
+
+    var many: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    for (&many, &ids, 0..) |*task_, *idbuf, i| {
+        _ = std.fmt.bufPrint(idbuf, "t{d:0>3}", .{i}) catch unreachable;
+        task_.* = t(idbuf, .low, .todo, null, &.{});
+    }
+    try loadInto(&m, &many);
+    m.scroll_top = 30;
+
+    try loadInto(&m, many[0..3]);
+    try std.testing.expect(m.scroll_top < m.rows.len);
 }
