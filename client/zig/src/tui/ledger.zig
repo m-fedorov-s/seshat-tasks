@@ -15,12 +15,15 @@ pub const Score = struct {
     self_matches: bool, // t itself passes the filters
 };
 
+// Keys borrow the `id` slices out of the `tasks` passed to `computeScores` — `Scores`
+// does not own them. A `Scores` map must not outlive (or be held across a swap of) the
+// task slice it was built from.
 pub const Scores = std.StringHashMap(Score);
 
 const DAY_SECS: i64 = 86400;
 
-// The fold predicate. The 3-day threshold deliberately reuses dueFactor's bucket
-// (view.zig:164) so the ledger's "soon" and the urgency score's "soon" cannot drift.
+// The fold predicate. The 3-day threshold deliberately reuses view.dueFactor's bucket
+// boundary so the ledger's "soon" and the urgency score's "soon" cannot drift.
 pub fn needsAttention(task_: Task, now: i64) bool {
     if (task_.content.status == .done or task_.content.status == .cancelled) return false;
     if (task_.content.priority == .high) return true;
@@ -39,9 +42,7 @@ pub fn computeScores(
     errdefer scores.deinit();
     var on_path = std.StringHashMap(void).init(allocator);
     defer on_path.deinit();
-    var truncated = std.StringHashMap(void).init(allocator);
-    defer truncated.deinit();
-    for (tasks) |task_| _ = try walk(task_, idx, f, now, &scores, &on_path, &truncated);
+    for (tasks) |task_| _ = try walk(task_, idx, f, now, &scores, &on_path);
     return scores;
 }
 
@@ -52,14 +53,19 @@ fn walk(
     now: i64,
     scores: *Scores,
     on_path: *std.StringHashMap(void),
-    truncated: *std.StringHashMap(void),
 ) !Score {
     if (scores.get(task_.id)) |memo| return memo;
     const self_m = view.matchesSelf(task_, f, now);
     if (on_path.contains(task_.id)) {
-        // Cycle: contribute nothing, and remember that this result was truncated
-        // so we do not memoise a wrong total for the ancestor that hit it.
-        try truncated.put(task_.id, {});
+        // Back-edge: task_ is already an ancestor on the current walk. Contribute
+        // nothing and stop recursing — `on_path` alone is what guarantees
+        // termination. This makes every score inside a cycle approximate (an
+        // undercount of `sub`/`attention`/`descendants`, since the closing edge's
+        // contribution is dropped), not exact. That is accepted: the server
+        // rejects cycles on every mutation and on data-file load (see
+        // server/validate.go), so cyclic data cannot arise from a well-behaved
+        // server. This branch exists only so malformed data degrades gracefully
+        // (terminates with approximate numbers) instead of recursing forever.
         return .{
             .own = 0,
             .sub = 0,
@@ -84,19 +90,16 @@ fn walk(
         .matches = self_m,
         .self_matches = self_m,
     };
-    var saw_truncation = false;
     for (task_.content.child_ids) |cid| {
         const child = idx.by_id.get(cid) orelse continue;
-        const cs = try walk(child, idx, f, now, scores, on_path, truncated);
-        if (truncated.contains(child.id)) saw_truncation = true;
+        const cs = try walk(child, idx, f, now, scores, on_path);
         if (cs.sub > s.sub) s.sub = cs.sub;
         s.attention += cs.attention + @intFromBool(needsAttention(child, now));
         s.descendants += cs.descendants + 1;
         if (!cs.all_complete) s.all_complete = false;
         if (cs.matches) s.matches = true;
     }
-    // Only memoise a total computed from complete subtrees.
-    if (!saw_truncation) try scores.put(task_.id, s);
+    try scores.put(task_.id, s);
     return s;
 }
 
@@ -196,7 +199,7 @@ test "computeScores: matches includes descendants, self_matches does not" {
     try std.testing.expect(s.get("kid").?.self_matches);
 }
 
-test "computeScores terminates on a cycle" {
+test "computeScores terminates on a 2-node cycle and memoises every member" {
     const a = std.testing.allocator;
     var tasks = [_]Task{
         t("x", .none, .todo, null, &.{"y"}),
@@ -207,4 +210,21 @@ test "computeScores terminates on a cycle" {
     var s = try computeScores(a, &tasks, &idx, .{}, NOW);
     defer s.deinit();
     try std.testing.expect(s.get("x") != null);
+    try std.testing.expect(s.get("y") != null);
+}
+
+test "computeScores terminates on a 3-node cycle and memoises every member" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("x", .none, .todo, null, &.{"y"}),
+        t("y", .none, .todo, null, &.{"z"}),
+        t("z", .none, .todo, null, &.{"x"}),
+    };
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var s = try computeScores(a, &tasks, &idx, .{}, NOW);
+    defer s.deinit();
+    try std.testing.expect(s.get("x") != null);
+    try std.testing.expect(s.get("y") != null);
+    try std.testing.expect(s.get("z") != null);
 }
