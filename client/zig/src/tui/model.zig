@@ -1,6 +1,7 @@
 //! The TUI's pure state: types, memory ownership, and nothing else. No I/O, and
 //! it never imports vaxis — the shell (task 18) owns the terminal, this owns the
-//! bytes. `update` and key handling arrive in later tasks.
+//! bytes. `update` is the event handler: it mutates the model and returns a
+//! `Command` describing any side effect for the shell to perform.
 const std = @import("std");
 const taskmod = @import("../core/task.zig");
 const Task = taskmod.Task;
@@ -8,6 +9,7 @@ const Content = taskmod.Content;
 const Priority = taskmod.Priority;
 const Status = taskmod.Status;
 const view = @import("../core/view.zig");
+const display = @import("../core/display.zig");
 const ledger = @import("ledger.zig");
 const editors = @import("editors.zig");
 
@@ -375,6 +377,199 @@ fn nearestTaskRow(rows: []const ledger.Row, anchor: usize) ?usize {
     return null;
 }
 
+// ─── update ──────────────────────────────────────────────────────────────────
+//
+// The event handler, and the only entry point the shell calls. It is pure of
+// I/O: it mutates the model and RETURNS a description of the side effect it
+// wants (`Command`), never performs one.
+//
+// Dispatch is on `m.mode` FIRST and on the event second. That order is the whole
+// reason `Mode` is a single tagged union: the mode is what decides what a key
+// means, so there is exactly one place per mode where its key map lives.
+pub fn update(allocator: std.mem.Allocator, m: *Model, ev: Event) !Command {
+    return switch (m.mode) {
+        .list => listMode(m, ev),
+        .field => |f| fieldMode(allocator, m, f, ev),
+        .editing => |e| editingMode(m, e.field, ev),
+        // Later tasks own these modes' key maps; until then they see only the
+        // events that mean the same thing everywhere.
+        .filter, .add, .confirm_delete => sharedEvent(m, ev),
+    };
+}
+
+// The events whose meaning does not depend on the mode. Every mode handler falls
+// through to here for anything it does not itself interpret.
+fn sharedEvent(m: *Model, ev: Event) !Command {
+    switch (ev) {
+        .resize => |vp| {
+            m.viewport = vp;
+            // A new height changes the valid scroll range.
+            try recompute(m);
+        },
+        .tasks_loaded => |tasks| {
+            try m.replaceTasks(tasks);
+            try recompute(m);
+        },
+        // `.key` reaches here only from a mode with no key map yet; the request
+        // outcomes (`commit_ok`, `conflict`, …) are later tasks'.
+        else => {},
+    }
+    return .none;
+}
+
+fn listMode(m: *Model, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        .char => |c| switch (c) {
+            'q' => return .quit,
+            'j' => try moveCursor(m, .next),
+            'k' => try moveCursor(m, .prev),
+            'l' => try setFold(m, true),
+            'h' => try setFold(m, false),
+            else => {},
+        },
+        .down => try moveCursor(m, .next),
+        .up => try moveCursor(m, .prev),
+        .right => try setFold(m, true),
+        .left => try setFold(m, false),
+        .enter => {
+            m.pane_open = true; // descending always shows the task being edited
+            m.mode = .{ .field = .title };
+            // The pane takes rows away from the ledger, so the scroll offset the
+            // old layout produced may no longer be valid.
+            try recompute(m);
+        },
+        else => {},
+    }
+    return .none;
+}
+
+const Dir = enum { prev, next };
+
+// Move the cursor to the adjacent SELECTABLE row, skipping `.missing` and
+// `.unreachable_header` rows, and clamping at both ends (no wrap).
+fn moveCursor(m: *Model, dir: Dir) !void {
+    var i = m.cursorIndex() orelse return;
+    while (true) {
+        switch (dir) {
+            .next => {
+                if (i + 1 >= m.rows.len) return; // clamped: nothing selectable ahead
+                i += 1;
+            },
+            .prev => {
+                if (i == 0) return; // clamped
+                i -= 1;
+            },
+        }
+        if (m.rows[i].kind == .task) break;
+    }
+    // INTERNED: `Row.id` points into the live task arena, which the next
+    // `replaceTasks` resets. `cursor_id` has to outlive that.
+    m.cursor_id = try m.internId(m.rows[i].id);
+    // recompute is the funnel — it re-resolves the cursor, refreshes the anchor
+    // and scrolls the viewport to follow it.
+    try recompute(m);
+}
+
+// h/l and ←/→: record an EXPLICIT fold for the cursor's task, overriding the
+// auto-expand rule. `cursor_id` is already interned, which is exactly what a
+// `folds` key must be — it outlives every task-set swap, while `Row.id` does not.
+fn setFold(m: *Model, expanded: bool) !void {
+    const id = m.cursor_id orelse return;
+    try m.folds.put(id, expanded);
+    try recompute(m);
+}
+
+fn fieldMode(allocator: std.mem.Allocator, m: *Model, f: FieldId, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        .up => m.mode = .{ .field = stepField(f, -1) },
+        .down => m.mode = .{ .field = stepField(f, 1) },
+        .enter => try openEditor(allocator, m, f),
+        // No editor is live in `.field`, but clearMode is the one sanctioned way
+        // back to `.list` — never hand-roll the teardown.
+        .escape => m.clearMode(),
+        else => {},
+    }
+    return .none;
+}
+
+// ↑/↓ walk FieldId's DECLARATION order, clamped at both ends — deliberately no
+// wrapping: a field list is short enough that wrapping only ever surprises.
+fn stepField(f: FieldId, delta: i8) FieldId {
+    const last: i8 = @typeInfo(FieldId).@"enum".fields.len - 1;
+    const i: i8 = @intFromEnum(f);
+    return @enumFromInt(std.math.clamp(i + delta, 0, last));
+}
+
+fn cursorTask(m: *const Model) ?Task {
+    const id = m.cursor_id orelse return null;
+    if (!m.idx_built) return null;
+    return m.idx.by_id.get(id);
+}
+
+// Open the editor whose TYPE matches the field, seeded from the cursor's task.
+fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !void {
+    const c: Content = if (cursorTask(m)) |task_| task_.content else .{ .title = "" };
+    var date_buf: [16]u8 = undefined;
+
+    // Build the editor BEFORE dropping the old mode, so a failed allocation
+    // leaves the model exactly as it was.
+    const editor: Editor = switch (f) {
+        // Enum fields pick from the declaration order, seeded at the current value.
+        .status => .{ .pick = .{
+            .len = @typeInfo(Status).@"enum".fields.len,
+            .index = @intFromEnum(c.status),
+        } },
+        .priority => .{ .pick = .{
+            .len = @typeInfo(Priority).@"enum".fields.len,
+            .index = @intFromEnum(c.priority),
+        } },
+        .title => .{ .line = try editors.LineEditor.init(m.gpa, c.title) },
+        .tags => blk: {
+            // Same comma-separated form the CLI's `--tags` takes.
+            const joined = try std.mem.join(allocator, ",", c.tags);
+            defer allocator.free(joined);
+            break :blk .{ .line = try editors.LineEditor.init(m.gpa, joined) };
+        },
+        // Dates prefill with the formatted local date, empty when unset.
+        .due => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.due_at, m.offset_minutes)) },
+        .scheduled => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.scheduled_at, m.offset_minutes)) },
+        // A description is edited in $EDITOR; task 13 emits the command for it.
+        .description => .external,
+    };
+    // Nothing below can fail, so `editor` cannot be stranded unowned.
+    m.clearMode(); // frees whatever the outgoing mode owned
+    m.mode = .{ .editing = .{ .field = f, .editor = editor } };
+}
+
+fn dateText(buf: []u8, at: ?i64, offset_minutes: i32) []const u8 {
+    const unix = at orelse return "";
+    return display.formatDate(buf, unix, offset_minutes);
+}
+
+fn editingMode(m: *Model, f: FieldId, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        .escape => {
+            m.clearMode(); // frees the editor's heap buffer
+            m.mode = .{ .field = f }; // back up one level, not all the way out
+        },
+        // Feeding keystrokes to the editor and committing on Enter are task 13's.
+        else => {},
+    }
+    return .none;
+}
+
 fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![][]const u8 {
     const out = try a.alloc([]const u8, src.len);
     for (src, out) |s, *d| d.* = try a.dupe(u8, s);
@@ -404,6 +599,29 @@ fn loadInto(m: *Model, tasks: []const Task) !void {
     try m.replaceTasks(tasks);
     try recompute(m);
 }
+
+const TestHarness = struct {
+    alloc: std.mem.Allocator,
+    m: Model,
+    last: Command = .none,
+
+    // NOTE: `h` must be declared by the caller and initialised in place; Model
+    // must never be copied by value.
+    fn setup(h: *TestHarness, alloc: std.mem.Allocator, tasks: []const Task) !void {
+        h.* = .{ .alloc = alloc, .m = undefined };
+        try h.m.init(alloc, NOW, 0);
+        h.last = try update(alloc, &h.m, .{ .tasks_loaded = tasks });
+    }
+    fn deinit(h: *TestHarness) void {
+        h.m.deinit();
+    }
+    fn key(h: *TestHarness, k: Key) !void {
+        h.last = try update(h.alloc, &h.m, .{ .key = k });
+    }
+    fn send(h: *TestHarness, ev: Event) !void {
+        h.last = try update(h.alloc, &h.m, ev);
+    }
+};
 
 test "a model initialises, accepts a task set, and tears down with no leaks" {
     const a = std.testing.allocator;
@@ -762,4 +980,153 @@ test "recompute scrolls the viewport down to the cursor row" {
     try recompute(&m);
     try std.testing.expectEqual(@as(usize, 35), m.cursorIndex().?);
     try std.testing.expectEqual(@as(usize, 29), m.scroll_top); // 35 + 1 - 7
+}
+
+test "enter descends list -> field, escape ascends" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try std.testing.expect(h.m.mode == .list);
+    try h.key(.enter);
+    try std.testing.expectEqual(FieldId.title, h.m.mode.field);
+    try std.testing.expect(h.m.pane_open); // descending opens the pane
+    try h.key(.escape);
+    try std.testing.expect(h.m.mode == .list);
+}
+
+test "up and down walk the field list without wrapping past the ends" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.up);
+    try std.testing.expectEqual(FieldId.title, h.m.mode.field);
+    try h.key(.down);
+    try std.testing.expectEqual(FieldId.description, h.m.mode.field);
+    for (0..10) |_| try h.key(.down);
+    try std.testing.expectEqual(FieldId.tags, h.m.mode.field);
+}
+
+test "enter on an enum field opens a pick editor seeded with the current value" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..3) |_| try h.key(.down); // title -> description -> status -> priority
+    try std.testing.expectEqual(FieldId.priority, h.m.mode.field);
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode.editing.editor == .pick);
+    // Priority declaration order is none, low, medium, high => medium is index 2.
+    try std.testing.expectEqual(@as(usize, 2), h.m.mode.editing.editor.pick.index);
+}
+
+test "enter on the status field seeds the pick from the current status" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .in_progress, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..2) |_| try h.key(.down); // -> status
+    try h.key(.enter);
+    // Status declaration order is todo, in_progress, done, cancelled => index 1.
+    try std.testing.expectEqual(@as(usize, 1), h.m.mode.editing.editor.pick.index);
+}
+
+test "enter on a text field opens a line editor prefilled with the value" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("hello", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter);
+    try std.testing.expectEqualStrings("hello", h.m.mode.editing.editor.line.text());
+}
+
+test "escape from an editor returns to the field and frees the editor" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .editing);
+    try h.key(.escape);
+    try std.testing.expectEqual(FieldId.title, h.m.mode.field);
+}
+
+test "j and k move the cursor, stored by id" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("aaa", .high, .todo, null, &.{}),
+        t("bbb", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try std.testing.expectEqualStrings("aaa", h.m.cursor_id.?);
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("bbb", h.m.cursor_id.?);
+    try h.key(.{ .char = 'j' }); // clamps at the end
+    try std.testing.expectEqualStrings("bbb", h.m.cursor_id.?);
+    try h.key(.{ .char = 'k' });
+    try std.testing.expectEqualStrings("aaa", h.m.cursor_id.?);
+}
+
+test "h and l collapse and expand the selected node" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("root", .none, .todo, null, &.{"kid"}),
+        t("kid", .high, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try std.testing.expectEqual(@as(usize, 2), h.m.rows.len); // auto-expanded
+    try h.key(.{ .char = 'h' });
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+    try h.key(.{ .char = 'l' });
+    try std.testing.expectEqual(@as(usize, 2), h.m.rows.len);
+}
+
+test "l on a leaf and h on an already-collapsed node are no-ops" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("leaf", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'l' });
+    try h.key(.{ .char = 'h' });
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+    try std.testing.expect(h.last == .none);
+}
+
+test "q emits quit" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'q' });
+    try std.testing.expect(h.last == .quit);
+}
+
+test "resize updates the viewport and re-clamps the scroll offset" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 100, .rows = 40 } });
+    try std.testing.expectEqual(@as(u16, 40), h.m.viewport.rows);
+    try std.testing.expect(h.m.scroll_top < @max(1, h.m.rows.len));
 }
