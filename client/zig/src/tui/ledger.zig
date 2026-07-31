@@ -149,9 +149,15 @@ pub fn buildRows(
     var out: std.ArrayList(Row) = .empty;
     errdefer out.deinit(allocator);
 
+    // Reachability must be computed from every *actual* root in the index, not from
+    // the (possibly filtered) `roots` argument — otherwise a root that view.select
+    // filtered out of the selection would look "unreachable" and its whole subtree
+    // would avalanche into the unreachable-header section on every filtered view.
     var reachable = std.StringHashMap(void).init(allocator);
     defer reachable.deinit();
-    for (roots) |r| try markReachable(r, idx, &reachable);
+    for (all_tasks) |task_| {
+        if (idx.isRoot(task_.id)) try markReachable(task_, idx, &reachable);
+    }
 
     var path = std.StringHashMap(void).init(allocator);
     defer path.deinit();
@@ -160,18 +166,38 @@ pub fn buildRows(
 
     for (roots) |r| try emit(allocator, r, idx, scores, folds, filtering, 0, true, &out, &path, &rendered);
 
-    // Spec §4.6: anything fetched but not reachable from a rendered root must be
+    // Spec §4.6: anything fetched but not reachable from a real root must be
     // surfaced, or a cycle would make tasks silently invisible. Skip anything
     // already structurally `reachable` (even if folding kept it off-screen) and
     // anything this pass has already emitted itself (e.g. a task reached while
-    // walking a previously-encountered unreachable component).
+    // walking a previously-encountered unreachable component). Under an active
+    // filter, an orphan that itself was filtered away should stay away — only
+    // one that still matches belongs in the safety net.
     var unreachable_first = true;
     for (all_tasks) |task_| {
         if (reachable.contains(task_.id) or rendered.contains(task_.id)) continue;
+        if (filtering) {
+            const sc = scores.get(task_.id) orelse Score{
+                .own = 0,
+                .sub = 0,
+                .attention = 0,
+                .descendants = 0,
+                .all_complete = false,
+                .matches = true,
+                .self_matches = true,
+            };
+            if (!sc.matches) continue;
+        }
         if (unreachable_first) {
             try out.append(allocator, .{
-                .id = "", .kind = .unreachable_header, .depth = 0, .last_sibling = true,
-                .descendants = 0, .attention = 0, .expanded = true, .dimmed = false,
+                .id = "",
+                .kind = .unreachable_header,
+                .depth = 0,
+                .last_sibling = true,
+                .descendants = 0,
+                .attention = 0,
+                .expanded = true,
+                .dimmed = false,
             });
             unreachable_first = false;
         }
@@ -193,14 +219,23 @@ fn emit(
     path: *std.StringHashMap(void),
     rendered: *std.StringHashMap(void),
 ) !void {
-    if (path.contains(task_.id)) return; // cycle guard
+    if (path.contains(task_.id)) return; // cycle guard (within this recursion chain)
+    if (rendered.contains(task_.id)) return; // already emitted from another entry point — every
+    // task in `all_tasks` must appear exactly once, whether reached twice via a
+    // malformed shared-parent forest or via an unreachable child that precedes its
+    // unreachable parent in iteration order.
     try path.put(task_.id, {});
     defer _ = path.remove(task_.id);
     try rendered.put(task_.id, {});
 
     const s = scores.get(task_.id) orelse Score{
-        .own = 0, .sub = 0, .attention = 0, .descendants = 0,
-        .all_complete = false, .matches = true, .self_matches = true,
+        .own = 0,
+        .sub = 0,
+        .attention = 0,
+        .descendants = 0,
+        .all_complete = false,
+        .matches = true,
+        .self_matches = true,
     };
     const expanded = isExpanded(task_.id, s, folds);
     try out.append(allocator, .{
@@ -222,8 +257,14 @@ fn emit(
             try emit(allocator, child, idx, scores, folds, filtering, depth + 1, is_last, out, path, rendered);
         } else {
             try out.append(allocator, .{
-                .id = cid, .kind = .missing, .depth = depth + 1, .last_sibling = is_last,
-                .descendants = 0, .attention = 0, .expanded = false, .dimmed = false,
+                .id = cid,
+                .kind = .missing,
+                .depth = depth + 1,
+                .last_sibling = is_last,
+                .descendants = 0,
+                .attention = 0,
+                .expanded = false,
+                .dimmed = false,
             });
         }
     }
@@ -356,8 +397,7 @@ test "computeScores terminates on a 3-node cycle and memoises every member" {
 }
 
 fn scoreWith(attention: u32) Score {
-    return .{ .own = 0, .sub = 0, .attention = attention, .descendants = 0,
-              .all_complete = false, .matches = true, .self_matches = true };
+    return .{ .own = 0, .sub = 0, .attention = attention, .descendants = 0, .all_complete = false, .matches = true, .self_matches = true };
 }
 
 test "isExpanded: auto-expands exactly when a descendant needs attention" {
@@ -372,8 +412,7 @@ test "isExpanded: the tie case the first design got wrong" {
     // `sub > own` rule collapsed this and hid the most important row.
     var folds = Folds.init(std.testing.allocator);
     defer folds.deinit();
-    const tie = Score{ .own = 15, .sub = 15, .attention = 1, .descendants = 1,
-                       .all_complete = false, .matches = true, .self_matches = true };
+    const tie = Score{ .own = 15, .sub = 15, .attention = 1, .descendants = 1, .all_complete = false, .matches = true, .self_matches = true };
     try std.testing.expect(isExpanded("p", tie, &folds));
 }
 
@@ -382,8 +421,7 @@ test "isExpanded: does NOT over-expand on a merely-dated child" {
     // degenerating the tree into an indented flat list.
     var folds = Folds.init(std.testing.allocator);
     defer folds.deinit();
-    const mild = Score{ .own = 0, .sub = 1, .attention = 0, .descendants = 1,
-                        .all_complete = false, .matches = true, .self_matches = true };
+    const mild = Score{ .own = 0, .sub = 1, .attention = 0, .descendants = 1, .all_complete = false, .matches = true, .self_matches = true };
     try std.testing.expect(!isExpanded("r", mild, &folds));
 }
 
@@ -444,13 +482,13 @@ test "buildRows: dims a row that did not itself match the filter" {
 
     const rows = try buildRows(a, tasks[0..1], &tasks, &idx, &scores, &folds, true);
     defer a.free(rows);
-    try std.testing.expect(rows[0].dimmed);   // context only
-    try std.testing.expect(!rows[1].dimmed);  // the actual hit
+    try std.testing.expect(rows[0].dimmed); // context only
+    try std.testing.expect(!rows[1].dimmed); // the actual hit
 }
 
 test "buildRows: a dangling child id becomes a .missing row" {
     const a = std.testing.allocator;
-    var tasks = [_]Task{ t("root", .none, .todo, null, &.{"ghost"}) };
+    var tasks = [_]Task{t("root", .none, .todo, null, &.{"ghost"})};
     var idx = try view.Index.build(a, &tasks);
     defer idx.deinit();
     var scores = try computeScores(a, &tasks, &idx, .{}, NOW);
@@ -510,4 +548,69 @@ test "buildRows terminates on a cycle reachable from a root" {
     const rows = try buildRows(a, tasks[0..1], &tasks, &idx, &scores, &folds, false);
     defer a.free(rows);
     try std.testing.expect(rows.len < 100); // the assertion is that it returns
+}
+
+test "buildRows: an unreachable child ordered before its unreachable parent is never duplicated" {
+    const a = std.testing.allocator;
+    // Mutual cycle, ordered child-then-parent in `all_tasks`, no actual roots at all.
+    // Forcing "parent" open makes it try to re-descend into "child", which a fix that
+    // only guards emit's *entry* (not its recursion) would happily re-emit.
+    var tasks = [_]Task{
+        t("child", .none, .todo, null, &.{"parent"}),
+        t("parent", .none, .todo, null, &.{"child"}),
+    };
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    var scores = try computeScores(a, &tasks, &idx, .{}, NOW);
+    defer scores.deinit();
+    var folds = Folds.init(a);
+    defer folds.deinit();
+    try folds.put("parent", true);
+
+    const rows = try buildRows(a, &.{}, &tasks, &idx, &scores, &folds, false);
+    defer a.free(rows);
+
+    var seen = std.StringHashMap(void).init(a);
+    defer seen.deinit();
+    for (rows) |r| {
+        if (r.kind != .task) continue;
+        try std.testing.expect(!seen.contains(r.id));
+        try seen.put(r.id, {});
+    }
+}
+
+test "buildRows: a filtered-out root's subtree is not swept into the unreachable header" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("matching_root", .none, .todo, null, &.{}),
+        t("other_root", .none, .todo, null, &.{"other_kid"}),
+        t("other_kid", .none, .todo, null, &.{}),
+        t("orphan_a", .none, .todo, null, &.{"orphan_b"}),
+        t("orphan_b", .none, .todo, null, &.{"orphan_a"}),
+    };
+    tasks[0].content.tags = @constCast(&[_][]const u8{"ops"});
+    tasks[3].content.tags = @constCast(&[_][]const u8{"ops"});
+    var idx = try view.Index.build(a, &tasks);
+    defer idx.deinit();
+    const f = view.Filters{ .tags = &[_][]const u8{"ops"} };
+    var scores = try computeScores(a, &tasks, &idx, f, NOW);
+    defer scores.deinit();
+    var folds = Folds.init(a);
+    defer folds.deinit();
+
+    // Simulate view.select() having already filtered `roots` down to just
+    // "matching_root" — "other_root" is a real root (per idx) but was filtered out.
+    const selected_roots = tasks[0..1];
+    const rows = try buildRows(a, selected_roots, &tasks, &idx, &scores, &folds, true);
+    defer a.free(rows);
+
+    var seen_ids = std.StringHashMap(void).init(a);
+    defer seen_ids.deinit();
+    for (rows) |r| {
+        if (r.kind == .task) try seen_ids.put(r.id, {});
+    }
+    try std.testing.expect(!seen_ids.contains("other_root")); // filtered-out root: not orphaned
+    try std.testing.expect(!seen_ids.contains("other_kid")); // its subtree: not orphaned either
+    try std.testing.expect(seen_ids.contains("orphan_a")); // genuine orphan that matches the filter
+    try std.testing.expect(!seen_ids.contains("orphan_b")); // genuine orphan that does NOT match
 }
