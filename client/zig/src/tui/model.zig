@@ -432,12 +432,22 @@ fn listMode(m: *Model, ev: Event) !Command {
             'k' => try moveCursor(m, .prev),
             'l' => try setFold(m, true),
             'h' => try setFold(m, false),
+            'g' => try jumpToEdge(m, true),
+            'G' => try jumpToEdge(m, false),
             else => {},
         },
         .down => try moveCursor(m, .next),
         .up => try moveCursor(m, .prev),
         .right => try setFold(m, true),
         .left => try setFold(m, false),
+        .ctrl_d => try pageBy(m, .next),
+        .ctrl_u => try pageBy(m, .prev),
+        .tab => {
+            m.pane_open = !m.pane_open;
+            // The pane takes/gives back rows from the ledger, so the old scroll
+            // offset may no longer be valid for the new layout.
+            try recompute(m);
+        },
         .enter => {
             // Nothing selected — there is no task to descend INTO. Without this
             // guard the pane opens onto a phantom, and the commit path in a later
@@ -487,6 +497,36 @@ fn moveCursor(m: *Model, dir: Dir) !void {
 fn setFold(m: *Model, expanded: bool) !void {
     const id = m.cursor_id orelse return;
     try m.folds.put(id, expanded);
+    try recompute(m);
+}
+
+// g/G: jump to the first/last SELECTABLE row. `nearestTaskRow` anchored at row 0
+// or the last row does exactly this — it searches outward from the anchor, so
+// anchoring at an end turns it into a directional scan that steps past a leading
+// `.unreachable_header` or a trailing `.missing` run instead of landing on one.
+fn jumpToEdge(m: *Model, first: bool) !void {
+    if (m.rows.len == 0) return;
+    const anchor: usize = if (first) 0 else m.rows.len - 1;
+    const i = nearestTaskRow(m.rows, anchor) orelse return;
+    // INTERNED: see moveCursor.
+    m.cursor_id = try m.internId(m.rows[i].id);
+    try recompute(m);
+}
+
+// Ctrl-D/Ctrl-U: move by half a ledger page (spec §11), clamped at both ends,
+// then settle on the nearest selectable row — the raw arithmetic target can land
+// on a `.missing` row or the `.unreachable_header`.
+fn pageBy(m: *Model, dir: Dir) !void {
+    const cur = m.cursorIndex() orelse return;
+    const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules, matching recompute
+    const half = ledger.halfPage(layout.ledger_rows);
+    const target = switch (dir) {
+        .next => @min(cur + half, m.rows.len -| 1),
+        .prev => cur -| half,
+    };
+    const i = nearestTaskRow(m.rows, target) orelse return;
+    // INTERNED: see moveCursor.
+    m.cursor_id = try m.internId(m.rows[i].id);
     try recompute(m);
 }
 
@@ -1176,4 +1216,100 @@ test "enter on an empty list does not descend into a phantom task" {
     try std.testing.expect(h.m.mode == .list);
     try std.testing.expect(!h.m.pane_open);
     try std.testing.expect(h.last == .none);
+}
+
+fn manyTasks(buf: []Task, ids: [][4]u8) []Task {
+    for (buf, ids, 0..) |*task_, *idbuf, i| {
+        _ = std.fmt.bufPrint(idbuf, "t{d:0>3}", .{i}) catch unreachable;
+        task_.* = t(idbuf, .low, .todo, null, &.{});
+    }
+    return buf;
+}
+
+test "G jumps to the last row, g to the first" {
+    const a = std.testing.allocator;
+    var buf: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    var h: TestHarness = undefined;
+    try h.setup(a, manyTasks(&buf, &ids));
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } });
+
+    try h.key(.{ .char = 'G' });
+    try std.testing.expectEqual(h.m.rows.len - 1, h.m.cursorIndex().?);
+    try std.testing.expect(h.m.scroll_top > 0);
+
+    try h.key(.{ .char = 'g' });
+    try std.testing.expectEqual(@as(usize, 0), h.m.cursorIndex().?);
+    try std.testing.expectEqual(@as(usize, 0), h.m.scroll_top);
+}
+
+test "Ctrl-D and Ctrl-U move by half a page and clamp at the ends" {
+    const a = std.testing.allocator;
+    var buf: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    var h: TestHarness = undefined;
+    try h.setup(a, manyTasks(&buf, &ids));
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } });
+
+    const before = h.m.cursorIndex().?;
+    try h.key(.ctrl_d);
+    try std.testing.expect(h.m.cursorIndex().? > before);
+    for (0..20) |_| try h.key(.ctrl_d);
+    try std.testing.expectEqual(h.m.rows.len - 1, h.m.cursorIndex().?);
+    for (0..20) |_| try h.key(.ctrl_u);
+    try std.testing.expectEqual(@as(usize, 0), h.m.cursorIndex().?);
+}
+
+test "Tab toggles the detail pane and re-clamps the viewport" {
+    const a = std.testing.allocator;
+    var buf: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    var h: TestHarness = undefined;
+    try h.setup(a, manyTasks(&buf, &ids));
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } });
+
+    try std.testing.expect(!h.m.pane_open);
+    try h.key(.tab);
+    try std.testing.expect(h.m.pane_open);
+    try h.key(.{ .char = 'G' });
+    const with_pane = h.m.scroll_top;
+    try h.key(.tab);
+    try std.testing.expect(!h.m.pane_open);
+    // A taller ledger means less scrolling is needed to show the last row.
+    try std.testing.expect(h.m.scroll_top <= with_pane);
+}
+
+test "the viewport keys are inert while a field is focused" {
+    const a = std.testing.allocator;
+    var buf: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    var h: TestHarness = undefined;
+    try h.setup(a, manyTasks(&buf, &ids));
+    defer h.deinit();
+    try h.key(.enter); // -> .field
+    const cursor = h.m.cursor_id.?;
+    try h.key(.{ .char = 'G' });
+    try std.testing.expectEqualStrings(cursor, h.m.cursor_id.?);
+}
+
+// The previous task deliberately decided Escape does NOT clear pane_open — it is
+// a user-owned toggle that Enter force-opens; clearing it on Escape would close a
+// pane the user had opened themselves. Tab is the independent toggle, so this is
+// the natural place to pin that decision before it regresses silently.
+test "escape does not clear a pane the user opened with Tab" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.tab);
+    try std.testing.expect(h.m.pane_open);
+    try h.key(.enter); // -> .field
+    try h.key(.escape); // -> .list
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(h.m.pane_open); // still open: escape is not a pane toggle
 }
