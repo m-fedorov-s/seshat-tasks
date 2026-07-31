@@ -12,8 +12,15 @@ pub const Index = struct {
     referenced: std.StringHashMap(void),
 
     pub fn build(allocator: std.mem.Allocator, tasks: []const Task) !Index {
+        // The errdefers matter for non-arena callers: tui/model.zig's replaceTasks
+        // builds the Index from the long-lived gpa (a managed StringHashMap stores
+        // its allocator, so an arena-backed one would die with the arena). Every
+        // earlier caller passed an arena that swallowed a partial build; this one
+        // would leak both maps on an OOM partway through.
         var by_id = std.StringHashMap(Task).init(allocator);
+        errdefer by_id.deinit();
         var referenced = std.StringHashMap(void).init(allocator);
+        errdefer referenced.deinit();
         for (tasks) |t| {
             try by_id.put(t.id, t);
             for (t.content.child_ids) |c| try referenced.put(c, {});

@@ -335,6 +335,35 @@ test "setStatus replaces the previous message without leaking" {
     try std.testing.expectEqualStrings("count 7", m.status());
 }
 
+// `rows`, `scores` and `folds` are the other three gpa-owned allocations `deinit`
+// is responsible for, and nothing else in this file populates them — so removing
+// any of their frees leaves the rest of the suite green. Populating them through
+// the real ledger pipeline also makes the borrowed-id hazard concrete: `Scores`
+// keys and `Row.id` point into the live task arena, `folds` keys into the id arena.
+test "deinit frees rows, scores and folds" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+
+    var tasks = [_]Task{
+        t("root", .high, .todo, NOW - DAY, &.{"kid"}),
+        t("kid", .high, .todo, NOW - DAY, &.{}),
+    };
+    try m.replaceTasks(&tasks);
+
+    try m.folds.put(try m.internId("root"), true);
+
+    const scores = try ledger.computeScores(m.gpa, m.tasks, &m.idx, m.filters, m.now);
+    m.scores.deinit();
+    m.scores = scores;
+    m.rows = try ledger.buildRows(m.gpa, m.tasks[0..1], m.tasks, &m.idx, &m.scores, &m.folds, m.filtering);
+
+    try std.testing.expect(m.rows.len > 0);
+    try std.testing.expect(m.scores.count() > 0);
+    try std.testing.expect(m.folds.count() > 0);
+}
+
 // A real session can quit mid-edit — Esc is not guaranteed to have been pressed
 // before the loop exits, and a commit can still be in flight. An editor buffer is
 // gpa-allocated and hides inside a union that nothing else in `deinit` inspects,
