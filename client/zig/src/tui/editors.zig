@@ -151,6 +151,31 @@ test "LineEditor treats a multi-byte codepoint as one unit" {
     try std.testing.expectEqualStrings("xé", e.text());
 }
 
+test "LineEditor prevBoundary walks back multi-byte continuation sequences (3-byte and 4-byte codepoints)" {
+    const a = std.testing.allocator;
+    // "a" (1 byte) + "€" (3 bytes) + "😀" (4 bytes) + "b" (1 byte) = 9 bytes.
+    var e = try LineEditor.init(a, "a€😀b");
+    defer e.deinit(a);
+    try std.testing.expectEqualStrings("a€😀b", e.text());
+
+    // .left must land exactly on codepoint boundaries, walking back over every
+    // continuation byte of the wide codepoints (a single-step scan would stop short).
+    try e.handle(a, .left); // skip 'b' (1 byte): cursor 9 -> 8
+    try e.handle(a, .left); // skip 😀 (4 bytes, 3-iteration scan): cursor 8 -> 4
+    try e.handle(a, .left); // skip €  (3 bytes, 2-iteration scan): cursor 4 -> 1
+    try e.handle(a, .{ .char = 'x' });
+    try std.testing.expectEqualStrings("ax€😀b", e.text());
+
+    // Backspace across the wide codepoints from the end, one whole codepoint at a time.
+    try e.handle(a, .end);
+    try e.handle(a, .backspace); // removes 'b'
+    try std.testing.expectEqualStrings("ax€😀", e.text());
+    try e.handle(a, .backspace); // removes 😀 (4-byte scan)
+    try std.testing.expectEqualStrings("ax€", e.text());
+    try e.handle(a, .backspace); // removes €  (3-byte scan)
+    try std.testing.expectEqualStrings("ax", e.text());
+}
+
 test "PickEditor wraps at both ends and ignores other keys" {
     var p = PickEditor{ .len = 4, .index = 0 };
     p.handle(.up);
