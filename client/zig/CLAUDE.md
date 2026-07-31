@@ -86,14 +86,32 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   a hand-rolled `ymdToEpochDay` (std has no date parser; see `plans/todo.md`). `flag_specs` +
   `patchFromArgs` (takes `offset_minutes`) turn `ParsedArgs` into a `Patch` (`--tags` comma-split
   here; unknown status/priority/date → `BuildError`).
+- `src/core/display.zig` — shared presentation logic, no styling: `statusGlyph`, `priorityLabel`,
+  `truncate` (codepoint-safe, never splits a UTF-8 codepoint), `formatDate(buf, unix_seconds,
+  offset_minutes)`, `handleText(buf, id, len)` (an unstyled `#<tail>`, lower-cased — the caller
+  wraps it in dim), `dueWording(buf, due_at, now, completed, offset_minutes)` (a `DueWording`
+  tagged union — `.due`/`.overdue{text, days}` — so the caller decides how to style it), and the
+  semantic `Style` enum (`normal/dim/overdue/prio_high/prio_medium/prio_low`) with
+  `priorityStyle`/`taskStyle`. Every function returns a slice (into a caller-supplied buffer where
+  one is needed, otherwise into the input) rather than writing to a stream — libvaxis wants strings
+  for cells, not a byte sink. The split is *which style* (`Style`, here) versus *how to emit it*
+  (`formatter.zig` maps it to SGR via `Sgr.style`; a future `tui/render.zig` will map the same
+  `Style` to a `vaxis.Style`) — this is what stops the CLI and the TUI drifting on what a task looks
+  like. `priorityStyle` and `taskStyle` differ only in whether a done/cancelled status forces
+  `.dim`: the compact-view root line uses `priorityStyle` (no dimming) while the detailed-view root
+  line uses `taskStyle` (dims) — a deliberate asymmetry locked by a formatter test.
+
+  `Style` covers only what **both** renderers need. TUI-only concerns — cursor-row highlight,
+  focused-field highlight, a `saving…` marker — are shell-local `vaxis.Style`s and must **not** be
+  added here.
 - `src/formatter.zig` — `RenderOptions` (one struct, `compact()`/`detailed()` constructors, a
   `layout` mode) + one `render`. **Compact** = one line/task (`<glyph> title #handle`, `├─`/`└─`
   children). **Detailed** = git-log-style multi-line blocks (header, dim meta line `priority · due/⚠
-  OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Plus `renderJson`,
-  codepoint-safe `truncateTitle`, 16-color SGR helpers, status glyphs, `formatDate` (YYYY-MM-DD,
-  shifted by `RenderOptions.offset_minutes` before splitting into Y/M/D — rendering is local, same
-  as parsing), a tail-based `writeHandle`. Immediate children only (depth 1); `[missing: #tail]`
-  for dangling ids.
+  OVERDUE · sched · #tags · N subtasks`, body, `│` gutter rail for children). Owns layout and SGR
+  emission only: `renderJson`, the 16-color `Sgr` helper (`Sgr.style` maps a `core/display.zig`
+  `Style` to an escape code), a tail-based `writeHandle` (wraps `display.handleText`). Glyphs,
+  labels, truncation, and date/due-wording formatting live in `core/display.zig`, not here.
+  Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
   `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
   `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`
