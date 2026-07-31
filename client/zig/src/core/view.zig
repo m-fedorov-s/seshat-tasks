@@ -154,6 +154,29 @@ test "subtree matching terminates on a cycle below a real root" {
     try std.testing.expectEqualStrings("r", sel[0].id);
 }
 
+test "subtree matching terminates on a cycle with no match anywhere" {
+    // Unlike the cycle test above, nothing here matches the filter, so
+    // subtreeMatches cannot short-circuit on a self-match — it is forced to
+    // walk the full cycle (including the x<->y back-edge) and the cycle guard
+    // is the only thing that stops it from recursing forever.
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "r", .content = .{ .title = "r", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "x", .content = .{ .title = "x", .status = .todo }, .meta = .{ .created_at = 2 } },
+        .{ .id = "y", .content = .{ .title = "y", .status = .todo }, .meta = .{ .created_at = 3 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"x"});
+    tasks[1].content.child_ids = @constCast(&[_][]const u8{"y"});
+    tasks[2].content.child_ids = @constCast(&[_][]const u8{"x"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    // Terminates without a match anywhere in the cycle.
+    try std.testing.expectEqual(@as(usize, 0), sel.len);
+}
+
 fn hasAllTags(t: Task, tags: []const []const u8) bool {
     for (tags) |want| {
         var found = false;
