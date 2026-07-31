@@ -513,9 +513,40 @@ fn jumpToEdge(m: *Model, first: bool) !void {
     try recompute(m);
 }
 
+// The first `.task` row AT OR PAST `start`, scanning strictly in `dir`. Unlike
+// `nearestTaskRow` (which picks whichever direction is closer — exactly wrong
+// here, since it can resolve back to the row the cursor is already on and
+// stall a page key forever) this only ever looks the way the key is pointing.
+// Falls back to the last/first `.task` row in the whole list when `dir` runs
+// off the end without finding one — mirroring where `g`/`G` would land.
+fn scanTaskRow(rows: []const ledger.Row, start: usize, dir: Dir) ?usize {
+    switch (dir) {
+        .next => {
+            var i = start;
+            while (i < rows.len) : (i += 1) {
+                if (rows[i].kind == .task) return i;
+            }
+            return nearestTaskRow(rows, rows.len -| 1);
+        },
+        .prev => {
+            var i = start;
+            while (true) {
+                if (rows[i].kind == .task) return i;
+                if (i == 0) break;
+                i -= 1;
+            }
+            return nearestTaskRow(rows, 0);
+        },
+    }
+}
+
 // Ctrl-D/Ctrl-U: move by half a ledger page (spec §11), clamped at both ends,
-// then settle on the nearest selectable row — the raw arithmetic target can land
-// on a `.missing` row or the `.unreachable_header`.
+// then settle on the nearest selectable row IN THE DIRECTION OF TRAVEL — the
+// raw arithmetic target can land inside a `.missing` run or the
+// `.unreachable_header`, and picking the globally-nearest task row (as
+// `nearestTaskRow` does) can resolve back to the row the cursor started on,
+// stalling the key forever when a long non-task run sits about half a page
+// ahead/behind.
 fn pageBy(m: *Model, dir: Dir) !void {
     const cur = m.cursorIndex() orelse return;
     const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules, matching recompute
@@ -524,7 +555,7 @@ fn pageBy(m: *Model, dir: Dir) !void {
         .next => @min(cur + half, m.rows.len -| 1),
         .prev => cur -| half,
     };
-    const i = nearestTaskRow(m.rows, target) orelse return;
+    const i = scanTaskRow(m.rows, target, dir) orelse return;
     // INTERNED: see moveCursor.
     m.cursor_id = try m.internId(m.rows[i].id);
     try recompute(m);
@@ -1244,7 +1275,14 @@ test "G jumps to the last row, g to the first" {
     try std.testing.expectEqual(@as(usize, 0), h.m.scroll_top);
 }
 
-test "Ctrl-D and Ctrl-U move by half a page and clamp at the ends" {
+// Ledger for this setup (viewport rows=20 -> ledger_rows = 20-3 = 17, pane
+// closed so nothing eats into it) is all plain `.task` rows, so half a page is
+// halfPage(17) = 8. The exact scroll_top values below are ensureVisible's
+// arithmetic worked through by hand: they pin `pageBy`'s own `recompute` call,
+// which nothing else in this test would trigger — cursorIndex() alone is
+// derived straight from cursor_id and would keep passing even if that call
+// were deleted (scroll_top would just stay frozen at its previous value).
+test "Ctrl-D and Ctrl-U move by half a page, clamp at the ends, and drag the viewport along" {
     const a = std.testing.allocator;
     var buf: [40]Task = undefined;
     var ids: [40][4]u8 = undefined;
@@ -1258,10 +1296,57 @@ test "Ctrl-D and Ctrl-U move by half a page and clamp at the ends" {
     try std.testing.expect(h.m.cursorIndex().? > before);
     for (0..20) |_| try h.key(.ctrl_d);
     try std.testing.expectEqual(h.m.rows.len - 1, h.m.cursorIndex().?);
+    try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top); // 39 + 1 - 17
     for (0..20) |_| try h.key(.ctrl_u);
     try std.testing.expectEqual(@as(usize, 0), h.m.cursorIndex().?);
+    try std.testing.expectEqual(@as(usize, 0), h.m.scroll_top);
 }
 
+// Defect: `pageBy` used to route its half-page target through `nearestTaskRow`,
+// which picks whichever direction is CLOSER — including back the way the
+// cursor came. With a long `.missing` run sitting about half a page ahead of
+// the cursor, the target lands inside the run and the nearest `.task` row to
+// it is the very row the cursor is already on: Ctrl-D would never move.
+// `scanTaskRow` fixes this by only ever looking in the direction of travel.
+test "Ctrl-D and Ctrl-U scan past a long run of missing rows instead of stalling" {
+    const a = std.testing.allocator;
+    var kid_bufs: [20][4]u8 = undefined;
+    var kid_ids: [20][]const u8 = undefined;
+    for (&kid_bufs, &kid_ids, 0..) |*buf, *slice, i| {
+        _ = std.fmt.bufPrint(buf, "g{d:0>3}", .{i}) catch unreachable;
+        slice.* = buf;
+    }
+    var tasks = [_]Task{
+        t("a", .low, .todo, null, &.{}),
+        t("b", .low, .todo, null, &kid_ids), // 20 dangling children -> 20 .missing rows once expanded
+        t("c", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 23 } }); // ledger_rows = 20, half = 10
+
+    try h.key(.{ .char = 'j' }); // -> "b"
+    try std.testing.expectEqualStrings("b", h.m.cursor_id.?);
+    try h.key(.{ .char = 'l' }); // expand -> rows: a, b, 20x missing, c (23 rows)
+    try std.testing.expectEqual(@as(usize, 23), h.m.rows.len);
+    for (h.m.rows[2..22]) |r| try std.testing.expectEqual(ledger.RowKind.missing, r.kind);
+
+    // Target = 1 + 10 = 11, inside the missing run. The nearest task row to 11
+    // is "b" itself (distance 10 vs. 11 to "c") — the stall the old code hit.
+    try h.key(.ctrl_d);
+    try std.testing.expectEqualStrings("c", h.m.cursor_id.?);
+
+    try h.key(.ctrl_u);
+    try std.testing.expectEqualStrings("b", h.m.cursor_id.?);
+}
+
+// The Tab-open scroll_top is asserted right after the Tab press with no
+// intervening key that itself recomputes — `G` runs first to position the
+// cursor and stamp `cursor_anchor`, but its own recompute happens BEFORE the
+// pane opens, so it cannot mask Tab's. Deleting Tab's `recompute` call would
+// leave scroll_top frozen at G's value (23) instead of following the layout
+// change to 29, then frozen at 29 instead of settling back to 23 on close.
 test "Tab toggles the detail pane and re-clamps the viewport" {
     const a = std.testing.allocator;
     var buf: [40]Task = undefined;
@@ -1269,17 +1354,22 @@ test "Tab toggles the detail pane and re-clamps the viewport" {
     var h: TestHarness = undefined;
     try h.setup(a, manyTasks(&buf, &ids));
     defer h.deinit();
-    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } });
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } }); // ledger_rows = 17 closed, 11 open
+
+    try h.key(.{ .char = 'G' }); // cursor -> last row, scroll_top = 39+1-17 = 23
+    try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top);
 
     try std.testing.expect(!h.m.pane_open);
     try h.key(.tab);
     try std.testing.expect(h.m.pane_open);
-    try h.key(.{ .char = 'G' });
-    const with_pane = h.m.scroll_top;
+    // Layout shrinks to 11 ledger rows; ensureVisible(39, 40, 11, 23) = 39+1-11 = 29.
+    try std.testing.expectEqual(@as(usize, 29), h.m.scroll_top);
+
     try h.key(.tab);
     try std.testing.expect(!h.m.pane_open);
-    // A taller ledger means less scrolling is needed to show the last row.
-    try std.testing.expect(h.m.scroll_top <= with_pane);
+    // Layout grows back to 17; ensureVisible(39, 40, 17, 29) clamps top to
+    // max_top = 40-17 = 23 before the cursor check, landing back at 23.
+    try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top);
 }
 
 test "the viewport keys are inert while a field is focused" {
