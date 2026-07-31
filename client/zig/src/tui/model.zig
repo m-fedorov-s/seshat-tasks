@@ -334,3 +334,55 @@ test "setStatus replaces the previous message without leaking" {
     try m.setStatus("count {d}", .{7});
     try std.testing.expectEqualStrings("count 7", m.status());
 }
+
+// A real session can quit mid-edit — Esc is not guaranteed to have been pressed
+// before the loop exits, and a commit can still be in flight. An editor buffer is
+// gpa-allocated and hides inside a union that nothing else in `deinit` inspects,
+// so this is the likeliest leak in the struct. Both slots are loaded at once
+// because `.commit` deliberately retains the editor a conflict would restore.
+test "deinit frees editor buffers left live in mode and in_flight" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+
+    m.mode = .{ .editing = .{
+        .field = .title,
+        .editor = .{ .line = try editors.LineEditor.init(a, "a heap-allocated draft title") },
+    } };
+    m.in_flight = .{ .commit = .{
+        .id = try m.internId("aaa"),
+        .field = .description,
+        .editor = .{ .line = try editors.LineEditor.init(a, "a heap-allocated in-flight body") },
+    } };
+
+    // No clearMode/clearInFlight: deinit alone must reclaim both buffers, or
+    // std.testing.allocator fails this test as a leak.
+    m.deinit();
+}
+
+test "clearMode and clearInFlight free the editor and reset the slot" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+
+    m.mode = .{ .filter = try editors.LineEditor.init(a, "a heap-allocated filter expression") };
+    m.clearMode();
+    try std.testing.expect(m.mode == .list);
+
+    m.in_flight = .{ .commit = .{
+        .field = .title,
+        .id = try m.internId("aaa"),
+        .editor = .{ .line = try editors.LineEditor.init(a, "a heap-allocated pending edit") },
+    } };
+    m.clearInFlight();
+    try std.testing.expect(m.in_flight == .none);
+
+    // Clearing twice must not double-free: Editor.deinit retags to `.external`.
+    m.clearMode();
+    m.clearInFlight();
+
+    // A second editor installed after a clear is still owned and still freed by
+    // deinit — the retag must not have made the slot un-ownable.
+    m.mode = .{ .add = try editors.LineEditor.init(a, "a heap-allocated new-task title") };
+}
