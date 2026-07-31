@@ -270,6 +270,28 @@ fn emit(
     }
 }
 
+pub const Layout = struct { ledger_rows: usize, pane_rows: usize };
+
+pub fn ensureVisible(cursor_index: usize, row_count: usize, height: usize, scroll_top: usize) usize {
+    if (height == 0) return scroll_top;
+    // Clamp first: a filter or a collapse can leave scroll_top past the end.
+    const max_top = if (row_count > height) row_count - height else 0;
+    var top = @min(scroll_top, max_top);
+    if (cursor_index < top) top = cursor_index;
+    if (cursor_index >= top + height) top = cursor_index + 1 - height;
+    return top;
+}
+
+pub fn halfPage(height: usize) usize {
+    return @max(1, height / 2);
+}
+
+pub fn layoutFor(total_rows: usize, pane_open: bool) Layout {
+    if (!pane_open or total_rows < 8) return .{ .ledger_rows = total_rows, .pane_rows = 0 };
+    const pane = @max(6, total_rows / 3);
+    return .{ .ledger_rows = total_rows - pane, .pane_rows = pane };
+}
+
 const DAY: i64 = 86400;
 const NOW: i64 = 100 * DAY;
 
@@ -613,4 +635,45 @@ test "buildRows: a filtered-out root's subtree is not swept into the unreachable
     try std.testing.expect(!seen_ids.contains("other_kid")); // its subtree: not orphaned either
     try std.testing.expect(seen_ids.contains("orphan_a")); // genuine orphan that matches the filter
     try std.testing.expect(!seen_ids.contains("orphan_b")); // genuine orphan that does NOT match
+}
+
+test "ensureVisible keeps the cursor inside the window" {
+    try std.testing.expectEqual(@as(usize, 0), ensureVisible(3, 50, 10, 0));
+    try std.testing.expectEqual(@as(usize, 1), ensureVisible(10, 50, 10, 0));
+    try std.testing.expectEqual(@as(usize, 6), ensureVisible(15, 50, 10, 0));
+    try std.testing.expectEqual(@as(usize, 2), ensureVisible(2, 50, 10, 7));
+}
+
+test "ensureVisible clamps when the row list shrinks under the scroll offset" {
+    // 3 rows left, window of 10, but scroll_top is still 40 from a bigger list.
+    try std.testing.expectEqual(@as(usize, 0), ensureVisible(0, 3, 10, 40));
+    // 20 rows, window of 5, cursor at the end: last full page.
+    try std.testing.expectEqual(@as(usize, 15), ensureVisible(19, 20, 5, 40));
+}
+
+test "ensureVisible is a no-op for a zero-height window" {
+    try std.testing.expectEqual(@as(usize, 5), ensureVisible(9, 50, 0, 5));
+}
+
+test "halfPage is at least one line" {
+    try std.testing.expectEqual(@as(usize, 5), halfPage(10));
+    try std.testing.expectEqual(@as(usize, 1), halfPage(1));
+    try std.testing.expectEqual(@as(usize, 1), halfPage(0));
+}
+
+test "layoutFor gives the pane a third of the screen, and nothing when closed" {
+    const closed = layoutFor(40, false);
+    try std.testing.expectEqual(@as(usize, 40), closed.ledger_rows);
+    try std.testing.expectEqual(@as(usize, 0), closed.pane_rows);
+
+    const open = layoutFor(40, true);
+    try std.testing.expectEqual(@as(usize, 40), open.ledger_rows + open.pane_rows);
+    try std.testing.expect(open.pane_rows >= 6);
+    try std.testing.expect(open.ledger_rows > open.pane_rows);
+}
+
+test "layoutFor degrades gracefully on a tiny terminal" {
+    const tiny = layoutFor(4, true);
+    try std.testing.expectEqual(@as(usize, 4), tiny.ledger_rows + tiny.pane_rows);
+    try std.testing.expect(tiny.ledger_rows >= 1);
 }
