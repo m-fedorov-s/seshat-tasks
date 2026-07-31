@@ -390,7 +390,10 @@ pub fn update(allocator: std.mem.Allocator, m: *Model, ev: Event) !Command {
     return switch (m.mode) {
         .list => listMode(m, ev),
         .field => |f| fieldMode(allocator, m, f, ev),
-        .editing => |e| editingMode(m, e.field, ev),
+        // BY POINTER, not by value: `Editor` transitively owns a heap ArrayList,
+        // so a by-value capture would hand task 13 a copy to mutate — leaking the
+        // reallocation and leaving `m.mode`'s buffer stale.
+        .editing => |*e| editingMode(m, e.field, ev),
         // Later tasks own these modes' key maps; until then they see only the
         // events that mean the same thing everywhere.
         .filter, .add, .confirm_delete => sharedEvent(m, ev),
@@ -436,6 +439,10 @@ fn listMode(m: *Model, ev: Event) !Command {
         .right => try setFold(m, true),
         .left => try setFold(m, false),
         .enter => {
+            // Nothing selected — there is no task to descend INTO. Without this
+            // guard the pane opens onto a phantom, and the commit path in a later
+            // task would have no id to write back against.
+            if (m.cursor_id == null) return .none;
             m.pane_open = true; // descending always shows the task being edited
             m.mode = .{ .field = .title };
             // The pane takes rows away from the ledger, so the scroll offset the
@@ -1129,4 +1136,44 @@ test "resize updates the viewport and re-clamps the scroll offset" {
     try h.send(.{ .resize = .{ .cols = 100, .rows = 40 } });
     try std.testing.expectEqual(@as(u16, 40), h.m.viewport.rows);
     try std.testing.expect(h.m.scroll_top < @max(1, h.m.rows.len));
+}
+
+// The `.task`-kind skip in `moveCursor` is double-masked: `recompute` self-heals
+// a cursor interned from a non-selectable row (it fails `cursorIndex`, gets
+// nulled, and `nearestTaskRow` puts it back), so removing the check leaves every
+// other test green. It only becomes observable across a run of TWO OR MORE
+// consecutive non-`.task` rows, where the self-heal walks the cursor back to
+// where it started and `j` silently does nothing. Two dangling children give
+// exactly that shape.
+test "j jumps over a run of .missing rows to the next task" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("aroot", .low, .todo, null, &.{ "ghost1", "ghost2" }),
+        t("zlater", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'l' }); // expand -> two .missing rows appear
+    try std.testing.expectEqual(@as(usize, 4), h.m.rows.len);
+    try std.testing.expectEqual(ledger.RowKind.missing, h.m.rows[1].kind);
+    try std.testing.expectEqual(ledger.RowKind.missing, h.m.rows[2].kind);
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("zlater", h.m.cursor_id.?);
+    try h.key(.{ .char = 'k' });
+    try std.testing.expectEqualStrings("aroot", h.m.cursor_id.?);
+}
+
+// Descending needs a task to descend INTO. Without the guard this opens the pane
+// on a phantom and leaves `.field` mode with no id for a later commit to target.
+test "enter on an empty list does not descend into a phantom task" {
+    const a = std.testing.allocator;
+    var h: TestHarness = undefined;
+    try h.setup(a, &.{});
+    defer h.deinit();
+    try std.testing.expect(h.m.cursor_id == null);
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(!h.m.pane_open);
+    try std.testing.expect(h.last == .none);
 }
