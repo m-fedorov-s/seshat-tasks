@@ -174,3 +174,108 @@ These are the 0.16 patterns this codebase relies on. The new I/O model threads a
   (`.month.numeric()`, `.day_index + 1`).
 - **UTF-8:** `std.unicode.utf8ByteSequenceLength(lead_byte)` (`!u3`) to walk codepoints without
   splitting them; `std.unicode.utf8ValidateSlice`.
+
+### libvaxis 0.6.0 (learned from `src/spike.zig`, `zig build spike`)
+
+Added as the `vaxis` dependency in `build.zig.zon`, pinned to a commit sha (not a tag — see below).
+Imported as `@import("vaxis")` from `src/main.zig`, `src/spike.zig`, and the unit-test root, wired
+in `build.zig` via `b.dependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug })` then
+`.root_module.addImport("vaxis", vaxis_dep.module("vaxis"))`. Pulls in `zigimg` (non-lazy) and
+`uucode` (lazy) transitively — three packages total, matching upstream's own `build.zig.zon`.
+
+**Pinning note:** upstream `rockorager/libvaxis` has no `v0.6.0` git tag (`git ls-remote --tags`
+tops out at `v0.5.1`), but `main`'s current HEAD already declares `.version = "0.6.0"` in its own
+`build.zig.zon` with exactly the expected non-lazy-zigimg/lazy-uucode shape. `build.zig.zon` here
+pins to that HEAD commit sha directly (an immutable sha, not a moving branch ref) rather than a
+tag. If upstream later tags `v0.6.0` on a different commit, or moves `main` past this state, re-fetch
+and re-verify against the notes below before trusting them.
+
+The 0.16 `std.Io`-threaded model applies throughout — same pattern as the rest of this codebase.
+
+- **`Tty`:** platform-selected type (`vaxis.Tty` = `PosixTty` on Linux). `Tty.init(io: std.Io,
+  buffer: []u8) !Tty` opens `/dev/tty` and puts it in raw mode (fails with `error.NoDevice` if
+  there's no controlling terminal — expected in a sandboxed/CI shell, not a compile error).
+  `tty.deinit()` (value receiver) restores the original termios. `tty.writer()` takes a `*Tty`
+  receiver and returns `*std.Io.Writer` — every `Vaxis` write call (`enterAltScreen`, `render`,
+  `resize`, `deinit`) takes that same `*std.Io.Writer`, not the `Tty` itself. `tty` must therefore
+  be declared `var`, not `const`.
+- **`vaxis.init`:** `vaxis.init(io: std.Io, alloc: std.mem.Allocator, env_map: *std.process.Environ.Map,
+  opts: Vaxis.Options) !Vaxis`. `init.environ_map` from `std.process.Init` is already `*Environ.Map`
+  so it passes straight through unchanged. `alloc` must be a real `std.mem.Allocator` —
+  `init.arena` in `std.process.Init` is a `*std.heap.ArenaAllocator`, **not** an `Allocator`; pass
+  `init.arena.allocator()` (same pattern `main.zig` already uses). `Vaxis.Options{}` (empty) is
+  fine for a plain TUI; its only field today is an optional `system_clipboard_allocator`.
+- **`vx.deinit`:** `deinit(self: *Vaxis, alloc: ?std.mem.Allocator, tty: *std.Io.Writer) void` —
+  resets terminal state (exits alt screen, shows cursor, etc.) and, if `alloc` is non-null, frees
+  Vaxis-owned buffers. Pass the same `tty.writer()` used elsewhere.
+- **`Loop` construction:** `Loop(T)` is *not* built as a plain struct literal — it has a required
+  `init` function because one field (`queue: Queue(T, 512)`) itself needs initializing:
+  `var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);` (positional: `io`, `*Tty`, `*Vaxis`). The
+  brief's struct-literal form (`.{ .io = io, .tty = &tty, .vaxis = &vx }`) compiles-by-accident
+  only if `queue`'s default is legal, which it isn't (no default) — use `.init(...)`.
+  - `loop.start() !void` spawns a background thread (`io.concurrent`) that reads the tty and posts
+    parsed events into the internal queue. On a non-Windows posix tty it also immediately posts one
+    synthetic `.winsize` event with the current size before entering its read loop — so the very
+    first `nextEvent()` after `start()` is reliably a winsize, useful for sizing the screen before
+    the first render.
+  - `loop.installResizeHandler() !void` / `loop.uninstallResizeHandler()` separately register/remove
+    a SIGWINCH handler so *later* terminal resizes also produce `.winsize` events (not automatic
+    from `start()` alone; call it once after `start()`).
+  - `loop.stop() void` sets a quit flag, nudges the tty with a bogus write to unblock the read, and
+    joins the background thread. No error return — safe to call from a `defer`.
+  - `loop.nextEvent() !T` blocks until an event is available (note: `!T`, must be `try`'d — the
+    brief's example omitted the `try`). `loop.postEvent(event: T) !void` pushes synthetically
+    (blocks if the 512-deep queue is full); `loop.tryPostEvent` is the non-blocking form.
+  - The `Event` union you pass as `T` only needs the variants you care about — `Loop` uses
+    `@hasField(Event, "key_press")` etc. internally and silently drops event kinds your union
+    doesn't declare a field for.
+- **`Window.printSegment(segment: Segment, opts: PrintOptions) PrintResult`:** exact match for the
+  brief's guess — a one-`Segment` shortcut for `print(&.{segment}, opts)`. `Segment = struct { text:
+  []const u8, style: Style = .{}, link: Hyperlink = .{} }`. `PrintOptions` has `row_offset`/
+  `col_offset` (both default 0), `wrap: enum { grapheme, word, none } = .grapheme`, and `commit:
+  bool = true` (set false to measure without drawing). Returns `PrintResult{ col, row, overflow:
+  bool }` — non-void, so a bare call needs `_ = win.printSegment(...)`.
+- **`Window.child(opts: ChildOptions) Window`:** field names are `x_off: i17 = 0`, `y_off: i17 = 0`,
+  `width: ?u16 = null` (null = "fill remaining", not a magic sentinel — confirms the v0.5.0
+  changelog's stated breaking change already landed), `height: ?u16 = null`, and `border:
+  BorderOptions = .{}` (itself `{ style: Cell.Style = .{}, where: union(enum) { none, all, top,
+  right, bottom, left, other: Locations } = .none, glyphs: ... = .single_rounded }`) for an
+  optional inline border drawn as part of the child.
+- **`Window.clear()`:** `self.fill(.{ .default = true })` — fills the window with default (blank,
+  unstyled) cells.
+- **`win.width` / `win.height`:** plain `u16` fields directly on `Window` (not methods).
+- **`vx.enterAltScreen(tty: *std.Io.Writer) !void` / `vx.exitAltScreen(tty) !void`:** write the
+  `smcup`/`rmcup` control sequences and flush; set/clear `vx.state.alt_screen`. `deinit` already
+  calls the alt-screen-exit + full terminal reset via `resetState`, so an explicit `exitAltScreen`
+  before `deinit` is optional (belt-and-suspenders) but not required.
+- **`vx.resize(alloc, tty: *std.Io.Writer, winsize: Winsize) !void`:** (re)allocates the internal
+  screen buffers to the new size and issues a hardware clear. **Must be called at least once
+  before the first `vx.render`** — `Vaxis.init` starts with a zero-size screen
+  (`screen = .{}`), and `render` asserts `screen.buf.len == width*height`. In practice the loop's
+  automatic first `.winsize` event (see above) makes this happen naturally if the event loop drives
+  `resize` before the first `window()`/`render()` call.
+- **`vx.render(tty: *std.Io.Writer) !void`:** diffs the current screen against the last-rendered
+  one and writes only the changed cells + escape codes, then flushes.
+- **`vx.window() Window`:** returns a `Window` spanning the whole current screen
+  (`x_off/y_off = 0`, `width/height = screen.width/height`).
+- **`vaxis.Key` shape:** `{ codepoint: u21, text: ?[]const u8 = null, shifted_codepoint: ?u21 =
+  null, base_layout_codepoint: ?u21 = null, mods: Modifiers = .{} }`. `Modifiers` is a packed
+  struct: `shift, alt, ctrl, super, hyper, meta, caps_lock, num_lock: bool`. Named key constants
+  are plain `u21` values on the `Key` (i.e. `vaxis.Key`) namespace — `vaxis.Key.enter` (`0x0D`),
+  `.tab`, `.escape`, `.space`, `.backspace`, plus a large block of Kitty-protocol-encoded values in
+  the Unicode private-use area for `.up/.down/.left/.right/.home/.end/.page_up/.page_down/.insert/
+  .delete/.f1`–`.f35`/keypad keys/modifier keys — there is no `vaxis.Key.up` as an enum tag, they're
+  all `u21` constants compared via `matches`, not switched on directly.
+  `key.matches(cp: u21, mods: Modifiers) bool` — the brief's `k.matches('q', .{})` compiles as-is
+  (ordinary chars are just their ASCII/Unicode codepoint). It does a 3-way loose match: exact
+  codepoint+mods (ignoring caps/num lock), the key's generated `text` against the UTF-8 encoding of
+  `cp` (ignoring shift/caps/num lock — handles e.g. shifted symbol keys), and `shifted_codepoint`
+  match with shift removed. `matchesAny(cps, mods)` checks a slice; `isModifier()` reports whether
+  the key itself *is* a bare modifier press.
+- **`vaxis.Style` shape:** `{ fg: Color = .default, bg: Color = .default, ul: Color = .default,
+  ul_style: Underline = .off, bold: bool = false, dim: bool = false, italic: bool = false, blink:
+  bool = false, reverse: bool = false, invisible: bool = false, strikethrough: bool = false }`.
+  `Color = union(enum) { default, index: u8, rgb: [3]u8 }` — a 16/256-color index is
+  `.{ .fg = .{ .index = 1 } }` (as the brief guessed), true color is `.{ .fg = .{ .rgb = .{ r, g, b
+  } } }`. `dim` and `bold` both exist as independent `bool` flags directly on `Style` (not part of
+  `Color`) — relevant for Task 17's `core/display.Style` → `vaxis.Style` mapping.
