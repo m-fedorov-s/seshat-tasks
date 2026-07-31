@@ -210,15 +210,9 @@ fn isCompleted(t: Task) bool {
 
 const RankCtx = struct { strategy: Strategy, now: i64 };
 
-// true if a should sort before b.
-fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
-    // 1. completed always sinks
-    const ca = isCompleted(a);
-    const cb = isCompleted(b);
-    if (ca != cb) return !ca; // non-completed (false) comes first
-
-    // 2. strategy key
-    const key: ?bool = switch (ctx.strategy) {
+// Returns null when a and b are equal on the strategy key.
+fn strategyDiffers(ctx: RankCtx, a: Task, b: Task) ?bool {
+    return switch (ctx.strategy) {
         .priority => blk: {
             const pa = priorityWeight(a.content.priority);
             const pb = priorityWeight(b.content.priority);
@@ -252,7 +246,17 @@ fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
             break :blk null;
         },
     };
-    if (key) |k| return k;
+}
+
+// true if a should sort before b.
+fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
+    // 1. completed always sinks
+    const ca = isCompleted(a);
+    const cb = isCompleted(b);
+    if (ca != cb) return !ca; // non-completed (false) comes first
+
+    // 2. strategy key
+    if (strategyDiffers(ctx, a, b)) |ord| return ord;
 
     // stable tiebreak: oldest first, then id ascending (ids are unique -> total order)
     if (a.meta.created_at != b.meta.created_at) return a.meta.created_at < b.meta.created_at;
@@ -263,6 +267,35 @@ pub fn rank(tasks: []Task, strategy: Strategy, now: i64) void {
     // lessThan is a strict total order (the created_at,id tiebreak resolves all
     // ties), so stability is irrelevant; use the faster unstable sort.
     std.mem.sortUnstable(Task, tasks, RankCtx{ .strategy = strategy, .now = now }, lessThan);
+}
+
+const Ranked = struct { t: Task, score: i64, complete: bool };
+
+fn rankedLessThan(ctx: RankCtx, a: Ranked, b: Ranked) bool {
+    if (a.complete != b.complete) return !a.complete;
+    switch (ctx.strategy) {
+        .urgency => if (a.score != b.score) return a.score > b.score,
+        else => if (strategyDiffers(ctx, a.t, b.t)) |ord| return ord,
+    }
+    if (a.t.meta.created_at != b.t.meta.created_at) return a.t.meta.created_at < b.t.meta.created_at;
+    return std.mem.order(u8, a.t.id, b.t.id) == .lt;
+}
+
+// tasks.len == scores.len == all_complete.len. Sorts `tasks` in place.
+pub fn rankByScore(
+    allocator: std.mem.Allocator,
+    tasks: []Task,
+    scores: []const i64,
+    all_complete: []const bool,
+    strategy: Strategy,
+    now: i64,
+) !void {
+    std.debug.assert(tasks.len == scores.len and tasks.len == all_complete.len);
+    const pairs = try allocator.alloc(Ranked, tasks.len);
+    defer allocator.free(pairs);
+    for (tasks, scores, all_complete, 0..) |task_, s, c, i| pairs[i] = .{ .t = task_, .score = s, .complete = c };
+    std.mem.sortUnstable(Ranked, pairs, RankCtx{ .strategy = strategy, .now = now }, rankedLessThan);
+    for (pairs, 0..) |p, i| tasks[i] = p.t;
 }
 
 test "rank: due strategy sorts soonest first and sinks undated" {
@@ -276,6 +309,64 @@ test "rank: due strategy sorts soonest first and sinks undated" {
     try std.testing.expectEqualStrings("soon", tasks[0].id);
     try std.testing.expectEqualStrings("late", tasks[1].id);
     try std.testing.expectEqualStrings("undated", tasks[2].id);
+}
+
+test "rankByScore orders by the injected score, not the task's own urgency" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        // created_at ordering is DELIBERATELY opposite the score ordering, so a
+        // stub that ignores `scores` and falls through to the tiebreak fails.
+        .{ .id = "a", .content = .{ .title = "a" }, .meta = .{ .created_at = 9 } },
+        .{ .id = "b", .content = .{ .title = "b" }, .meta = .{ .created_at = 1 } },
+    };
+    const scores = [_]i64{ 20, 5 };
+    const complete = [_]bool{ false, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("a", tasks[0].id);
+}
+
+test "rankByScore sinks on all_complete, not on the task's own status" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        .{ .id = "donep", .content = .{ .title = "done parent", .status = .done }, .meta = .{ .created_at = 1 } },
+        .{ .id = "live", .content = .{ .title = "live", .priority = .low }, .meta = .{ .created_at = 2 } },
+    };
+    // The done parent has a live overdue child, so its subtree is NOT complete.
+    const scores = [_]i64{ 13, 1 };
+    const complete = [_]bool{ false, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("donep", tasks[0].id);
+}
+
+test "rankByScore sinks a fully-complete subtree whose own status is live" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        // NOT .done — so a stub using the existing own-status sink fails here.
+        .{ .id = "allDone", .content = .{ .title = "all done", .priority = .high }, .meta = .{ .created_at = 1 } },
+        .{ .id = "live", .content = .{ .title = "live", .priority = .low }, .meta = .{ .created_at = 2 } },
+    };
+    const scores = [_]i64{ 5, 1 };
+    const complete = [_]bool{ true, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("live", tasks[0].id);
+}
+
+test "rank still behaves exactly as before" {
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        .{ .id = "z", .content = .{ .title = "z", .priority = .low }, .meta = .{ .created_at = 1 } },
+        .{ .id = "d", .content = .{ .title = "d", .priority = .high, .status = .done }, .meta = .{ .created_at = 2 } },
+        .{ .id = "h1", .content = .{ .title = "h1", .priority = .high }, .meta = .{ .created_at = 5 } },
+        .{ .id = "h2", .content = .{ .title = "h2", .priority = .high }, .meta = .{ .created_at = 3 } },
+    };
+    rank(&tasks, .priority, now);
+    try std.testing.expectEqualStrings("h2", tasks[0].id);
+    try std.testing.expectEqualStrings("h1", tasks[1].id);
+    try std.testing.expectEqualStrings("z", tasks[2].id);
+    try std.testing.expectEqualStrings("d", tasks[3].id);
 }
 
 pub const ResolveError = error{ NoSuchId, AmbiguousId };
