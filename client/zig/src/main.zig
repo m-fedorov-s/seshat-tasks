@@ -8,6 +8,7 @@ const formatter = @import("formatter.zig");
 const view = @import("core/view.zig");
 const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
+const filterspec = @import("core/filterspec.zig");
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -137,42 +138,31 @@ fn runShow(
     defer idx.deinit();
 
     // --- build Filters ---
+    // filterspec.parse only knows about `--filter` expressions; `--open` (seeds the
+    // status list) and `--flat` (roots_only) are merged in here, not inside the parser —
+    // see client/zig/src/core/filterspec.zig for why.
+    const fs = filterspec.parse(allocator, parsed.getMulti("filter")) catch |e| switch (e) {
+        error.BadFilter => {
+            std.debug.print("error: bad --filter expression (want tag:NAME, status:S1,S2, or overdue)\n", .{});
+            return error.Reported;
+        },
+        error.OutOfMemory => return e,
+    };
+    defer fs.deinit(allocator);
+
     var status_list = std.ArrayList(task.Status).empty;
     defer status_list.deinit(allocator);
-    var tag_list = std.ArrayList([]const u8).empty;
-    defer tag_list.deinit(allocator);
-    var overdue = false;
-
     if (parsed.getBool("open")) {
         try status_list.append(allocator, .todo);
         try status_list.append(allocator, .in_progress);
     }
-    for (parsed.getMulti("filter")) |expr| {
-        if (std.mem.startsWith(u8, expr, "tag:")) {
-            try tag_list.append(allocator, expr["tag:".len..]);
-        } else if (std.mem.startsWith(u8, expr, "status:")) {
-            var it = std.mem.splitScalar(u8, expr["status:".len..], ',');
-            while (it.next()) |s| {
-                if (std.meta.stringToEnum(task.Status, s)) |st| {
-                    try status_list.append(allocator, st);
-                } else {
-                    std.debug.print("Unknown status in filter: {s}\n", .{s});
-                    return error.Reported;
-                }
-            }
-        } else if (std.mem.eql(u8, expr, "overdue")) {
-            overdue = true;
-        } else {
-            std.debug.print("Unknown filter: {s}\n", .{expr});
-            return error.Reported;
-        }
-    }
+    try status_list.appendSlice(allocator, fs.statuses);
 
     const filters = view.Filters{
         .roots_only = !parsed.getBool("flat"),
-        .tags = tag_list.items,
+        .tags = fs.tags,
         .statuses = status_list.items,
-        .overdue = overdue,
+        .overdue = fs.overdue,
     };
 
     // --- sort strategy ---
@@ -450,5 +440,6 @@ test {
     _ = @import("formatter.zig");
     _ = @import("core/config.zig");
     _ = @import("core/edit.zig");
+    _ = @import("core/filterspec.zig");
     _ = @import("api/client.zig");
 }
