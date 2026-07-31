@@ -223,13 +223,14 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
     if (t.content.due_at) |due| {
         try beginPart(out, sgr, prefix, &started);
         var word_buf: [64]u8 = undefined;
-        switch (display.dueWording(&word_buf, due, now, isCompleted(t), offset_minutes)) {
+        const wording = display.dueWording(&word_buf, due, now, isCompleted(t), offset_minutes);
+        switch (wording) {
             .overdue => |o| {
-                try out.print("{s}{s}{s}", .{ sgr.overdue, o.text, sgr.reset });
+                try out.print("{s}{s}{s}", .{ sgr.style(display.dueStyle(wording)), o.text, sgr.reset });
                 // After the overdue token, surrounding faint was interrupted; restore it.
                 if (sgr.faint.len > 0) try out.writeAll(sgr.faint);
             },
-            .due => |s| try out.writeAll(s),
+            .due => |d| try out.writeAll(d.text),
         }
     }
 
@@ -264,7 +265,7 @@ fn writeMetaLine(out: *std.Io.Writer, sgr: Sgr, prefix: []const u8, t: Task, now
 
 
 fn isCompleted(t: Task) bool {
-    return t.content.status == .done or t.content.status == .cancelled;
+    return display.isCompleted(t.content.status);
 }
 
 test "render options constructors differ as specified" {
@@ -305,7 +306,7 @@ pub fn renderJson(out: *std.Io.Writer, tasks: []const Task) !void {
     try out.writeAll("\n");
 }
 
-test "truncateTitle never splits a UTF-8 codepoint" {
+test "display.truncate never splits a UTF-8 codepoint" {
     // "héllo" where é is 2 bytes; truncating to 3 codepoints yields exactly "hél".
     const s = "h\u{00e9}llo";
     const out = display.truncate(s, 3);

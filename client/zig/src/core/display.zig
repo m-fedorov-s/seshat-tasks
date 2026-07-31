@@ -49,7 +49,7 @@ pub fn formatDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) []const u8 
 }
 
 pub const DueWording = union(enum) {
-    due: []const u8,
+    due: struct { text: []const u8, days: i64 },
     overdue: struct { text: []const u8, days: i64 },
 };
 
@@ -62,8 +62,10 @@ pub fn dueWording(buf: []u8, due_at: i64, now: i64, completed: bool, offset_minu
         const text = std.fmt.bufPrint(buf, "⚠ OVERDUE ({d}d, due {s})", .{ days, date_str }) catch buf[0..0];
         return .{ .overdue = .{ .text = text, .days = days } };
     }
+    // Days until due (may be negative for a completed, past-due task).
+    const days = @divTrunc(due_at - now, 86400);
     const text = std.fmt.bufPrint(buf, "due {s}", .{date_str}) catch buf[0..0];
-    return .{ .due = text };
+    return .{ .due = .{ .text = text, .days = days } };
 }
 
 // "#<tail>" — the last `len` characters of `id`, lower-cased — with no styling.
@@ -95,9 +97,24 @@ pub fn priorityStyle(p: Priority) Style {
     };
 }
 
+// Whether a status counts as "finished" for dimming/sinking purposes.
+pub fn isCompleted(s: Status) bool {
+    return s == .done or s == .cancelled;
+}
+
 pub fn taskStyle(status: Status, priority: Priority) Style {
-    if (status == .done or status == .cancelled) return .dim;
+    if (isCompleted(status)) return .dim;
     return priorityStyle(priority);
+}
+
+// The style a due/overdue wording should render in. Split from `dueWording` itself
+// so a caller can compute the wording once and derive both the text and the style
+// from the same result.
+pub fn dueStyle(w: DueWording) Style {
+    return switch (w) {
+        .overdue => .overdue,
+        .due => .normal,
+    };
 }
 
 test "statusGlyph covers every status" {
@@ -121,6 +138,14 @@ test "truncate is codepoint-safe and never splits a multi-byte character" {
     const s = "é" ++ "x";
     const got = truncate(s, 1);
     try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+    try std.testing.expectEqualStrings("é", got);
+    // "héllo" where é is 2 bytes; truncating to 3 codepoints yields exactly "hél".
+    const s2 = "h\u{00e9}llo";
+    try std.testing.expectEqualStrings("h\u{00e9}l", truncate(s2, 3));
+    // fits-entirely returns the whole string
+    try std.testing.expectEqualStrings(s2, truncate(s2, 99));
+    // 0 = no budget -> full string (not blank)
+    try std.testing.expectEqualStrings(s2, truncate(s2, 0));
 }
 
 test "formatDate renders in the local offset" {
@@ -144,7 +169,16 @@ test "dueWording renders a future date plainly" {
     var buf: [64]u8 = undefined;
     const due: i64 = 1785708000;
     switch (dueWording(&buf, due, due - 86400, false, 0)) {
-        .due => |s| try std.testing.expectEqualStrings("due 2026-08-02", s),
+        .due => |d| try std.testing.expectEqualStrings("due 2026-08-02", d.text),
+        .overdue => return error.TestUnexpectedResult,
+    }
+}
+
+test "dueWording's due arm carries the days until due" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    switch (dueWording(&buf, due, due - 2 * 86400, false, 0)) {
+        .due => |d| try std.testing.expectEqual(@as(i64, 2), d.days),
         .overdue => return error.TestUnexpectedResult,
     }
 }
@@ -165,7 +199,7 @@ test "dueWording never reports a completed task as overdue" {
     var buf: [64]u8 = undefined;
     const due: i64 = 1785708000;
     switch (dueWording(&buf, due, due + 3 * 86400, true, 0)) {
-        .due => |s| try std.testing.expectEqualStrings("due 2026-08-02", s),
+        .due => |d| try std.testing.expectEqualStrings("due 2026-08-02", d.text),
         .overdue => return error.TestUnexpectedResult,
     }
 }
@@ -174,7 +208,7 @@ test "dueWording renders the date in the local offset" {
     var buf: [64]u8 = undefined;
     const due: i64 = 1785708000;
     switch (dueWording(&buf, due, due - 86400, false, 180)) {
-        .due => |s| try std.testing.expectEqualStrings("due 2026-08-03", s),
+        .due => |d| try std.testing.expectEqualStrings("due 2026-08-03", d.text),
         .overdue => return error.TestUnexpectedResult,
     }
 }
@@ -191,4 +225,18 @@ test "taskStyle dims a completed task regardless of priority" {
     try std.testing.expectEqual(Style.dim, taskStyle(.cancelled, .high));
     try std.testing.expectEqual(Style.prio_high, taskStyle(.todo, .high));
     try std.testing.expectEqual(Style.normal, taskStyle(.in_progress, .none));
+}
+
+test "isCompleted is true only for done/cancelled" {
+    try std.testing.expect(isCompleted(.done));
+    try std.testing.expect(isCompleted(.cancelled));
+    try std.testing.expect(!isCompleted(.todo));
+    try std.testing.expect(!isCompleted(.in_progress));
+}
+
+test "dueStyle maps overdue to .overdue and due to .normal" {
+    var buf: [64]u8 = undefined;
+    const due: i64 = 1785708000;
+    try std.testing.expectEqual(Style.overdue, dueStyle(dueWording(&buf, due, due + 3 * 86400, false, 0)));
+    try std.testing.expectEqual(Style.normal, dueStyle(dueWording(&buf, due, due - 86400, false, 0)));
 }
