@@ -83,6 +83,77 @@ test "select applies AND-combined filters over the top level" {
     try std.testing.expectEqualStrings("a", od[0].id);
 }
 
+test "select surfaces a root whose descendant matches the tag filter" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "untagged root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "ops kid", .status = .todo, .tags = @constCast(&[_][]const u8{"ops"}) }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("root", sel[0].id);
+}
+
+test "select surfaces a root whose descendant is overdue" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "kid", .status = .todo, .due_at = 50 }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .overdue = true }, 100);
+    defer a.free(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("root", sel[0].id);
+}
+
+test "select still drops a root with no match anywhere in its subtree" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "kid", .status = .todo }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.len);
+}
+
+test "subtree matching terminates on a cycle below a real root" {
+    const a = std.testing.allocator;
+    // `r` IS a root; x<->y is a cycle inside its subtree. Without `r` the cycle
+    // members are never roots, subtreeMatches is never called, and the test is vacuous.
+    var tasks = [_]Task{
+        .{ .id = "r", .content = .{ .title = "r", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "x", .content = .{ .title = "x", .status = .todo }, .meta = .{ .created_at = 2 } },
+        .{ .id = "y", .content = .{ .title = "y", .status = .todo, .tags = @constCast(&[_][]const u8{"ops"}) }, .meta = .{ .created_at = 3 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"x"});
+    tasks[1].content.child_ids = @constCast(&[_][]const u8{"y"});
+    tasks[2].content.child_ids = @constCast(&[_][]const u8{"x"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    // Terminates AND finds the tagged node through the cycle.
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("r", sel[0].id);
+}
+
 fn hasAllTags(t: Task, tags: []const []const u8) bool {
     for (tags) |want| {
         var found = false;
@@ -108,22 +179,54 @@ fn isOverdue(t: Task, now: i64) bool {
     return due < now;
 }
 
-fn passes(t: Task, idx: *const Index, f: Filters, now: i64) bool {
-    if (f.roots_only and !idx.isRoot(t.id)) return false;
+// The per-task filter predicate. No roots_only handling — that is select's job.
+pub fn matchesSelf(t: Task, f: Filters, now: i64) bool {
     if (f.tags.len != 0 and !hasAllTags(t, f.tags)) return false;
     if (f.statuses.len != 0 and !statusInSet(t.content.status, f.statuses)) return false;
     if (f.overdue and !isOverdue(t, now)) return false;
     return true;
 }
 
+fn subtreeMatches(
+    t: Task,
+    idx: *const Index,
+    f: Filters,
+    now: i64,
+    seen: *std.StringHashMap(void),
+) !bool {
+    if (seen.contains(t.id)) return false; // cycle guard
+    try seen.put(t.id, {});
+    if (matchesSelf(t, f, now)) return true;
+    for (t.content.child_ids) |cid| {
+        const child = idx.by_id.get(cid) orelse continue;
+        if (try subtreeMatches(child, idx, f, now, seen)) return true;
+    }
+    return false;
+}
+
 // Returns a newly-allocated slice of the tasks that pass all filters.
 // Caller owns the slice (free with allocator.free); the Task values are shallow
 // copies referencing the original (arena-backed) string data.
+//
+// When f.roots_only is set, a root is kept iff it or anything in its subtree
+// matches (so a matching descendant is never silently erased). When false
+// (the CLI's --flat path), the per-task predicate applies directly with no
+// subtree walk.
 pub fn select(allocator: std.mem.Allocator, tasks: []const Task, idx: *const Index, f: Filters, now: i64) ![]Task {
     var list: std.ArrayList(Task) = .empty;
     errdefer list.deinit(allocator);
-    for (tasks) |t| {
-        if (passes(t, idx, f, now)) try list.append(allocator, t);
+    if (f.roots_only) {
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+        for (tasks) |t| {
+            if (!idx.isRoot(t.id)) continue;
+            seen.clearRetainingCapacity();
+            if (try subtreeMatches(t, idx, f, now, &seen)) try list.append(allocator, t);
+        }
+    } else {
+        for (tasks) |t| {
+            if (matchesSelf(t, f, now)) try list.append(allocator, t);
+        }
     }
     return list.toOwnedSlice(allocator);
 }
