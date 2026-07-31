@@ -442,4 +442,5 @@ test {
     _ = @import("core/edit.zig");
     _ = @import("core/filterspec.zig");
     _ = @import("api/client.zig");
+    _ = @import("tui/ledger.zig");
 }
