@@ -9,6 +9,7 @@ const Content = taskmod.Content;
 const Priority = taskmod.Priority;
 const Status = taskmod.Status;
 const view = @import("../core/view.zig");
+const filterspec = @import("../core/filterspec.zig");
 const display = @import("../core/display.zig");
 const edit = @import("../core/edit.zig");
 const ledger = @import("ledger.zig");
@@ -102,8 +103,11 @@ pub const Model = struct {
     // than a rule someone has to remember (spec §12).
     live: *std.heap.ArenaAllocator,
     spare: *std.heap.ArenaAllocator,
-    // Interned ids: cursor, fold keys, and every id held in Mode/InFlight. Must
-    // outlive task-set swaps, so it is a THIRD arena, never reset during a session.
+    // Interned ids: cursor, fold keys, and every id held in Mode/InFlight — plus
+    // the filter expression and the tag/status slices `filters` points at, which
+    // are the same lifetime class (they outlive both the `filterspec.Parsed` they
+    // were built from and the editor buffer that Parsed borrowed). Must outlive
+    // task-set swaps, so it is a THIRD arena, never reset during a session.
     ids: *std.heap.ArenaAllocator,
 
     tasks: []Task = &.{},
@@ -410,9 +414,13 @@ pub fn update(allocator: std.mem.Allocator, m: *Model, ev: Event) !Command {
         // so a by-value capture would hand the keystroke path a copy to mutate —
         // leaking the reallocation and leaving `m.mode`'s buffer stale.
         .editing => |*e| editingMode(m, e, ev),
-        // Later tasks own these modes' key maps; until then they see only the
-        // events that mean the same thing everywhere.
-        .filter, .add, .confirm_delete => sharedEvent(m, ev),
+        // Both prompts own a heap LineEditor, so BY POINTER for the same reason
+        // `.editing` is.
+        .filter => |*le| filterMode(m, le, ev),
+        .add => |*le| addMode(m, le, ev),
+        // A copy of the id slice, not of an owner: `confirm_delete` carries only
+        // an interned id and nothing that needs writing back through `m.mode`.
+        .confirm_delete => |c| confirmDeleteMode(m, c.id, ev),
     };
 }
 
@@ -431,8 +439,44 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
             // failure still has to hand back, and an unrelated fetch must not free it.
             if (m.in_flight == .refresh) m.in_flight = .none;
             m.load_failed = false; // we have data again, whatever came before
+            // WHICH task the current mode is about, read before the swap. A
+            // background refresh must not close a prompt just because it landed:
+            // the ONLY thing that invalidates a mode is its task disappearing.
+            // Interned, so it survives `replaceTasks` and can be looked up after.
+            const anchored = modeAnchor(m);
             try m.replaceTasks(tasks);
             try recompute(m);
+            // `.filter`/`.add` anchor to nothing — they belong to the user, not to
+            // the task set — so a refresh never throws away what they hold.
+            if (anchored) |id| {
+                if (!m.idx.by_id.contains(id)) m.clearMode();
+            }
+        },
+        // The server created the task and echoed it back. A brand-new task scores
+        // urgency 0, so it ranks LAST — landing the cursor on it and opening the
+        // pane is what stops it vanishing off the bottom the instant it exists.
+        .create_ok => |created| {
+            if (m.in_flight == .create) m.clearInFlight();
+            const one = [_]Task{created};
+            try mergeTasks(m, &one);
+            m.clearMode(); // frees the add prompt's editor
+            // INTERNED: `created.id` borrows the shell's response buffer.
+            m.cursor_id = try m.internId(created.id);
+            m.pane_open = true;
+            m.mode = .{ .field = .priority };
+            try recompute(m);
+            try m.setStatus("created — set a priority, or escape to the list", .{});
+        },
+        // A delete is the one mutation whose effect is not confined to the task
+        // written: the server promotes the children, so the only honest way to
+        // learn the new shape of the forest is to ask for it.
+        .delete_ok => {
+            if (m.in_flight == .delete) {
+                m.clearInFlight();
+                m.in_flight = .refresh; // the refetch below is now the outstanding request
+            }
+            try m.setStatus("deleted", .{});
+            return .fetch;
         },
         // The server accepted the edit and echoed the authoritative task. That
         // echo is the ONLY thing that changes what the user sees — there is no
@@ -486,6 +530,19 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
     return .none;
 }
 
+// The task a mode is ABOUT, or null when it is about none. `.field`/`.editing`
+// edit the cursor's task and `.confirm_delete` names its own, so all three become
+// meaningless the moment that task stops existing; `.filter` and `.add` hold text
+// the user typed, which no refresh has any business discarding. Every id returned
+// here is interned, so the caller may hold it across a task-set swap.
+fn modeAnchor(m: *const Model) ?[]const u8 {
+    return switch (m.mode) {
+        .field, .editing => m.cursor_id,
+        .confirm_delete => |c| c.id,
+        .list, .filter, .add => null,
+    };
+}
+
 // Fold the server's authoritative tasks into the current set BY ID, then install
 // the result through `replaceTasks` — the same double-buffering, so the new
 // Index exists before the old arena is reset.
@@ -524,6 +581,16 @@ fn mergeTasks(m: *Model, incoming: []const Task) !void {
 fn restoreEditor(m: *Model) ?FieldId {
     switch (m.in_flight) {
         .commit => |c| {
+            // The status-cycle key commits from `.list` with no editor at all,
+            // parking an empty `.external` in the slot so the commit path keeps
+            // one shape. There is nothing to hand back, and reopening `.editing`
+            // on it would strand the user in an editor whose only reply is
+            // "nothing to save yet". A description commit can never look like
+            // this: it only ever commits text that has already come back.
+            if (c.editor == .external and c.editor.external == null) {
+                m.in_flight = .none;
+                return null;
+            }
             const f = c.field;
             const moved = c.editor;
             m.in_flight = .none; // in_flight no longer owns it; `moved` does
@@ -552,12 +619,10 @@ fn listMode(m: *Model, ev: Event) !Command {
             'h' => try setFold(m, false),
             'g' => try jumpToEdge(m, true),
             'G' => try jumpToEdge(m, false),
-            // The status-cycle key is task 15's. Its in-flight REFUSAL lives here
-            // already, because from this task onward a commit can be outstanding
-            // and a second mutation must be refused rather than queued.
-            ' ' => {
-                if (try refuseIfBusy(m)) return .none;
-            },
+            ' ' => return cycleStatus(m),
+            'a' => try openPrompt(m, .add),
+            '/' => try openPrompt(m, .filter),
+            'x' => try openConfirmDelete(m),
             // Manual refresh. Also the ONLY way out of a failed initial load, so
             // it has to exist from this task onward rather than waiting for the
             // rest of the list keys.
@@ -591,6 +656,9 @@ fn listMode(m: *Model, ev: Event) !Command {
             // old layout produced may no longer be valid.
             try recompute(m);
         },
+        // Escape is the way OUT of a filtered view. In `.list` it is otherwise
+        // inert, so it costs nothing and there is no other key that undoes `/`.
+        .escape => try clearFilter(m),
         else => {},
     }
     return .none;
@@ -695,6 +763,221 @@ fn pageBy(m: *Model, dir: Dir) !void {
     const i = scanTaskRow(m.rows, target, dir) orelse return;
     // INTERNED: see moveCursor.
     m.cursor_id = try m.internId(m.rows[i].id);
+    try recompute(m);
+}
+
+// ─── the mutating list keys ──────────────────────────────────────────────────
+
+// space: the one edit with NO editor at all — the next status is a pure function
+// of the current one, so there is nothing to type. It commits straight from
+// `.list` and stays there.
+fn cycleStatus(m: *Model) !Command {
+    if (try refuseIfBusy(m)) return .none;
+    const target = cursorTask(m) orelse return .none;
+    const next: Status = switch (target.content.status) {
+        // Closing a task is what the key is FOR, so both open states go straight
+        // to done rather than stepping through each other. The two terminal
+        // states return to todo, which is the only non-destructive way back from
+        // a mis-press.
+        .todo, .in_progress => .done,
+        .done, .cancelled => .todo,
+    };
+    const content = edit.applyPatch(target.content, .{ .status = .{ .set = next } });
+    const id = m.cursor_id.?; // proven non-null by `cursorTask` resolving
+    // An EMPTY `.external` editor. The slot keeps the shape every other commit
+    // uses, so `commit_ok`/`conflict`/`request_failed` need no new case; and an
+    // `.external` holding null owns nothing, so no teardown path can leak or
+    // double-free it. `restoreEditor` knows not to reopen an editor on it.
+    m.in_flight = .{ .commit = .{ .id = id, .field = .status, .editor = .{ .external = null } } };
+    return .{ .commit = .{
+        .id = id,
+        .expected_version = target.meta.version,
+        .content = content,
+    } };
+}
+
+const Prompt = enum { add, filter };
+
+// `a` and `/` both open a one-line prompt. The in-flight refusal is here for a
+// MEMORY reason as much as a policy one: `in_flight.commit` may already own the
+// editor a failed commit has to hand back, and a prompt installed in `Mode`
+// alongside it would be a SECOND live editor — the invariant `fieldMode` has
+// guarded since task 14, now reachable from two more keys.
+fn openPrompt(m: *Model, which: Prompt) !void {
+    if (try refuseIfBusy(m)) return;
+    // Built BEFORE the old mode is dropped, so a failed allocation leaves the
+    // model exactly as it was. Nothing below can fail, so `le` is never stranded
+    // unowned. Same shape as `openEditor`.
+    const le = try editors.LineEditor.init(m.gpa, "");
+    m.clearMode(); // frees whatever the outgoing mode owned
+    m.mode = switch (which) {
+        .add => .{ .add = le },
+        .filter => .{ .filter = le },
+    };
+}
+
+// `x`: the prompt carries ONLY the (already interned) id. The number of children
+// the server will promote is read out of `m.tasks` again when `y` is pressed, so
+// a refresh landing while the prompt is open cannot leave the user confirming
+// against a count that has stopped being true.
+fn openConfirmDelete(m: *Model) !void {
+    if (try refuseIfBusy(m)) return;
+    const id = m.cursor_id orelse return;
+    try m.setStatus("delete this task? {d} subtasks would be promoted to top level — y/n", .{promoteCount(m, id)});
+    m.clearMode();
+    m.mode = .{ .confirm_delete = .{ .id = id } };
+}
+
+// How many of a task's children are real tasks, and would therefore be promoted
+// to top level by deleting it. Counted against the Index rather than taken as
+// `child_ids.len`: a dangling child id is not a task, and nothing can promote it.
+fn promoteCount(m: *const Model, id: []const u8) usize {
+    if (!m.idx_built) return 0;
+    const task_ = m.idx.by_id.get(id) orelse return 0;
+    var n: usize = 0;
+    for (task_.content.child_ids) |c| {
+        if (m.idx.by_id.contains(c)) n += 1;
+    }
+    return n;
+}
+
+// y/n only. Every other key is SWALLOWED rather than falling through to the list
+// key map — a confirmation prompt that quietly acts on whatever else is pressed
+// is exactly how the wrong task gets deleted.
+fn confirmDeleteMode(m: *Model, id: []const u8, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        .char => |c| switch (c) {
+            'y' => {
+                if (try refuseIfBusy(m)) return .none;
+                // Read NOW, not when the prompt opened.
+                const n = promoteCount(m, id);
+                try m.setStatus("deleting — {d} subtasks promoted to top level", .{n});
+                m.clearMode();
+                // `id` is interned and the id arena is never reset, so it stays
+                // valid for the whole round trip and for the Command below.
+                m.in_flight = .{ .delete = .{ .id = id } };
+                return .{ .delete = id };
+            },
+            'n' => try cancelConfirm(m),
+            else => {},
+        },
+        .escape => try cancelConfirm(m),
+        else => {},
+    }
+    return .none;
+}
+
+fn cancelConfirm(m: *Model) !void {
+    m.clearMode();
+    // The prompt's question must not stay on the status line after it is answered.
+    try m.setStatus("cancelled", .{});
+}
+
+fn addMode(m: *Model, le: *editors.LineEditor, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        .escape => m.clearMode(),
+        .enter => return submitAdd(m, le),
+        else => try le.handle(m.gpa, k),
+    }
+    return .none;
+}
+
+// Enter in the add prompt. `Mode` STAYS `.add` until the server answers: a failed
+// create has to give the typed title back, and the prompt still holding it is the
+// cheapest possible way to do that (`request_failed`'s `.create` branch is
+// deliberately a no-op for exactly this reason).
+fn submitAdd(m: *Model, le: *editors.LineEditor) !Command {
+    if (try refuseIfBusy(m)) return .none;
+    const typed = std.mem.trim(u8, le.text(), " \t");
+    edit.validate(.{ .title = typed }) catch |err| switch (err) {
+        error.EmptyTitle => {
+            try m.setStatus("a title cannot be empty", .{});
+            return .none; // the prompt stays open
+        },
+    };
+    // Interned for the same reason every other stored slice is: it has to outlive
+    // the editor buffer it was typed into AND the Command that carries it out.
+    const title = try m.internId(typed);
+    m.in_flight = .{ .create = .{ .title = title } };
+    return .{ .create = .{ .title = title } };
+}
+
+fn filterMode(m: *Model, le: *editors.LineEditor, ev: Event) !Command {
+    const k = switch (ev) {
+        .key => |k| k,
+        else => return sharedEvent(m, ev),
+    };
+    switch (k) {
+        // Abandons the EDIT, not the view: an already-active filter stays on.
+        // Escape from `.list` is what clears one.
+        .escape => m.clearMode(),
+        .enter => try applyFilter(m, le.text()),
+        else => try le.handle(m.gpa, k),
+    }
+    return .none;
+}
+
+// Enter in the filter prompt. A rejected expression keeps the prompt OPEN with
+// the text intact — which is the whole reason `filterspec.parse` returns
+// `error.BadFilter` instead of printing and exiting the way the CLI needs.
+fn applyFilter(m: *Model, typed: []const u8) !void {
+    const trimmed = std.mem.trim(u8, typed, " \t");
+    if (trimmed.len == 0) {
+        // An emptied prompt says the same thing Escape from the list says.
+        m.clearMode();
+        return clearFilter(m);
+    }
+
+    // `parse` takes the CLI's repeatable `--filter` form; one typed line is that
+    // same list with spaces where the flag repeats used to be.
+    var exprs = std.ArrayList([]const u8).empty;
+    defer exprs.deinit(m.gpa);
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+    while (it.next()) |e| try exprs.append(m.gpa, e);
+
+    const parsed = filterspec.parse(m.gpa, exprs.items) catch |err| switch (err) {
+        error.BadFilter => {
+            try m.setStatus("not a filter: {s} (try tag:NAME, status:todo,done, or overdue)", .{trimmed});
+            return; // still `.filter`, still holding what the user typed
+        },
+        else => |leftover| return leftover,
+    };
+    defer parsed.deinit(m.gpa);
+
+    // COPY into the ID ARENA, which is the only one that outlives both hazards:
+    // `parsed.tags` are subslices of the editor buffer `clearMode` frees three
+    // lines down, and `m.filters` is read by every later `recompute`, across
+    // every task-set swap. Nothing here may point into `live`.
+    const ia = m.ids.allocator();
+    const tags = try ia.alloc([]const u8, parsed.tags.len);
+    for (parsed.tags, tags) |src, *dst| dst.* = try ia.dupe(u8, src);
+    const statuses = try ia.dupe(Status, parsed.statuses);
+    const expr = try m.internId(trimmed);
+
+    // MERGE, not replace: `roots_only` describes the view's shape, not anything
+    // the user can type into this prompt.
+    m.filters.tags = tags;
+    m.filters.statuses = statuses;
+    m.filters.overdue = parsed.overdue;
+    m.filter_expr = expr;
+    m.filtering = true;
+    m.clearMode();
+    try recompute(m);
+}
+
+fn clearFilter(m: *Model) !void {
+    if (!m.filtering) return;
+    m.filters = .{ .roots_only = m.filters.roots_only };
+    m.filter_expr = "";
+    m.filtering = false;
     try recompute(m);
 }
 
@@ -2326,4 +2609,569 @@ test "commit_ok leaves an in-flight slot it is not the answer to" {
 
     try std.testing.expect(h.m.in_flight == .refresh);
     try std.testing.expectEqual(Priority.high, h.m.tasks[0].content.priority);
+}
+
+test "space cycles every one of the four statuses" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { from: Status, to: Status }{
+        .{ .from = .todo, .to = .done },
+        .{ .from = .in_progress, .to = .done },
+        .{ .from = .done, .to = .todo },
+        .{ .from = .cancelled, .to = .todo },
+    };
+    for (cases) |c| {
+        var tasks = [_]Task{t("a", .medium, c.from, null, &.{})};
+        var h: TestHarness = undefined;
+        try h.setup(a, &tasks);
+        defer h.deinit();
+        try h.key(.{ .char = ' ' });
+        try std.testing.expect(h.last == .commit);
+        try std.testing.expectEqual(c.to, h.last.commit.content.status);
+    }
+}
+
+test "x opens a confirm reporting how many children get promoted; n cancels" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("root", .none, .todo, null, &.{ "k1", "k2" }),
+        t("k1", .none, .todo, null, &.{}),
+        t("k2", .none, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+    try std.testing.expect(h.m.mode == .confirm_delete);
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "2 subtasks") != null);
+    try h.key(.{ .char = 'n' });
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.mode == .list);
+}
+
+test "the promote count is recomputed at confirm time, not at prompt time" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("root", .none, .todo, null, &.{"k1"}),
+        t("k1", .none, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+
+    // A refresh lands while the prompt is open. The cursor's task still exists,
+    // so .confirm_delete survives.
+    var refreshed = [_]Task{
+        t("root", .none, .todo, null, &.{ "k1", "k2" }),
+        t("k1", .none, .todo, null, &.{}),
+        t("k2", .none, .todo, null, &.{}),
+    };
+    try h.send(.{ .tasks_loaded = &refreshed });
+    try std.testing.expect(h.m.mode == .confirm_delete);
+
+    try h.key(.{ .char = 'y' });
+    try std.testing.expect(h.last == .delete);
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "2 subtasks") != null);
+}
+
+test "delete_ok forces a full refetch" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .none, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+    try h.key(.{ .char = 'y' });
+    try h.send(.delete_ok);
+    try std.testing.expect(h.last == .fetch);
+}
+
+test "a adds a root task with default fields and lands focus on priority" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("existing", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'a' });
+    for ("new thing") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.last == .create);
+    try std.testing.expectEqualStrings("new thing", h.last.create.title);
+    try std.testing.expectEqual(Status.todo, h.last.create.status);
+    try std.testing.expectEqual(Priority.none, h.last.create.priority);
+    try std.testing.expectEqual(@as(usize, 0), h.last.create.child_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), h.last.create.tags.len);
+
+    const created = t("newid", .none, .todo, null, &.{});
+    try h.send(.{ .create_ok = created });
+    try std.testing.expectEqualStrings("newid", h.m.cursor_id.?);
+    try std.testing.expect(h.m.pane_open);
+    try std.testing.expectEqual(FieldId.priority, h.m.mode.field);
+}
+
+test "a with an empty title is refused and keeps the prompt open" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("x", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'a' });
+    try h.key(.enter);
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.mode == .add);
+}
+
+test "add failure keeps the typed title" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("x", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'a' });
+    for ("keepme") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try h.send(.{ .request_failed = "boom" });
+    try std.testing.expect(h.m.mode == .add);
+    try std.testing.expectEqualStrings("keepme", h.m.mode.add.text());
+}
+
+test "/ applies a filter, records the expression, and rejects a bad one in place" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("hit", .none, .todo, null, &.{}),
+        t("miss", .none, .todo, null, &.{}),
+    };
+    tasks[0].content.tags = @constCast(&[_][]const u8{"ops"});
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = '/' });
+    for ("bogus") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .filter);
+    try std.testing.expect(h.m.status().len > 0);
+
+    for (0..5) |_| try h.key(.backspace);
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(h.m.filtering);
+    try std.testing.expectEqualStrings("tag:ops", h.m.filter_expr);
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+    try std.testing.expectEqualStrings("hit", h.m.rows[0].id);
+}
+
+test "escape clears an active filter from list mode" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("hit", .none, .todo, null, &.{}),
+        t("miss", .none, .todo, null, &.{}),
+    };
+    tasks[0].content.tags = @constCast(&[_][]const u8{"ops"});
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = '/' });
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try h.key(.escape);
+    try std.testing.expect(!h.m.filtering);
+    try std.testing.expectEqual(@as(usize, 2), h.m.rows.len);
+}
+
+test "escape leaves the filter and add prompts without applying them" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = '/' });
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    try h.key(.escape);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(!h.m.filtering);
+
+    try h.key(.{ .char = 'a' });
+    for ("nope") |c| try h.key(.{ .char = c });
+    try h.key(.escape);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(h.last == .none);
+}
+
+test "a refresh that removes the selected task returns to list mode" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("gone", .high, .todo, null, &.{}),
+        t("stays", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .field);
+
+    var after = [_]Task{t("stays", .low, .todo, null, &.{})};
+    try h.send(.{ .tasks_loaded = &after });
+    try std.testing.expectEqualStrings("stays", h.m.cursor_id.?);
+    try std.testing.expect(h.m.mode == .list);
+}
+
+test "a refresh that keeps the selected task preserves the mode" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("stays", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.down); // .field = description
+
+    var again = [_]Task{t("stays", .high, .todo, null, &.{})};
+    try h.send(.{ .tasks_loaded = &again });
+    try std.testing.expectEqual(FieldId.description, h.m.mode.field);
+}
+
+test "R emits fetch and is refused while a mutation is in flight" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'R' });
+    try std.testing.expect(h.last == .fetch);
+
+    try commitPriorityHigh(&h);
+    try h.key(.escape);
+    try h.key(.{ .char = 'R' });
+    try std.testing.expect(h.last == .none);
+}
+
+// Three tasks, shaped so a leading FILLER task's id length varies: `keep`'s and
+// `kid`'s bytes therefore land at a different offset inside the task arena on
+// every cycle. `buf` must outlive the returned array (it holds the filler id).
+fn shiftingSet(buf: []u8, out: *[3]Task, cycle: usize) []Task {
+    const n = (cycle * 2) % buf.len + 1; // 1..buf.len bytes, changing every cycle
+    @memset(buf[0..n], 'f');
+    out.* = .{
+        t(buf[0..n], .none, .todo, null, &.{}),
+        t("keep", .none, .todo, null, &.{"kid"}),
+        t("kid", .high, .todo, null, &.{}),
+    };
+    return out;
+}
+
+// Step 5's lifetime test, STRENGTHENED. The plan's version reloads the same task
+// set twenty times — and `replaceTasks` resets its arenas with `.retain_capacity`,
+// so every id re-lands at the identical address and a dangling pointer reads back
+// correct purely by luck. A 50-cycle version of that passed on this branch with a
+// deliberately non-interned fold key planted in it. What makes it decisive is
+// changing the task set's SHAPE between cycles, so the offsets actually move —
+// and dereferencing every retained id each iteration, comparing BYTES rather than
+// merely asserting non-null.
+test "repeated refresh cycles leak nothing and keep interned ids valid" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("keep", .none, .todo, null, &.{"kid"}),
+        t("kid", .high, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = 'h' }); // an explicit fold, keyed by interned id
+    try h.key(.enter); // a live Mode.field
+
+    var filler: [40]u8 = undefined;
+    var fresh: [3]Task = undefined;
+    for (0..20) |i| {
+        try h.send(.{ .tasks_loaded = shiftingSet(&filler, &fresh, i) });
+
+        // Every stored id, DEREFERENCED and byte-compared.
+        try std.testing.expectEqualStrings("keep", h.m.cursor_id.?);
+        var it = h.m.folds.iterator();
+        var folds_seen: usize = 0;
+        while (it.next()) |kv| {
+            try std.testing.expectEqualStrings("keep", kv.key_ptr.*);
+            folds_seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), folds_seen);
+        try std.testing.expect(h.m.folds.get("keep") != null);
+        try std.testing.expectEqual(FieldId.title, h.m.mode.field);
+    }
+}
+
+// The other half of the same hazard. `Mode.confirm_delete` carries an id of its
+// own, and it is the one Mode a refresh deliberately PRESERVES — so it is held
+// across arbitrarily many task-set swaps, which makes it the id most likely to
+// dangle if it were ever stored straight off `m.tasks[i].id`. Same shape-changing
+// cycle, dereferenced every iteration, then actually confirmed at the end.
+test "an open delete prompt keeps its id valid across shape-changing refreshes" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("keep", .none, .todo, null, &.{"kid"}),
+        t("kid", .high, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+    try std.testing.expect(h.m.mode == .confirm_delete);
+
+    var filler: [40]u8 = undefined;
+    var fresh: [3]Task = undefined;
+    for (0..20) |i| {
+        try h.send(.{ .tasks_loaded = shiftingSet(&filler, &fresh, i) });
+        try std.testing.expect(h.m.mode == .confirm_delete);
+        try std.testing.expectEqualStrings("keep", h.m.mode.confirm_delete.id);
+        try std.testing.expectEqualStrings("keep", h.m.cursor_id.?);
+    }
+
+    try h.key(.{ .char = 'y' });
+    try std.testing.expect(h.last == .delete);
+    try std.testing.expectEqualStrings("keep", h.last.delete);
+    try std.testing.expectEqualStrings("keep", h.m.in_flight.delete.id);
+}
+
+// `m.filters` points at tag/status slices built from a `filterspec.Parsed` whose
+// tag strings were subslices of the filter prompt's EDITOR BUFFER — freed the
+// instant the prompt closes — and it is re-read by every later `recompute`. Both
+// hazards at once: the editor is long gone, and the task set is swapped
+// (shape-changing) underneath a live filter twenty times.
+test "an active filter survives the editor closing and repeated task-set swaps" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("keep", .none, .todo, null, &.{}),
+        t("kid", .high, .todo, null, &.{}),
+    };
+    tasks[0].content.tags = @constCast(&[_][]const u8{"ops"});
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = '/' });
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.m.mode == .list); // the editor buffer is freed here
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+
+    var filler: [40]u8 = undefined;
+    var fresh: [3]Task = undefined;
+    for (0..20) |i| {
+        var set = shiftingSet(&filler, &fresh, i);
+        set[1].content.tags = @constCast(&[_][]const u8{"ops"});
+        try h.send(.{ .tasks_loaded = set });
+
+        // Read the stored filter back byte-for-byte, and prove it is still the
+        // one being APPLIED: of the three roots only "keep" carries the tag, and
+        // it brings its one child along, so the filler must be gone.
+        try std.testing.expectEqualStrings("tag:ops", h.m.filter_expr);
+        try std.testing.expectEqual(@as(usize, 1), h.m.filters.tags.len);
+        try std.testing.expectEqualStrings("ops", h.m.filters.tags[0]);
+        try std.testing.expectEqual(@as(usize, 2), h.m.rows.len);
+        try std.testing.expectEqualStrings("keep", h.m.rows[0].id);
+        try std.testing.expectEqualStrings("kid", h.m.rows[1].id);
+    }
+
+    try h.key(.escape);
+    try std.testing.expect(!h.m.filtering);
+    try std.testing.expectEqual(@as(usize, 3), h.m.rows.len);
+}
+
+// A status filter exercises the OTHER slice on `m.filters` — `[]Status`, which is
+// a plain value copy rather than a deep string copy, so it fails differently.
+test "a status filter is applied and survives a task-set swap" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("open", .none, .todo, null, &.{}),
+        t("shut", .none, .done, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = '/' });
+    for ("status:done") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expectEqual(@as(usize, 1), h.m.filters.statuses.len);
+    try std.testing.expectEqual(Status.done, h.m.filters.statuses[0]);
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+    try std.testing.expectEqualStrings("shut", h.m.rows[0].id);
+
+    var again = [_]Task{
+        t("open", .none, .todo, null, &.{}),
+        t("shut", .none, .done, null, &.{}),
+    };
+    try h.send(.{ .tasks_loaded = &again });
+    try std.testing.expectEqual(Status.done, h.m.filters.statuses[0]);
+    try std.testing.expectEqual(@as(usize, 1), h.m.rows.len);
+}
+
+// `openEditor` used to be the ONLY thing that could put an `Editor` into `Mode`,
+// so "exactly one live editor" rested on one guard in `fieldMode`. `a` and `/`
+// now build editors too, and `in_flight.commit` may already own the one a failed
+// commit has to hand back — a prompt installed alongside it would either leak or
+// be clobbered by that restore. `x` is guarded for the plainer reason that a
+// delete must not be started while another mutation is outstanding.
+test "the add, filter and delete keys are all refused while a commit is in flight" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try commitPriorityHigh(&h);
+    try h.key(.escape); // back to .list, commit still outstanding
+    try std.testing.expect(h.m.in_flight == .commit);
+
+    for ([_]u21{ 'a', '/', 'x', ' ' }) |c| {
+        try h.key(.{ .char = c });
+        try std.testing.expect(h.m.mode == .list); // no second editor, no prompt
+        try std.testing.expect(h.last == .none);
+        try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "still saving") != null);
+    }
+    // The editor the commit owns is still intact and still restorable.
+    try h.send(.{ .request_failed = "connection reset" });
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqual(@as(usize, 3), h.m.mode.editing.editor.pick.index);
+}
+
+// The status cycle commits with NO editor, so `request_failed` must not hand one
+// back: reopening `.editing` on an empty `.external` drops the user into an
+// editor whose only reply is "nothing to save yet". It has to land back in the
+// list, with the slot empty and the next press still working.
+test "a failed status cycle returns to the list rather than opening an empty editor" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = ' ' });
+    try std.testing.expect(h.m.in_flight == .commit);
+
+    try h.send(.{ .request_failed = "connection reset" });
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "connection reset") != null);
+    try std.testing.expectEqual(Status.todo, h.m.tasks[0].content.status); // never optimistic
+
+    // A jammed slot would refuse this outright.
+    try h.key(.{ .char = ' ' });
+    try std.testing.expect(h.last == .commit);
+}
+
+// The same slot on the success path: `commit_ok` must empty it (and free nothing
+// it does not own), and the mode must not have wandered off the list.
+test "a status cycle that succeeds clears the slot and stays in list mode" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .in_progress, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = ' ' });
+    try std.testing.expect(h.m.mode == .list);
+
+    var echoed = [_]Task{t("a", .medium, .done, null, &.{})};
+    try h.send(.{ .commit_ok = &echoed });
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expectEqual(Status.done, h.m.tasks[0].content.status);
+}
+
+// A background refresh must never throw away text the user is in the middle of
+// typing — it belongs to the user, not to the task set. The `tasks_loaded` mode
+// rule keys off the mode's ANCHOR task, and `.add`/`.filter` anchor to none, so
+// a refresh cannot reach them however the cursor moves. (Nor may it free their
+// editor while the model still points at it.)
+test "a refresh does not close the add or filter prompt" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("gone", .high, .todo, null, &.{}),
+        t("stays", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = 'a' });
+    for ("half typed") |c| try h.key(.{ .char = c });
+    // The refresh even removes the task the cursor was on.
+    var after = [_]Task{t("stays", .low, .todo, null, &.{})};
+    try h.send(.{ .tasks_loaded = &after });
+    try std.testing.expect(h.m.mode == .add);
+    try std.testing.expectEqualStrings("half typed", h.m.mode.add.text());
+    try h.key(.{ .char = '!' }); // still owned and writable, not a freed copy
+    try std.testing.expectEqualStrings("half typed!", h.m.mode.add.text());
+    try h.key(.escape);
+
+    try h.key(.{ .char = '/' });
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    var after2 = [_]Task{t("stays", .low, .todo, null, &.{})};
+    try h.send(.{ .tasks_loaded = &after2 });
+    try std.testing.expect(h.m.mode == .filter);
+    try std.testing.expectEqualStrings("tag:ops", h.m.mode.filter.text());
+}
+
+// The count must reflect what can actually be promoted. A child id nothing
+// resolves to is not a task, so nothing promotes it — and reporting it would tell
+// the user two subtasks are about to move when only one exists.
+test "the promote count ignores dangling child ids" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("root", .none, .todo, null, &.{ "real", "ghost" }),
+        t("real", .none, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "1 subtasks") != null);
+}
+
+// An emptied filter prompt is the plainest way to say "no filter" — routing it
+// through `filterspec.parse` as a zero-expression list would leave `filtering`
+// true with nothing to match on, and the header claiming a filter that is not
+// there.
+test "enter on an emptied filter prompt clears the filter" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("hit", .none, .todo, null, &.{}),
+        t("miss", .none, .todo, null, &.{}),
+    };
+    tasks[0].content.tags = @constCast(&[_][]const u8{"ops"});
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = '/' });
+    for ("tag:ops") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.m.filtering);
+
+    try h.key(.{ .char = '/' });
+    try h.key(.enter); // nothing typed
+    try std.testing.expect(h.m.mode == .list);
+    try std.testing.expect(!h.m.filtering);
+    try std.testing.expectEqualStrings("", h.m.filter_expr);
+    try std.testing.expectEqual(@as(usize, 2), h.m.rows.len);
+}
+
+// The confirm prompt must not act on any key but y/n/escape. Falling through to
+// the list key map would make `x` re-prompt, `q` quit mid-confirmation, and — the
+// dangerous one — `j`/`k` move the cursor away from the task the prompt names,
+// so `y` would delete a task the user is no longer looking at.
+test "the delete confirm swallows every key that is not y, n or escape" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("aaa", .high, .todo, null, &.{}),
+        t("bbb", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'x' });
+    for ([_]Key{ .{ .char = 'j' }, .{ .char = 'q' }, .{ .char = 'x' }, .down, .enter, .tab }) |k| {
+        try h.key(k);
+        try std.testing.expect(h.m.mode == .confirm_delete);
+        try std.testing.expect(h.last == .none);
+    }
+    try std.testing.expectEqualStrings("aaa", h.m.cursor_id.?); // never moved
+    try h.key(.{ .char = 'y' });
+    try std.testing.expectEqualStrings("aaa", h.last.delete);
 }
