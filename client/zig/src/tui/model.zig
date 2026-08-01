@@ -416,14 +416,108 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
             try recompute(m);
         },
         .tasks_loaded => |tasks| {
+            // A refresh that lands is the answer to the request that asked for it.
+            // Only `.refresh` is cleared: a `.commit` slot owns an editor that a
+            // failure still has to hand back, and an unrelated fetch must not free it.
+            if (m.in_flight == .refresh) m.in_flight = .none;
+            m.load_failed = false; // we have data again, whatever came before
             try m.replaceTasks(tasks);
             try recompute(m);
         },
-        // `.key` reaches here only from a mode with no key map yet; the request
-        // outcomes (`commit_ok`, `conflict`, …) are later tasks'.
+        // The server accepted the edit and echoed the authoritative task. That
+        // echo is the ONLY thing that changes what the user sees — there is no
+        // optimistic write anywhere on the commit path.
+        .commit_ok => |tasks| {
+            m.clearInFlight(); // the edit landed, so the editor it was built from is done
+            try mergeTasks(m, tasks);
+            try recompute(m);
+            try m.setStatus("saved", .{});
+        },
+        // A conflict is BOTH halves: the server's version wins on screen, and the
+        // user's typed value comes back into an open editor so re-applying it
+        // costs one keystroke rather than a retype.
+        .conflict => |tasks| {
+            const f = restoreEditor(m);
+            try mergeTasks(m, tasks);
+            try recompute(m);
+            if (f) |field| {
+                try m.setStatus("{s} changed on the server — your edit is still here, press enter to reapply", .{@tagName(field)});
+            } else {
+                try m.setStatus("that task changed on the server", .{});
+            }
+        },
+        .request_failed => |msg| {
+            switch (m.in_flight) {
+                // Hand the editor back so the typed text survives the round trip.
+                .commit => _ = restoreEditor(m),
+                // `Mode.add` still holds the title the user typed; leave it alone.
+                .create, .delete => {},
+                .none, .refresh => {
+                    // Only the INITIAL load fails with nothing on screen. A failed
+                    // refresh must keep the data the user already has rather than
+                    // replacing a working list with an error page.
+                    if (m.tasks.len == 0) m.load_failed = true;
+                },
+            }
+            m.clearInFlight(); // `.commit` was already emptied above; every branch ends here
+            try m.setStatus("{s}", .{msg});
+        },
+        // `.key` reaches here only from a mode with no key map yet.
         else => {},
     }
     return .none;
+}
+
+// Fold the server's authoritative tasks into the current set BY ID, then install
+// the result through `replaceTasks` — the same double-buffering, so the new
+// Index exists before the old arena is reset.
+//
+// `scratch` holds BORROWED task values: some point into the live arena, some into
+// the caller's response buffer. `replaceTasks` deep-copies the whole thing into
+// `spare` before it touches anything live, so both sets of borrows are still
+// valid at the instant they are read.
+fn mergeTasks(m: *Model, incoming: []const Task) !void {
+    const scratch = try m.gpa.alloc(Task, m.tasks.len + incoming.len);
+    defer m.gpa.free(scratch);
+    @memcpy(scratch[0..m.tasks.len], m.tasks);
+    var n = m.tasks.len;
+    outer: for (incoming) |src| {
+        for (scratch[0..n]) |*dst| {
+            if (std.mem.eql(u8, dst.id, src.id)) {
+                dst.* = src;
+                continue :outer;
+            }
+        }
+        // A task the client has never seen (a subtask the server created as part
+        // of the same write): keep it rather than silently dropping it.
+        scratch[n] = src;
+        n += 1;
+    }
+    try m.replaceTasks(scratch[0..n]);
+}
+
+// Move the `Editor` back OUT of `in_flight` and INTO `Mode` — the exact mirror of
+// the move in `commitEdit`, and the other half of that handshake. Copy the value,
+// retag `in_flight`, then install: `moved` is the sole owner in between, and
+// nothing fallible runs there, so there is exactly one owner at every instant.
+// Deliberately NOT `clearInFlight`, which would free the very buffer being handed
+// back. Returns the field the editor belongs to, or null when no commit was
+// outstanding.
+fn restoreEditor(m: *Model) ?FieldId {
+    switch (m.in_flight) {
+        .commit => |c| {
+            const f = c.field;
+            const moved = c.editor;
+            m.in_flight = .none; // in_flight no longer owns it; `moved` does
+            // `fieldMode` refuses to open an editor while a commit is
+            // outstanding, so `Mode` should hold none — but going through
+            // clearMode keeps that a guarantee rather than an assumption.
+            m.clearMode();
+            m.mode = .{ .editing = .{ .field = f, .editor = moved } };
+            return f;
+        },
+        else => return null,
+    }
 }
 
 fn listMode(m: *Model, ev: Event) !Command {
@@ -445,6 +539,14 @@ fn listMode(m: *Model, ev: Event) !Command {
             // and a second mutation must be refused rather than queued.
             ' ' => {
                 if (try refuseIfBusy(m)) return .none;
+            },
+            // Manual refresh. Also the ONLY way out of a failed initial load, so
+            // it has to exist from this task onward rather than waiting for the
+            // rest of the list keys.
+            'R' => {
+                if (try refuseIfBusy(m)) return .none;
+                m.in_flight = .refresh;
+                return .fetch;
             },
             else => {},
         },
@@ -681,6 +783,9 @@ fn dateText(buf: []u8, at: ?i64, offset_minutes: i32) []const u8 {
 fn editingMode(m: *Model, e: *Editing, ev: Event) !Command {
     const k = switch (ev) {
         .key => |k| k,
+        // The external editor reports back through an EVENT, not a key: it is the
+        // only editor whose Enter happens outside this process.
+        .editor_returned => |returned| return editorReturned(m, e, returned),
         else => return sharedEvent(m, ev),
     };
     const f = e.field; // read before anything can retag `m.mode` under `e`
@@ -754,6 +859,12 @@ fn ownPatch(m: *Model, p: *edit.Patch) !void {
         .set => |s| p.title = .{ .set = try la.dupe(u8, s) },
         .unchanged => {},
     }
+    // The description borrows the shell's $EDITOR buffer, which it frees the
+    // moment `update` returns.
+    switch (p.description) {
+        .set => |s| p.description = .{ .set = try la.dupe(u8, s) },
+        .unchanged => {},
+    }
     switch (p.tags) {
         .set => |tags| for (tags) |*tag| {
             tag.* = try la.dupe(u8, tag.*);
@@ -793,9 +904,15 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
         else => |leftover| return leftover,
     };
 
+    return finishCommit(m, e, &patch, target);
+}
+
+// The tail every commit shares, whichever editor produced the patch: validate,
+// take ownership of the borrowed strings, move the editor into `in_flight`, emit.
+fn finishCommit(m: *Model, e: *Editing, patch: *edit.Patch, target: Task) !Command {
     // Validate against a preview whose strings still borrow the editor buffer —
     // `validate` only reads, and a rejection then costs nothing to undo.
-    edit.validate(edit.applyPatch(target.content, patch)) catch |err| switch (err) {
+    edit.validate(edit.applyPatch(target.content, patch.*)) catch |err| switch (err) {
         error.EmptyTitle => {
             try m.setStatus("a title cannot be empty", .{});
             return .none;
@@ -803,8 +920,8 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
     };
 
     // Known good: copy the borrowed strings out before the buffer moves.
-    try ownPatch(m, &patch);
-    const content = edit.applyPatch(target.content, patch);
+    try ownPatch(m, patch);
+    const content = edit.applyPatch(target.content, patch.*);
 
     // Already interned (see `moveCursor`), and the `ids` arena is never reset, so
     // this stays valid for the whole round trip even if the cursor moves on.
@@ -813,7 +930,7 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
     // MOVE the editor out of `Mode` into `in_flight` — copy the value, then retag
     // `Mode`. NOT `clearMode`, which would free the very buffer `in_flight` is
     // taking ownership of. `e` dangles from the `m.mode` assignment onward and
-    // must not be read again.
+    // must not be read again. `restoreEditor` is the mirror of these three lines.
     const f = e.field;
     const moved = e.editor;
     m.mode = .{ .field = f };
@@ -824,6 +941,26 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
         .expected_version = target.meta.version,
         .content = content,
     } };
+}
+
+// $EDITOR exited. `null` is a cancel — the user quit without saving, so nothing
+// is emitted and we step back up to the field. Text is the new description, and
+// it borrows the shell's buffer: `finishCommit`'s `ownPatch` copies it out before
+// this returns.
+fn editorReturned(m: *Model, e: *Editing, returned: ?[]const u8) !Command {
+    const f = e.field; // read before anything can retag `m.mode` under `e`
+    const text = returned orelse {
+        m.clearMode(); // `.external` owns nothing, but this is the sanctioned exit
+        m.mode = .{ .field = f };
+        return .none;
+    };
+    if (try refuseIfBusy(m)) return .none;
+    const target = cursorTask(m) orelse {
+        try m.setStatus("that task no longer exists", .{});
+        return .none;
+    };
+    var patch = edit.Patch{ .description = .{ .set = text } };
+    return finishCommit(m, e, &patch, target);
 }
 
 fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![][]const u8 {
@@ -1832,4 +1969,211 @@ test "a field cannot be opened for editing while a commit is in flight" {
     try std.testing.expect(h.last == .none);
     try std.testing.expectEqual(FieldId.priority, h.m.mode.field); // still .field
     try std.testing.expect(h.m.status().len > 0);
+}
+
+fn commitPriorityHigh(h: *TestHarness) !void {
+    try h.key(.enter);
+    for (0..3) |_| try h.key(.down);
+    try h.key(.enter);
+    try h.key(.down);
+    try h.key(.enter);
+}
+
+test "commit_ok applies the server's authoritative task and clears in_flight" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try commitPriorityHigh(&h);
+
+    var echoed = [_]Task{t("a", .high, .todo, null, &.{})};
+    echoed[0].meta.version = 8;
+    try h.send(.{ .commit_ok = &echoed });
+
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expectEqual(Priority.high, h.m.tasks[0].content.priority);
+    try std.testing.expectEqual(@as(u64, 8), h.m.tasks[0].meta.version);
+    try std.testing.expectEqual(FieldId.priority, h.m.mode.field);
+}
+
+test "request_failed on a commit reopens the editor with the typed value intact" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try commitPriorityHigh(&h);
+
+    try h.send(.{ .request_failed = "connection reset" });
+
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqual(@as(usize, 3), h.m.mode.editing.editor.pick.index); // "high"
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "connection reset") != null);
+    try std.testing.expectEqual(Priority.medium, h.m.tasks[0].content.priority); // never optimistic
+}
+
+test "conflict ALSO reopens the editor and applies the server's version" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    tasks[0].meta.version = 7;
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try commitPriorityHigh(&h);
+
+    var fresh = [_]Task{t("a", .low, .todo, null, &.{})};
+    fresh[0].meta.version = 9;
+    try h.send(.{ .conflict = &fresh });
+
+    try std.testing.expect(h.m.mode == .editing); // not discarded
+    try std.testing.expectEqual(@as(usize, 3), h.m.mode.editing.editor.pick.index);
+    try std.testing.expectEqual(Priority.low, h.m.tasks[0].content.priority); // server wins
+    try std.testing.expectEqual(@as(u64, 9), h.m.tasks[0].meta.version);
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "changed on the server") != null);
+}
+
+test "editor_returned null is a cancel and emits nothing" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.down);
+    try h.key(.enter);
+    try h.send(.{ .editor_returned = null });
+    try std.testing.expect(h.last == .none);
+    try std.testing.expectEqual(FieldId.description, h.m.mode.field);
+}
+
+test "editor_returned text commits the description" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.down);
+    try h.key(.enter);
+    try h.send(.{ .editor_returned = "a new description" });
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("a new description", h.last.commit.content.description);
+}
+
+test "a failed INITIAL load sets load_failed; R retries and clears it" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    m.in_flight = .refresh;
+
+    _ = try update(a, &m, .{ .request_failed = "server down" });
+    try std.testing.expect(m.load_failed);
+    try std.testing.expect(m.in_flight == .none);
+    try std.testing.expect(std.mem.indexOf(u8, m.status(), "server down") != null);
+
+    const cmd = try update(a, &m, .{ .key = .{ .char = 'R' } });
+    try std.testing.expect(cmd == .fetch);
+
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    _ = try update(a, &m, .{ .tasks_loaded = &tasks });
+    try std.testing.expect(!m.load_failed);
+}
+
+test "a failed REFRESH keeps the existing data and does not set load_failed" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'R' });
+    try h.send(.{ .request_failed = "server down" });
+
+    try std.testing.expect(!h.m.load_failed); // we still have data
+    try std.testing.expectEqual(@as(usize, 1), h.m.tasks.len);
+    try std.testing.expect(h.m.status().len > 0);
+}
+
+// The brief's commit_ok/conflict tests both use a ONE-task set, where merging by
+// id and wholesale-replacing with the echo are indistinguishable — and the server
+// echoes only the tasks it wrote. Replacing wholesale would therefore delete
+// every task the user did not just edit. Ids of differing lengths also vary the
+// task set's SHAPE across the swap, so a surviving id that dangled into the old
+// arena cannot read back correct by landing at the same address.
+test "commit_ok merges the echo by id instead of replacing the whole task set" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("aa", .medium, .todo, null, &.{}),
+        t("bbbbbbbb", .low, .todo, null, &.{}),
+        t("ccc", .none, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try commitPriorityHigh(&h); // cursor is on "aa" (highest urgency)
+    try std.testing.expectEqualStrings("aa", h.m.in_flight.commit.id);
+
+    var echoed = [_]Task{t("aa", .high, .todo, null, &.{})};
+    try h.send(.{ .commit_ok = &echoed });
+
+    try std.testing.expectEqual(@as(usize, 3), h.m.tasks.len);
+    try std.testing.expectEqual(Priority.high, h.m.idx.by_id.get("aa").?.content.priority);
+    try std.testing.expectEqual(Priority.low, h.m.idx.by_id.get("bbbbbbbb").?.content.priority);
+    try std.testing.expectEqual(Priority.none, h.m.idx.by_id.get("ccc").?.content.priority);
+    // The interned cursor id still reads correctly after the swap.
+    try std.testing.expectEqualStrings("aa", h.m.cursor_id.?);
+}
+
+// The `.create` branch of `request_failed` has no key path to reach it until the
+// `a` key exists, so it is driven directly here — otherwise its "keep Mode.add
+// and its text" rule ships with zero coverage and could be a bare `clearMode`.
+test "request_failed on a create keeps the add-mode text the user typed" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    h.m.mode = .{ .add = try editors.LineEditor.init(a, "a half-typed new task") };
+    h.m.in_flight = .{ .create = .{ .title = try h.m.internId("a half-typed new task") } };
+
+    try h.send(.{ .request_failed = "connection reset" });
+
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .add);
+    try std.testing.expectEqualStrings("a half-typed new task", h.m.mode.add.text());
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "connection reset") != null);
+}
+
+// Both of the brief's restore tests use a PICK editor, which owns no heap memory
+// at all — the move back out of `in_flight` could leak or double-free a buffer
+// and they would still pass byte-for-byte. A LINE editor is where the ownership
+// is real, so this is the test that actually exercises the handoff: the buffer
+// must arrive intact, still owned (typing into it must work), and still freed by
+// deinit.
+test "a failed commit hands a line editor's heap buffer back intact and still owned" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("ab", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter); // title line editor, prefilled "ab"
+    for ("cd") |c| try h.key(.{ .char = c });
+    try h.key(.enter); // commit -> the editor MOVES into in_flight
+
+    try h.send(.{ .request_failed = "connection reset" });
+
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqualStrings("abcd", h.m.mode.editing.editor.line.text());
+    try std.testing.expectEqualStrings("ab", h.m.tasks[0].content.title); // never optimistic
+    // Still writable, and re-committable: a stale copy would strand the append.
+    try h.key(.{ .char = 'e' });
+    try std.testing.expectEqualStrings("abcde", h.m.mode.editing.editor.line.text());
+    try h.key(.enter);
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("abcde", h.last.commit.content.title);
 }
