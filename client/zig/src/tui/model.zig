@@ -47,7 +47,15 @@ pub const Editor = union(enum) {
 // The open-editor payload of `Mode.editing`. Named (rather than inline) so the
 // handlers that mutate it in place can take a `*Editing` — an anonymous struct
 // type has no spellable name to write in a signature.
-pub const Editing = struct { field: FieldId, editor: Editor };
+//
+// `id` is the task the editor was OPENED ON, interned like every other stored id.
+// It is not a convenience copy of `cursor_id`: the commit path targets THIS id,
+// never the cursor. The cursor is a viewport position and it moves on its own —
+// `recompute` re-resolves it, and drops it onto a neighbour whenever the edited
+// task's row disappears (a filter it no longer matches, a fold, a refresh). An
+// editor that targeted the cursor would then write the user's typed text onto an
+// unrelated task, at that task's version, and the server would accept it.
+pub const Editing = struct { id: []const u8, field: FieldId, editor: Editor };
 
 pub const Mode = union(enum) {
     list,
@@ -559,7 +567,10 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
 // here is interned, so the caller may hold it across a task-set swap.
 fn modeAnchor(m: *const Model) ?[]const u8 {
     return switch (m.mode) {
-        .field, .editing => m.cursor_id,
+        // `.editing` names its own task (see `Editing.id`); `.field` has only the
+        // cursor, which is what it acts on.
+        .editing => |e| e.id,
+        .field => m.cursor_id,
         .confirm_delete => |c| c.id,
         .list, .filter, .add => null,
     };
@@ -615,12 +626,19 @@ fn restoreEditor(m: *Model) ?FieldId {
             }
             const f = c.field;
             const moved = c.editor;
+            // Carry the TARGET id back too, not just the buffer. `c.id` is what
+            // the rejected request was for; the caller (`.conflict`) merges and
+            // recomputes immediately afterwards, which can move `cursor_id` off
+            // this task entirely — so the restored editor has to remember its own
+            // target or "press enter to reapply" lands on whatever the cursor
+            // drifted to. Interned, and the id arena is never reset.
+            const target_id = c.id;
             m.in_flight = .none; // in_flight no longer owns it; `moved` does
             // `fieldMode` refuses to open an editor while a commit is
             // outstanding, so `Mode` should hold none — but going through
             // clearMode keeps that a guarantee rather than an assumption.
             m.clearMode();
-            m.mode = .{ .editing = .{ .field = f, .editor = moved } };
+            m.mode = .{ .editing = .{ .id = target_id, .field = f, .editor = moved } };
             return f;
         },
         else => return null,
@@ -1048,6 +1066,13 @@ fn stepField(f: FieldId, delta: i8) FieldId {
 
 fn cursorTask(m: *const Model) ?Task {
     const id = m.cursor_id orelse return null;
+    return taskById(m, id);
+}
+
+// Any task by id, whether or not it is on screen. The commit path uses this
+// rather than `cursorTask`: a task that no longer matches the filter still
+// EXISTS, and an editor open on it must still be able to save.
+fn taskById(m: *const Model, id: []const u8) ?Task {
     if (!m.idx_built) return null;
     return m.idx.by_id.get(id);
 }
@@ -1055,6 +1080,17 @@ fn cursorTask(m: *const Model) ?Task {
 // Open the editor whose TYPE matches the field, seeded from the cursor's task.
 // Returns `.open_editor` for the one field that is not edited in-process.
 fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !Command {
+    // FIRST, above every write to `m.mode`. `.field` outlives its task being
+    // filtered away — `recompute` nulls `cursor_id` while `modeAnchor` keeps the
+    // mode alive, because only leaving the *Index* invalidates a mode. Installing
+    // `.editing` and only then discovering there is no id to build the command
+    // from parked the user in an editor that never opens: `.description` returned
+    // `.none`, so `$EDITOR` never ran, and the pane said "editing in $EDITOR…"
+    // with nothing to wait for.
+    const id = m.cursor_id orelse {
+        try m.setStatus("nothing selected", .{});
+        return .none;
+    };
     const c: Content = if (cursorTask(m)) |task_| task_.content else .{ .title = "" };
     var date_buf: [16]u8 = undefined;
 
@@ -1086,14 +1122,14 @@ fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !Command {
     };
     // Nothing below can fail, so `editor` cannot be stranded unowned.
     m.clearMode(); // frees whatever the outgoing mode owned
-    m.mode = .{ .editing = .{ .field = f, .editor = editor } };
+    m.mode = .{ .editing = .{ .id = id, .field = f, .editor = editor } };
 
     if (f == .description) {
-        // `id` is `cursor_id`, already interned in the `ids` arena (never reset,
-        // so it outlives every task-set swap the round trip races); `initial`
-        // borrows the live task arena, which survives until the next swap. Both
-        // outlast this return, which is all a Command payload promises.
-        if (m.cursor_id) |id| return .{ .open_editor = .{ .id = id, .initial = c.description } };
+        // `id` came from `cursor_id`, already interned in the `ids` arena (never
+        // reset, so it outlives every task-set swap the round trip races);
+        // `initial` borrows the live task arena, which survives until the next
+        // swap. Both outlast this return, which is all a Command payload promises.
+        return .{ .open_editor = .{ .id = id, .initial = c.description } };
     }
     return .none;
 }
@@ -1219,9 +1255,8 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
         return commitDescription(m, e, retained);
     }
 
-    // `cursorTask` resolving proves `cursor_id` is non-null, which the id below
-    // relies on.
-    const target = cursorTask(m) orelse {
+    // The editor's OWN task, not the cursor's — see `Editing.id`.
+    const target = taskById(m, e.id) orelse {
         try m.setStatus("that task no longer exists", .{});
         return .none;
     };
@@ -1255,9 +1290,10 @@ fn finishCommit(m: *Model, e: *Editing, patch: *edit.Patch, target: Task) !Comma
     try ownPatch(m, patch);
     const content = edit.applyPatch(target.content, patch.*);
 
-    // Already interned (see `moveCursor`), and the `ids` arena is never reset, so
-    // this stays valid for the whole round trip even if the cursor moves on.
-    const id = m.cursor_id.?;
+    // The editor's own target. Already interned (`openEditor`/`restoreEditor`),
+    // and the `ids` arena is never reset, so it stays valid for the whole round
+    // trip even if the cursor moves on — which is exactly what it must survive.
+    const id = e.id;
 
     // MOVE the editor out of `Mode` into `in_flight` — copy the value, then retag
     // `Mode`. NOT `clearMode`, which would free the very buffer `in_flight` is
@@ -1301,7 +1337,9 @@ fn editorReturned(m: *Model, e: *Editing, returned: ?[]const u8) !Command {
 // Commit the description held by an `.external` editor — shared by the first
 // round trip (`editorReturned`) and by Enter retrying a failed one.
 fn commitDescription(m: *Model, e: *Editing, text: []const u8) !Command {
-    const target = cursorTask(m) orelse {
+    // The editor's OWN task, not the cursor's — see `Editing.id`. A $EDITOR round
+    // trip is the longest window on the branch for the cursor to move.
+    const target = taskById(m, e.id) orelse {
         try m.setStatus("that task no longer exists", .{});
         return .none;
     };
@@ -1484,6 +1522,7 @@ test "deinit frees editor buffers left live in mode and in_flight" {
     try m.init(a, NOW, 0);
 
     m.mode = .{ .editing = .{
+        .id = try m.internId("aaa"),
         .field = .title,
         .editor = .{ .line = try editors.LineEditor.init(a, "a heap-allocated draft title") },
     } };
@@ -2406,6 +2445,131 @@ test "conflict ALSO reopens the editor and applies the server's version" {
     try std.testing.expectEqual(Priority.low, h.m.tasks[0].content.priority); // server wins
     try std.testing.expectEqual(@as(u64, 9), h.m.tasks[0].meta.version);
     try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "changed on the server") != null);
+}
+
+// FINAL REVIEW, finding 1 (CRITICAL). `.conflict` restores the editor and THEN
+// merges + recomputes — and `recompute` re-resolves the cursor, moving it off the
+// conflicting task the moment that task stops matching the active filter. The
+// reapplied commit must still target the task the editor was OPENED on; targeting
+// the cursor writes the user's text onto a task they never touched, at that task's
+// own version, so the server accepts it.
+test "a conflict under a filter that then excludes the task reapplies to THAT task" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("AAA1", .high, .todo, null, &.{}),
+        t("BBB2", .medium, .todo, null, &.{}),
+    };
+    tasks[0].meta.version = 3;
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    // `status:todo` matches both — for now.
+    try h.key(.{ .char = '/' });
+    for ("status:todo") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try std.testing.expect(h.m.filtering);
+    try std.testing.expectEqualStrings("AAA1", h.m.cursor_id.?);
+
+    // Retitle AAA1 to "AAAZ" and commit.
+    try h.key(.enter); // .field title
+    try h.key(.enter); // line editor, prefilled "AAA1"
+    try h.key(.backspace);
+    try h.key(.{ .char = 'Z' });
+    try h.key(.enter);
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("AAA1", h.last.commit.id);
+
+    // 409: the server's AAA1 is now `.done`, so it drops out of `status:todo`
+    // and its row disappears — which is what moves the cursor to BBB2.
+    var fresh = [_]Task{t("AAA1", .high, .done, null, &.{})};
+    fresh[0].meta.version = 9;
+    try h.send(.{ .conflict = &fresh });
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqualStrings("AAAZ", h.m.mode.editing.editor.line.text());
+
+    // "press enter to reapply" — onto AAA1, at AAA1's version.
+    try h.key(.enter);
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("AAA1", h.last.commit.id);
+    try std.testing.expectEqualStrings("AAAZ", h.last.commit.content.title);
+    try std.testing.expectEqual(@as(u64, 9), h.last.commit.expected_version);
+    // …and BBB2 is untouched: nothing was ever written optimistically.
+    try std.testing.expectEqualStrings("BBB2", h.m.idx.by_id.get("BBB2").?.content.title);
+}
+
+// The other half of finding 1. The cursor also moves ON PURPOSE: nothing stops
+// the user escaping to the list and walking away while a commit is out. What
+// `restoreEditor` hands back must be the id the REQUEST was for, which is the one
+// piece of information the restore used to drop on the floor.
+test "a conflict restores the editor onto its own task after the cursor moved away" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("AAA1", .high, .todo, null, &.{}),
+        t("BBB2", .medium, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try std.testing.expectEqualStrings("AAA1", h.m.cursor_id.?);
+
+    try h.key(.enter); // .field title
+    try h.key(.enter); // line editor on AAA1, prefilled "AAA1"
+    try h.key(.backspace);
+    try h.key(.{ .char = 'Z' });
+    try h.key(.enter); // commit AAA1
+    try std.testing.expectEqualStrings("AAA1", h.m.in_flight.commit.id);
+
+    // The user walks away while the request is still out.
+    try h.key(.escape);
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("BBB2", h.m.cursor_id.?);
+
+    var fresh = [_]Task{t("AAA1", .high, .todo, null, &.{})};
+    fresh[0].meta.version = 9;
+    try h.send(.{ .conflict = &fresh });
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqualStrings("AAA1", h.m.mode.editing.id);
+
+    try h.key(.enter);
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("AAA1", h.last.commit.id);
+    try std.testing.expectEqualStrings("AAAZ", h.last.commit.content.title);
+    try std.testing.expectEqual(@as(u64, 9), h.last.commit.expected_version);
+}
+
+// FINAL REVIEW, finding 3 (IMPORTANT). `.field` survives its task being FILTERED
+// away — `modeAnchor` only clears a mode when the anchored task leaves the Index,
+// and a task that merely stops matching is still in it — so `recompute` nulls
+// `cursor_id` underneath a live `.field`. Enter must not then install an editor it
+// has no task to open: the `.description` case returned `.none`, so `$EDITOR`
+// never ran, and the pane sat on "editing in $EDITOR…" forever.
+test "Enter in .field with no resolvable cursor refuses instead of opening a phantom editor" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = '/' });
+    for ("status:todo") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+    try h.key(.enter); // descend: .field title
+    try h.key(.down); // .field description
+    try std.testing.expectEqual(FieldId.description, h.m.mode.field);
+
+    // A refresh lands with the task now `.done`: still in the Index, so the mode
+    // survives, but it no longer matches `status:todo`, so there are no rows.
+    var fresh = [_]Task{t("a", .medium, .done, null, &.{})};
+    try h.send(.{ .tasks_loaded = &fresh });
+    try std.testing.expect(h.m.mode == .field);
+    try std.testing.expect(h.m.cursor_id == null);
+    try std.testing.expectEqual(@as(usize, 0), h.m.rows.len);
+
+    try h.key(.enter);
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.mode == .field); // NOT parked in an editor
+    try std.testing.expect(h.m.status().len > 0);
 }
 
 test "editor_returned null is a cancel and emits nothing" {
