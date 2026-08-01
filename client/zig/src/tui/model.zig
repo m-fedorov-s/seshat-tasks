@@ -529,7 +529,12 @@ fn scanTaskRow(rows: []const ledger.Row, start: usize, dir: Dir) ?usize {
             return nearestTaskRow(rows, rows.len -| 1);
         },
         .prev => {
-            var i = start;
+            // Unlike .next, whose loop simply does not run, a backward scan
+            // dereferences rows[i] before any bounds check. Guard both an empty
+            // list and a start past the end so the helper is total over its
+            // signature, not merely safe for today's one caller.
+            if (rows.len == 0) return null;
+            var i = @min(start, rows.len - 1);
             while (true) {
                 if (rows[i].kind == .task) return i;
                 if (i == 0) break;
@@ -1300,6 +1305,27 @@ test "Ctrl-D and Ctrl-U move by half a page, clamp at the ends, and drag the vie
     for (0..20) |_| try h.key(.ctrl_u);
     try std.testing.expectEqual(@as(usize, 0), h.m.cursorIndex().?);
     try std.testing.expectEqual(@as(usize, 0), h.m.scroll_top);
+}
+
+// `scanTaskRow` is only ever reached today through `pageBy`, whose
+// `cursorIndex() orelse return` guard already proves `rows.len > 0`. Pin the
+// helper's totality anyway: `.prev` dereferences `rows[i]` before any bounds
+// check, so an empty list or an out-of-range start used to panic, while `.next`
+// returned null. A later task calling it from a new site would have found that
+// the hard way.
+test "scanTaskRow is total: empty list and out-of-range start in both directions" {
+    const empty: []const ledger.Row = &.{};
+    try std.testing.expect(scanTaskRow(empty, 0, .prev) == null);
+    try std.testing.expect(scanTaskRow(empty, 0, .next) == null);
+    try std.testing.expect(scanTaskRow(empty, 7, .prev) == null);
+
+    const rows = [_]ledger.Row{
+        .{ .id = "", .kind = .unreachable_header, .depth = 0, .last_sibling = true, .descendants = 0, .attention = 0, .expanded = true, .dimmed = false },
+        .{ .id = "a", .kind = .task, .depth = 0, .last_sibling = true, .descendants = 0, .attention = 0, .expanded = false, .dimmed = false },
+    };
+    // A start past the end clamps rather than reading out of bounds.
+    try std.testing.expectEqual(@as(?usize, 1), scanTaskRow(&rows, 99, .prev));
+    try std.testing.expectEqual(@as(?usize, 1), scanTaskRow(&rows, 0, .next));
 }
 
 // Defect: `pageBy` used to route its half-page target through `nearestTaskRow`,
