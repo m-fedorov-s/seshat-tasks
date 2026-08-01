@@ -209,7 +209,9 @@ pub const flag_specs = [_]args.OptionSpec{
 pub const BuildError = error{ BadStatus, BadPriority, BadDate, OutOfMemory };
 
 // raw=="" -> cleared (&.{}); otherwise comma-split, trimmed, empty segments dropped.
-fn splitTags(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![][]const u8 {
+// NOTE: only the OUTER slice is allocated — every segment points INTO `raw`, so a
+// caller whose `raw` is shorter-lived than the result must dupe the segments too.
+pub fn splitTags(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![][]const u8 {
     if (raw.len == 0) return &.{};
     var list = std.ArrayList([]const u8).empty;
     errdefer list.deinit(allocator);

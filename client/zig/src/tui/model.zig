@@ -10,6 +10,7 @@ const Priority = taskmod.Priority;
 const Status = taskmod.Status;
 const view = @import("../core/view.zig");
 const display = @import("../core/display.zig");
+const edit = @import("../core/edit.zig");
 const ledger = @import("ledger.zig");
 const editors = @import("editors.zig");
 
@@ -32,10 +33,15 @@ pub const Editor = union(enum) {
     }
 };
 
+// The open-editor payload of `Mode.editing`. Named (rather than inline) so the
+// handlers that mutate it in place can take a `*Editing` — an anonymous struct
+// type has no spellable name to write in a signature.
+pub const Editing = struct { field: FieldId, editor: Editor };
+
 pub const Mode = union(enum) {
     list,
     field: FieldId,
-    editing: struct { field: FieldId, editor: Editor },
+    editing: Editing,
     filter: editors.LineEditor,
     add: editors.LineEditor,
     confirm_delete: struct { id: []const u8 }, // id is interned; `promotes` is
@@ -391,9 +397,9 @@ pub fn update(allocator: std.mem.Allocator, m: *Model, ev: Event) !Command {
         .list => listMode(m, ev),
         .field => |f| fieldMode(allocator, m, f, ev),
         // BY POINTER, not by value: `Editor` transitively owns a heap ArrayList,
-        // so a by-value capture would hand task 13 a copy to mutate — leaking the
-        // reallocation and leaving `m.mode`'s buffer stale.
-        .editing => |*e| editingMode(m, e.field, ev),
+        // so a by-value capture would hand the keystroke path a copy to mutate —
+        // leaking the reallocation and leaving `m.mode`'s buffer stale.
+        .editing => |*e| editingMode(m, e, ev),
         // Later tasks own these modes' key maps; until then they see only the
         // events that mean the same thing everywhere.
         .filter, .add, .confirm_delete => sharedEvent(m, ev),
@@ -434,6 +440,12 @@ fn listMode(m: *Model, ev: Event) !Command {
             'h' => try setFold(m, false),
             'g' => try jumpToEdge(m, true),
             'G' => try jumpToEdge(m, false),
+            // The status-cycle key is task 15's. Its in-flight REFUSAL lives here
+            // already, because from this task onward a commit can be outstanding
+            // and a second mutation must be refused rather than queued.
+            ' ' => {
+                if (try busy(m)) return .none;
+            },
             else => {},
         },
         .down => try moveCursor(m, .next),
@@ -574,13 +586,30 @@ fn fieldMode(allocator: std.mem.Allocator, m: *Model, f: FieldId, ev: Event) !Co
     switch (k) {
         .up => m.mode = .{ .field = stepField(f, -1) },
         .down => m.mode = .{ .field = stepField(f, 1) },
-        .enter => try openEditor(allocator, m, f),
+        // Opening an editor is the first step of a mutation, and it is also what
+        // would put a SECOND `Editor` in `Mode` while `in_flight` still holds the
+        // one a failed commit has to restore (task 14). Refusing here keeps
+        // "exactly one live editor" an invariant rather than a coincidence.
+        .enter => {
+            if (try busy(m)) return .none;
+            return openEditor(allocator, m, f);
+        },
         // No editor is live in `.field`, but clearMode is the one sanctioned way
         // back to `.list` — never hand-roll the teardown.
         .escape => m.clearMode(),
         else => {},
     }
     return .none;
+}
+
+// At most ONE mutation may be outstanding. Every key path that would start one
+// asks here first; a refused key gets a message and is DROPPED, never queued —
+// queuing would let the user stack edits against a state the server has not
+// confirmed, which is the same trap as an optimistic write.
+fn busy(m: *Model) !bool {
+    if (m.in_flight == .none) return false;
+    try m.setStatus("still saving…", .{});
+    return true;
 }
 
 // ↑/↓ walk FieldId's DECLARATION order, clamped at both ends — deliberately no
@@ -598,7 +627,8 @@ fn cursorTask(m: *const Model) ?Task {
 }
 
 // Open the editor whose TYPE matches the field, seeded from the cursor's task.
-fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !void {
+// Returns `.open_editor` for the one field that is not edited in-process.
+fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !Command {
     const c: Content = if (cursorTask(m)) |task_| task_.content else .{ .title = "" };
     var date_buf: [16]u8 = undefined;
 
@@ -624,12 +654,22 @@ fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !void {
         // Dates prefill with the formatted local date, empty when unset.
         .due => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.due_at, m.offset_minutes)) },
         .scheduled => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.scheduled_at, m.offset_minutes)) },
-        // A description is edited in $EDITOR; task 13 emits the command for it.
+        // A description is edited in $EDITOR — the shell runs it and reports back
+        // through `editor_returned`, so there is no in-process buffer to own.
         .description => .external,
     };
     // Nothing below can fail, so `editor` cannot be stranded unowned.
     m.clearMode(); // frees whatever the outgoing mode owned
     m.mode = .{ .editing = .{ .field = f, .editor = editor } };
+
+    if (f == .description) {
+        // `id` is `cursor_id`, already interned in the `ids` arena (never reset,
+        // so it outlives every task-set swap the round trip races); `initial`
+        // borrows the live task arena, which survives until the next swap. Both
+        // outlast this return, which is all a Command payload promises.
+        if (m.cursor_id) |id| return .{ .open_editor = .{ .id = id, .initial = c.description } };
+    }
+    return .none;
 }
 
 fn dateText(buf: []u8, at: ?i64, offset_minutes: i32) []const u8 {
@@ -637,20 +677,127 @@ fn dateText(buf: []u8, at: ?i64, offset_minutes: i32) []const u8 {
     return display.formatDate(buf, unix, offset_minutes);
 }
 
-fn editingMode(m: *Model, f: FieldId, ev: Event) !Command {
+fn editingMode(m: *Model, e: *Editing, ev: Event) !Command {
     const k = switch (ev) {
         .key => |k| k,
         else => return sharedEvent(m, ev),
     };
+    const f = e.field; // read before anything can retag `m.mode` under `e`
     switch (k) {
         .escape => {
             m.clearMode(); // frees the editor's heap buffer
             m.mode = .{ .field = f }; // back up one level, not all the way out
         },
-        // Feeding keystrokes to the editor and committing on Enter are task 13's.
-        else => {},
+        .enter => return commitEdit(m, e),
+        // Every other key belongs to the editor: it owns its own key map, and
+        // `.external` has no in-process buffer to type into.
+        else => switch (e.editor) {
+            .line => |*le| try le.handle(m.gpa, k),
+            .pick => |*pe| pe.handle(k),
+            .external => {},
+        },
     }
     return .none;
+}
+
+// One field in, one `Edit` out — a commit never carries a change the user did not
+// make in this editor. Strings are duped into the LIVE arena: the editor buffer
+// they are read from is handed to `in_flight` and eventually freed, while `live`
+// survives until the next task-set swap, which is exactly when the server's echo
+// replaces this content anyway.
+fn buildPatch(m: *Model, e: *const Editing) error{ BadDate, OutOfMemory }!edit.Patch {
+    const la = m.live.allocator();
+    var p = edit.Patch{};
+    switch (e.editor) {
+        .pick => |pe| switch (e.field) {
+            // `PickEditor.index` is always < `len`, and `len` came from the enum's
+            // own field count in `openEditor`, so neither cast can be out of range.
+            .status => p.status = .{ .set = @enumFromInt(pe.index) },
+            .priority => p.priority = .{ .set = @enumFromInt(pe.index) },
+            else => {},
+        },
+        .line => |le| {
+            const typed = le.text();
+            switch (e.field) {
+                .title => p.title = .{ .set = try la.dupe(u8, typed) },
+                .due => p.due = try edit.parseDate(typed, m.now, .due, m.offset_minutes),
+                .scheduled => p.scheduled = try edit.parseDate(typed, m.now, .scheduled, m.offset_minutes),
+                .tags => {
+                    // splitTags allocates only the OUTER slice — every segment
+                    // points into `typed`, i.e. into the editor buffer this
+                    // commit is about to move away. Dupe each one out first.
+                    const tags = try edit.splitTags(la, typed);
+                    for (tags) |*tag| tag.* = try la.dupe(u8, tag.*);
+                    p.tags = .{ .set = tags };
+                },
+                else => {},
+            }
+        },
+        .external => {},
+    }
+    return p;
+}
+
+// Enter in an open editor: build the one-field patch, apply it to the task's
+// CURRENT content, validate client-side, and hand the whole result to the shell.
+// Nothing is written into `m.tasks` — the server's echo (task 14) is the only
+// thing allowed to change what the user sees, so a failed request can never
+// leave a value on screen the server never accepted.
+fn commitEdit(m: *Model, e: *Editing) !Command {
+    // Currently unreachable — `fieldMode` refuses to OPEN an editor while a
+    // commit is outstanding, so merely being in `.editing` already proves nothing
+    // is in flight (removing it changes no test). Kept as the last line of
+    // defence for the one-mutation rule, which is a memory-ownership invariant
+    // and not just a policy: the editor `in_flight` holds is the one task 14
+    // restores, and a second commit would strand it.
+    if (try busy(m)) return .none;
+    // The external editor commits when it RETURNS (`editor_returned`), not on a
+    // key — there is no typed text here to build a patch from.
+    if (e.editor == .external) return .none;
+
+    // `cursorTask` resolving proves `cursor_id` is non-null, which the id below
+    // relies on.
+    const target = cursorTask(m) orelse {
+        try m.setStatus("that task no longer exists", .{});
+        return .none;
+    };
+
+    // Both failure paths below leave `Mode` UNTOUCHED: the editor stays open with
+    // the user's text intact, so a typo costs a keystroke and not a retype.
+    const patch = buildPatch(m, e) catch |err| switch (err) {
+        error.BadDate => {
+            try m.setStatus("not a date: {s} (try 2026-08-02, 2026-08-02T14:30, +3d or none)", .{e.editor.line.text()});
+            return .none;
+        },
+        else => |leftover| return leftover,
+    };
+
+    const content = edit.applyPatch(target.content, patch);
+    edit.validate(content) catch |err| switch (err) {
+        error.EmptyTitle => {
+            try m.setStatus("a title cannot be empty", .{});
+            return .none;
+        },
+    };
+
+    // Already interned (see `moveCursor`), and the `ids` arena is never reset, so
+    // this stays valid for the whole round trip even if the cursor moves on.
+    const id = m.cursor_id.?;
+
+    // MOVE the editor out of `Mode` into `in_flight` — copy the value, then retag
+    // `Mode`. NOT `clearMode`, which would free the very buffer `in_flight` is
+    // taking ownership of. `e` dangles from the `m.mode` assignment onward and
+    // must not be read again.
+    const f = e.field;
+    const moved = e.editor;
+    m.mode = .{ .field = f };
+    m.in_flight = .{ .commit = .{ .id = id, .field = f, .editor = moved } };
+
+    return .{ .commit = .{
+        .id = id,
+        .expected_version = target.meta.version,
+        .content = content,
+    } };
 }
 
 fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![][]const u8 {
@@ -1428,4 +1575,207 @@ test "escape does not clear a pane the user opened with Tab" {
     try h.key(.escape); // -> .list
     try std.testing.expect(h.m.mode == .list);
     try std.testing.expect(h.m.pane_open); // still open: escape is not a pane toggle
+}
+
+test "committing a pick emits one Command.commit with exactly one field changed" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    tasks[0].meta.version = 7;
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.enter);
+    for (0..3) |_| try h.key(.down); // -> priority
+    try h.key(.enter); // pick opens at index 2 (medium)
+    try h.key(.down); // -> high
+    try h.key(.enter); // commit
+
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("a", h.last.commit.id);
+    try std.testing.expectEqual(@as(u64, 7), h.last.commit.expected_version);
+    try std.testing.expectEqual(Priority.high, h.last.commit.content.priority);
+    try std.testing.expectEqualStrings("a", h.last.commit.content.title); // untouched
+    try std.testing.expectEqual(Status.todo, h.last.commit.content.status);
+    try std.testing.expect(h.m.in_flight == .commit);
+    // Mode leaves .editing — the editor was MOVED into in_flight.
+    try std.testing.expectEqual(FieldId.priority, h.m.mode.field);
+    // No optimistic write.
+    try std.testing.expectEqual(Priority.medium, h.m.tasks[0].content.priority);
+}
+
+test "committing a date parses with the configured offset" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    h.m.offset_minutes = 180;
+
+    try h.key(.enter);
+    for (0..4) |_| try h.key(.down); // -> due
+    try h.key(.enter);
+    for ("2026-08-02") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+
+    try std.testing.expect(h.last == .commit);
+    // Local end-of-day at +03:00, stored as UTC.
+    // 1785628800 == 2026-08-02T00:00:00Z (verified: `date -u -d @1785628800`).
+    const day_start: i64 = 1785628800;
+    try std.testing.expectEqual(@as(?i64, day_start + 86399 - 180 * 60), h.last.commit.content.due_at);
+}
+
+test "a bad date keeps the editor open with the text intact and emits no command" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..4) |_| try h.key(.down);
+    try h.key(.enter);
+    for ("nonsense") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.mode == .editing);
+    try std.testing.expectEqualStrings("nonsense", h.m.mode.editing.editor.line.text());
+    try std.testing.expect(h.m.status().len > 0);
+}
+
+test "an empty title is refused client-side" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("abcdefgh", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter);
+    for (0..8) |_| try h.key(.backspace);
+    try h.key(.enter);
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.mode == .editing);
+}
+
+test "committing tags splits on commas and survives the editor being freed" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..6) |_| try h.key(.down); // -> tags
+    try h.key(.enter);
+    for ("ops,urgent") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqual(@as(usize, 2), h.last.commit.content.tags.len);
+    try std.testing.expectEqualStrings("ops", h.last.commit.content.tags[0]);
+    try std.testing.expectEqualStrings("urgent", h.last.commit.content.tags[1]);
+}
+
+test "a second mutation while one is in flight is refused" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..3) |_| try h.key(.down);
+    try h.key(.enter);
+    try h.key(.down);
+    try h.key(.enter); // in flight
+    try std.testing.expect(h.m.in_flight == .commit);
+
+    try h.key(.escape);
+    try h.key(.{ .char = ' ' });
+    try std.testing.expect(h.last == .none);
+    try std.testing.expect(h.m.status().len > 0);
+}
+
+test "editing the description emits open_editor rather than a commit" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.down); // -> description
+    try h.key(.enter);
+    try std.testing.expect(h.last == .open_editor);
+    try std.testing.expectEqualStrings("a", h.last.open_editor.id);
+    try std.testing.expect(h.m.mode.editing.editor == .external);
+}
+
+// True when `s` lies anywhere inside `buf`'s bytes — i.e. `s` was never copied
+// out of it.
+fn aliases(s: []const u8, buf: []const u8) bool {
+    const p = @intFromPtr(s.ptr);
+    return p >= @intFromPtr(buf.ptr) and p < @intFromPtr(buf.ptr) + buf.len;
+}
+
+// The brief's tags test reads `h.last` while the editor is still ALIVE (it was
+// moved into `in_flight`, not freed), so it passes byte-for-byte even when the
+// segments still point straight into that buffer — `splitTags` allocates only
+// the outer slice. Asserting non-aliasing is what actually pins the dupe, and it
+// is deterministic where a free-then-read would depend on allocator internals.
+test "committed tag text is copied out of the editor buffer, not aliased into it" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..6) |_| try h.key(.down); // -> tags
+    try h.key(.enter);
+    for ("ops,urgent") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+
+    const typed = h.m.in_flight.commit.editor.line.text();
+    for (h.last.commit.content.tags) |tag| try std.testing.expect(!aliases(tag, typed));
+}
+
+// The title path has no brief test that commits at all (the empty-title one is
+// refused before a command exists), so both halves are pinned here: the typed
+// text reaches the command, and it is a copy rather than a view of the editor.
+test "committing a title sends the typed text, copied out of the editor buffer" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("ab", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter); // line editor, prefilled "ab", cursor at the end
+    for ("cd") |c| try h.key(.{ .char = c });
+    try h.key(.enter);
+
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("abcd", h.last.commit.content.title);
+    const typed = h.m.in_flight.commit.editor.line.text();
+    try std.testing.expectEqualStrings("abcd", typed);
+    try std.testing.expect(!aliases(h.last.commit.content.title, typed));
+}
+
+// `in_flight` holds the editor a failed commit has to restore (task 14), so
+// `Mode` must not acquire a SECOND one meanwhile — otherwise that restore either
+// leaks the newer editor or clobbers the user's newer text. Refusing to open one
+// is what makes "exactly one live editor" an invariant rather than a coincidence.
+test "a field cannot be opened for editing while a commit is in flight" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    for (0..3) |_| try h.key(.down);
+    try h.key(.enter);
+    try h.key(.down);
+    try h.key(.enter); // commit -> in flight, mode back to .field
+    try std.testing.expect(h.m.in_flight == .commit);
+
+    try h.key(.enter); // would open a second editor
+    try std.testing.expect(h.last == .none);
+    try std.testing.expectEqual(FieldId.priority, h.m.mode.field); // still .field
+    try std.testing.expect(h.m.status().len > 0);
 }
