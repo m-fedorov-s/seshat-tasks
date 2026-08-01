@@ -22,14 +22,24 @@ pub const FieldId = enum { title, description, status, priority, due, scheduled,
 pub const Editor = union(enum) {
     line: editors.LineEditor,
     pick: editors.PickEditor,
-    external,
+    // The description is edited OUT of process, so there is no in-process buffer
+    // to type into — but the text $EDITOR handed back is OWNED here (gpa), so a
+    // failed commit can give it back and Enter can retry it. Without that, the
+    // one field edited outside the TUI was the one field where a dropped
+    // connection cost the whole edit. `null` = nothing has come back yet.
+    external: ?[]const u8,
 
     pub fn deinit(self: *Editor, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .line => |*le| le.deinit(gpa),
-            .pick, .external => {},
+            .external => |retained| if (retained) |text| gpa.free(text),
+            .pick => {},
         }
-        self.* = .external;
+        // Retag to the empty variant so a second deinit is a no-op. NOTE: this is
+        // the ONE ownership site the exhaustive, else-less switches above cannot
+        // protect — it used to read `self.* = .external`, which stayed valid
+        // shorthand for a payload-carrying variant only by accident of syntax.
+        self.* = .{ .external = null };
     }
 };
 
@@ -428,7 +438,11 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
         // echo is the ONLY thing that changes what the user sees — there is no
         // optimistic write anywhere on the commit path.
         .commit_ok => |tasks| {
-            m.clearInFlight(); // the edit landed, so the editor it was built from is done
+            // Scoped to `.commit`, for the same reason `tasks_loaded`'s clear is
+            // scoped to `.refresh`: an unconditional clear would silently cancel
+            // whatever OTHER request happens to be outstanding, leaving its own
+            // reply with nothing expecting it.
+            if (m.in_flight == .commit) m.clearInFlight(); // the edit landed; the editor is done
             try mergeTasks(m, tasks);
             try recompute(m);
             try m.setStatus("saved", .{});
@@ -438,6 +452,10 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
         // costs one keystroke rather than a retype.
         .conflict => |tasks| {
             const f = restoreEditor(m);
+            // `restoreEditor` empties a `.commit` slot on its way past; any OTHER
+            // slot still has to be cleared here or the model jams "busy" forever
+            // and refuses every subsequent mutation.
+            m.clearInFlight();
             try mergeTasks(m, tasks);
             try recompute(m);
             if (f) |field| {
@@ -758,8 +776,8 @@ fn openEditor(allocator: std.mem.Allocator, m: *Model, f: FieldId) !Command {
         .due => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.due_at, m.offset_minutes)) },
         .scheduled => .{ .line = try editors.LineEditor.init(m.gpa, dateText(&date_buf, c.scheduled_at, m.offset_minutes)) },
         // A description is edited in $EDITOR — the shell runs it and reports back
-        // through `editor_returned`, so there is no in-process buffer to own.
-        .description => .external,
+        // through `editor_returned`, which is what fills in the retained text.
+        .description => .{ .external = null },
     };
     // Nothing below can fail, so `editor` cannot be stranded unowned.
     m.clearMode(); // frees whatever the outgoing mode owned
@@ -884,8 +902,17 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
     // (the editor `in_flight` holds is the one task 14 restores), not just policy.
     if (try refuseIfBusy(m)) return .none;
     // The external editor commits when it RETURNS (`editor_returned`), not on a
-    // key — there is no typed text here to build a patch from.
-    if (e.editor == .external) return .none;
+    // key — but the text it returned is retained, so Enter here RETRIES a commit
+    // the server rejected. It used to be a silent no-op with no status, which
+    // left a failed description edit in a frozen editor with no way forward
+    // except Escape, which threw the work away.
+    if (e.editor == .external) {
+        const retained = e.editor.external orelse {
+            try m.setStatus("nothing to save yet — the editor has not returned", .{});
+            return .none;
+        };
+        return commitDescription(m, e, retained);
+    }
 
     // `cursorTask` resolving proves `cursor_id` is non-null, which the id below
     // relies on.
@@ -944,21 +971,38 @@ fn finishCommit(m: *Model, e: *Editing, patch: *edit.Patch, target: Task) !Comma
 }
 
 // $EDITOR exited. `null` is a cancel — the user quit without saving, so nothing
-// is emitted and we step back up to the field. Text is the new description, and
-// it borrows the shell's buffer: `finishCommit`'s `ownPatch` copies it out before
-// this returns.
+// is emitted and we step back up to the field.
 fn editorReturned(m: *Model, e: *Editing, returned: ?[]const u8) !Command {
     const f = e.field; // read before anything can retag `m.mode` under `e`
     const text = returned orelse {
-        m.clearMode(); // `.external` owns nothing, but this is the sanctioned exit
+        m.clearMode(); // frees any previously retained text
         m.mode = .{ .field = f };
         return .none;
     };
     if (try refuseIfBusy(m)) return .none;
+
+    // `text` borrows the shell's buffer, which it frees the moment `update`
+    // returns — so OWN it, and own it on the editor rather than in a local. From
+    // the assignment below there is exactly one owner and every teardown path
+    // (clearMode, clearInFlight, deinit) already reclaims it; a local would be
+    // unowned on each of the early returns inside `commitDescription`.
+    const owned = try m.gpa.dupe(u8, text);
+    e.editor.deinit(m.gpa); // frees the text a previous round trip retained
+    e.editor = .{ .external = owned };
+
+    return commitDescription(m, e, owned);
+}
+
+// Commit the description held by an `.external` editor — shared by the first
+// round trip (`editorReturned`) and by Enter retrying a failed one.
+fn commitDescription(m: *Model, e: *Editing, text: []const u8) !Command {
     const target = cursorTask(m) orelse {
         try m.setStatus("that task no longer exists", .{});
         return .none;
     };
+    // `text` is the editor's own buffer, which moves into `in_flight` intact;
+    // `finishCommit`'s `ownPatch` still copies it into the live arena so the
+    // emitted Command does not alias an editor a later event may free.
     var patch = edit.Patch{ .description = .{ .set = text } };
     return finishCommit(m, e, &patch, target);
 }
@@ -2176,4 +2220,110 @@ test "a failed commit hands a line editor's heap buffer back intact and still ow
     try h.key(.enter);
     try std.testing.expect(h.last == .commit);
     try std.testing.expectEqualStrings("abcde", h.last.commit.content.title);
+}
+
+// The description is the one field edited OUT of process, so it used to be the
+// one field where a failed commit lost the work outright: the editor carried no
+// text, Enter on it was a silent no-op with no status, and Escape+re-enter
+// reseeded $EDITOR from the task's OLD description. `.external` now owns the
+// returned text, which makes "a dropped connection never costs a retype" true
+// here too. The source buffer is overwritten right after it is handed over,
+// because the shell frees its own buffer the moment `update` returns.
+test "a failed description commit retains the returned text and enter retries it" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.down); // -> description
+    try h.key(.enter); // -> .open_editor, editor is .external with nothing retained
+    try std.testing.expect(h.m.mode.editing.editor.external == null);
+
+    var from_shell = "a long body typed in $EDITOR".*;
+    try h.send(.{ .editor_returned = &from_shell });
+    @memset(from_shell[0..], 'X'); // the shell's buffer is gone the instant update returns
+    try std.testing.expect(h.last == .commit);
+
+    try h.send(.{ .request_failed = "connection reset" });
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expect(h.m.mode == .editing);
+    // The work survives, in a buffer the model owns.
+    try std.testing.expectEqualStrings("a long body typed in $EDITOR", h.m.mode.editing.editor.external.?);
+    try std.testing.expectEqualStrings("", h.m.tasks[0].content.description); // never optimistic
+
+    // Enter RETRIES from the retained text instead of being a silent no-op.
+    try h.key(.enter);
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqualStrings("a long body typed in $EDITOR", h.last.commit.content.description);
+    try std.testing.expect(h.m.in_flight == .commit);
+}
+
+// `tasks_loaded` clears `in_flight` only when the slot is `.refresh`. A blanket
+// clear there would FREE the editor an outstanding `.commit` still owes back,
+// and the model would have nothing to restore when that commit fails. No value
+// assertion on the refresh itself can see that (the freed union reads correctly),
+// so this drives the failure through to the restore and then writes to the buffer.
+test "a refresh landing mid-commit leaves the in-flight editor untouched" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("ab", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.enter);
+    try h.key(.enter); // title line editor, prefilled "ab"
+    for ("cd") |c| try h.key(.{ .char = c });
+    try h.key(.enter); // commit -> the editor moves into in_flight
+    try std.testing.expect(h.m.in_flight == .commit);
+
+    var refreshed = [_]Task{t("ab", .low, .todo, null, &.{})};
+    try h.send(.{ .tasks_loaded = &refreshed });
+    try std.testing.expect(h.m.in_flight == .commit); // NOT cancelled
+    try std.testing.expectEqualStrings("abcd", h.m.in_flight.commit.editor.line.text());
+
+    try h.send(.{ .request_failed = "connection reset" });
+    try std.testing.expectEqualStrings("abcd", h.m.mode.editing.editor.line.text());
+    try h.key(.{ .char = 'e' }); // still genuinely owned, not a freed copy
+    try std.testing.expectEqualStrings("abcde", h.m.mode.editing.editor.line.text());
+}
+
+// `.conflict` restores the editor out of a `.commit` slot — but any OTHER slot
+// must still be emptied, or the model stays "busy" forever and refuses every
+// later mutation. Unreachable until deletes are wired (tasks 15/18), which is
+// exactly why it needs pinning now rather than after it goes live.
+test "conflict clears an in-flight slot that carries no editor" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    h.m.in_flight = .{ .delete = .{ .id = try h.m.internId("a") } };
+
+    var fresh = [_]Task{t("a", .low, .todo, null, &.{})};
+    try h.send(.{ .conflict = &fresh });
+
+    try std.testing.expect(h.m.in_flight == .none);
+    try std.testing.expectEqual(Priority.low, h.m.tasks[0].content.priority);
+    // Still busy would refuse this outright.
+    try h.key(.{ .char = 'R' });
+    try std.testing.expect(h.last == .fetch);
+}
+
+// The mirror of the `tasks_loaded` scoping: a `commit_ok` answers the COMMIT
+// slot, so clearing unconditionally would silently cancel a refresh the shell
+// still has outstanding.
+test "commit_ok leaves an in-flight slot it is not the answer to" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+    try h.key(.{ .char = 'R' });
+    try std.testing.expect(h.m.in_flight == .refresh);
+
+    var echoed = [_]Task{t("a", .high, .todo, null, &.{})};
+    try h.send(.{ .commit_ok = &echoed });
+
+    try std.testing.expect(h.m.in_flight == .refresh);
+    try std.testing.expectEqual(Priority.high, h.m.tasks[0].content.priority);
 }
