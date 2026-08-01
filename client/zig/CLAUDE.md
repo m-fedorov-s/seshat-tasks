@@ -136,10 +136,14 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   the one-shot CLI:
   - **Caller-provided allocation.** `fetchTasks`/`addTask`/`updateTasks`/`deleteTask` all take an
     explicit `alloc` used for the connection, the URL, the response body and the parse. Tasks are
-    parsed `.allocate = .alloc_always`, so they do **not** alias the response body (which is freed
-    before returning). A TUI hands in a per-request arena and reclaims the lot; the CLI hands in
-    the process arena and never frees. Nothing is allocated from `self.allocator` except the
-    recorded error.
+    parsed `.allocate = .alloc_always`, so they do **not** alias the response body (which *is*
+    freed before returning — every transient allocation has a matching `alloc.free`). What differs
+    is who reclaims: a TUI hands in a per-request arena and resets it; the CLI hands in the process
+    arena, whose `free` is a no-op, so nothing is actually returned until exit. That asymmetry is
+    why the non-aliasing invariant needs its own tests — under the CLI an aliased task string still
+    reads correctly forever. `parseGet`/`parseAdd`/`parseConflict`/`updateResultFrom` exist as
+    separate functions so each parse site can be tested against a body that has been freed; do not
+    inline them. Nothing is allocated from `self.allocator` except the recorded error.
   - **Errors are data, not output.** A non-2xx response goes through `fail()`, which calls
     `recordError` and returns `error.ApiFailed`. Nothing is printed — inside an alt-screen TUI a
     stray stderr write corrupts the display. `lastError()` returns `?ApiError{code, message}`;

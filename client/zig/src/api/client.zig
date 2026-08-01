@@ -118,22 +118,14 @@ pub const Client = struct {
 
         const body = try resp.reader(&.{}).allocRemaining(alloc, .unlimited);
         defer alloc.free(body);
-        const parsed = try std.json.parseFromSliceLeaky(types.GetResponse, alloc, body, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        });
-        return parsed.tasks;
+        return parseGet(alloc, body);
     }
 
     pub fn addTask(self: *Client, alloc: std.mem.Allocator, content: types.Content, parent_id: ?[]const u8) !Task {
         const payload = types.AddRequest{ .content = content, .parent_id = parent_id };
         const res = try self.postJson(alloc, "/api/tasks/add", payload, &.{ .ok, .created });
         defer alloc.free(res.body);
-        const parsed = try std.json.parseFromSliceLeaky(types.AddResponse, alloc, res.body, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        });
-        return parsed.task;
+        return parseAdd(alloc, res.body);
     }
 
     // updateTasks sends an atomic batch with per-task expected_version. A 409 comes back
@@ -210,6 +202,39 @@ pub const Client = struct {
         return self.fail(resp.head.status, err_body);
     }
 };
+
+// ---------------------------------------------------------------------------------------
+// Response parsing.
+//
+// EVERY parse below uses `.allocate = .alloc_always`, and that is the single most important
+// invariant in this file. The default (.alloc_if_needed) hands back task strings that are
+// SLICES INTO the response body — and every caller frees the body immediately, or resets the
+// arena it came from. Under the CLI's process arena that bug is invisible (nothing is ever
+// reclaimed, so an aliased string reads correctly forever); under the TUI's per-request arena
+// it surfaces as corrupted titles mid-session, nowhere near this code.
+//
+// Each of these is a separate function purely so a test can feed it a body owned by its own
+// arena, destroy that arena, and then read the returned strings. Do not inline them back into
+// the request functions — that would make the invariant untestable again.
+// ---------------------------------------------------------------------------------------
+
+// parseGet: GET /api/tasks/get -> the task forest.
+fn parseGet(alloc: std.mem.Allocator, body: []const u8) ![]Task {
+    const parsed = try std.json.parseFromSliceLeaky(types.GetResponse, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    return parsed.tasks;
+}
+
+// parseAdd: POST /api/tasks/add -> the created task the server echoed back.
+fn parseAdd(alloc: std.mem.Allocator, body: []const u8) !Task {
+    const parsed = try std.json.parseFromSliceLeaky(types.AddResponse, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    return parsed.task;
+}
 
 // updateResultFrom turns a (status, body) pair into an UpdateResult. Split out of
 // updateTasks purely so the 409 branch is reachable from a unit test — the CLI refetches
@@ -337,14 +362,90 @@ test "parseConflict tasks do NOT alias the response body" {
     defer arena.deinit();
 
     var body_arena = std.heap.ArenaAllocator.init(a);
-    const body = try body_arena.allocator().dupe(u8,
-        \\{"conflicts":[{"id":"abc","content":{"title":"keep me","status":"todo","priority":"none","child_ids":[],"tags":[]},"meta":{"created_at":1,"updated_at":2,"version":9}}]}
+    const body = try std.fmt.allocPrint(
+        body_arena.allocator(),
+        "{{\"conflicts\":[{s}]}}",
+        .{alias_task_json},
     );
     const tasks = try parseConflict(arena.allocator(), body);
     body_arena.deinit(); // the body is GONE
 
-    try std.testing.expectEqualStrings("abc", tasks[0].id);
-    try std.testing.expectEqualStrings("keep me", tasks[0].content.title);
+    try expectOutlivedBody(tasks[0]);
+}
+
+// --- non-aliasing coverage for EVERY parse site that hands tasks to a caller ------------
+//
+// `.allocate = .alloc_always` is the property this whole rework exists to guarantee, and it
+// has to be pinned at each parse site independently: flipping any one of them back to
+// .alloc_if_needed still compiles, still round-trips, and is invisible under the CLI's
+// process arena. Each test below parses from a body owned by its OWN arena, destroys that
+// arena, and only then reads the strings — so an aliased result reads freed memory.
+//
+// If you add a parse that returns tasks, add a test here too.
+
+const alias_task_json =
+    \\{"id":"01ID","content":{"title":"keep me","description":"and me","status":"todo","priority":"none","child_ids":["kid"],"tags":["tag1"]},"meta":{"created_at":1,"updated_at":2,"version":9}}
+;
+
+// Every string on the task, not just the id — .alloc_if_needed aliases all of them.
+fn expectOutlivedBody(t: Task) !void {
+    try std.testing.expectEqualStrings("01ID", t.id);
+    try std.testing.expectEqualStrings("keep me", t.content.title);
+    try std.testing.expectEqualStrings("and me", t.content.description);
+    try std.testing.expectEqualStrings("kid", t.content.child_ids[0]);
+    try std.testing.expectEqualStrings("tag1", t.content.tags[0]);
+}
+
+test "fetched tasks do NOT alias the response body" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    var body_arena = std.heap.ArenaAllocator.init(a);
+    const body = try std.fmt.allocPrint(
+        body_arena.allocator(),
+        "{{\"state_version\":3,\"tasks\":[{s}]}}",
+        .{alias_task_json},
+    );
+    const tasks = try parseGet(arena.allocator(), body);
+    body_arena.deinit(); // the body is GONE
+
+    try std.testing.expectEqual(@as(usize, 1), tasks.len);
+    try expectOutlivedBody(tasks[0]);
+}
+
+test "the added task does NOT alias the response body" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    var body_arena = std.heap.ArenaAllocator.init(a);
+    const body = try std.fmt.allocPrint(
+        body_arena.allocator(),
+        "{{\"state_version\":3,\"task\":{s}}}",
+        .{alias_task_json},
+    );
+    const created = try parseAdd(arena.allocator(), body);
+    body_arena.deinit(); // the body is GONE
+
+    try expectOutlivedBody(created);
+}
+
+test "updateResultFrom .ok tasks do NOT alias the response body" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    var body_arena = std.heap.ArenaAllocator.init(a);
+    const body = try std.fmt.allocPrint(
+        body_arena.allocator(),
+        "{{\"state_version\":3,\"tasks\":[{s}]}}",
+        .{alias_task_json},
+    );
+    const res = try updateResultFrom(arena.allocator(), .ok, body);
+    body_arena.deinit(); // the body is GONE
+
+    try expectOutlivedBody(res.ok[0]);
 }
 
 test "parseConflict returns an empty slice for an unparseable body" {
