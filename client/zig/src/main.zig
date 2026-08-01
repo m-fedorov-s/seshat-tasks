@@ -467,4 +467,8 @@ test {
     // this import plus its own `refAllDecls` block is the ONLY thing that gets its
     // function bodies typechecked at all.
     _ = @import("tui/render.zig");
+    // Same story for app.zig: no tests of its own, and nothing in the exe graph
+    // reaches it until the `tui` subcommand exists. This import plus its own
+    // `refAllDecls` block is what typechecks the event loop at all.
+    _ = @import("tui/app.zig");
 }
