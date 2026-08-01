@@ -22,6 +22,11 @@ reachable from main's import graph. `src/main.zig` ends with a `test { _ = @impo
 … }` aggregator block precisely so `zig build test` exercises view/args/formatter/config. If you add
 a new test-bearing file, add it to that block (or run `zig test src/<file>.zig` directly).
 
+**Gotcha: `zig build test` does NOT typecheck the CLI.** A test build only analyzes decls reachable
+from a `test` block, and `main()`/`run()` are not — so `zig build test` can report "N/N tests
+passed" while `zig build` fails to compile `main.zig` and every `client.*` call site. Always run
+**both** `zig build` and `zig build test` before claiming a change is green.
+
 **Gotcha:** `zig test src/<file>.zig` only works for files directly under `src/`. For files under
 `src/api/*.zig` or `src/core/*.zig`, a bare `zig test` roots the module at that file's own
 directory, so its `@import`s of sibling top-level modules fail with `error: import of file outside
@@ -127,14 +132,29 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/core/task.zig` — `Task = { id, content, meta }` matching `schema/SCHEMA.md`. `Status`/
   `Priority` are string enums with an unknown-value `jsonParse` fallback.
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
-  No cache (scope A) — every fetch hits the server. `postJson` returns the response body; `addTask`
-  returns the created `Task` and `updateTasks` returns the updated `[]Task` (server echoes the
-  authoritative result — used by `--verbose`). 409 → `error.Conflict`. Every other non-2xx response
-  goes through `fail()`, which prints `server error (<code>): <message>` and returns
-  `error.Reported` — matching the client-wide error model. `<message>` is the server's own
-  `{"error": "..."}` body via `parseServerError`, falling back to `defaultMessage(code)` (a small
-  switch over the statuses Stage 0 introduced: 429/413/403/404, else a generic message) when the
-  body isn't parseable.
+  No cache (scope A) — every fetch hits the server. Written for a **long-lived caller**, not just
+  the one-shot CLI:
+  - **Caller-provided allocation.** `fetchTasks`/`addTask`/`updateTasks`/`deleteTask` all take an
+    explicit `alloc` used for the connection, the URL, the response body and the parse. Tasks are
+    parsed `.allocate = .alloc_always`, so they do **not** alias the response body (which is freed
+    before returning). A TUI hands in a per-request arena and reclaims the lot; the CLI hands in
+    the process arena and never frees. Nothing is allocated from `self.allocator` except the
+    recorded error.
+  - **Errors are data, not output.** A non-2xx response goes through `fail()`, which calls
+    `recordError` and returns `error.ApiFailed`. Nothing is printed — inside an alt-screen TUI a
+    stray stderr write corrupts the display. `lastError()` returns `?ApiError{code, message}`;
+    `clearError(alloc)` frees it (idempotent). **`ApiError.message` is OWNED**: `recordError`
+    *dupes* it, because `parseServerError` returns a slice into the body, and the body dies with
+    the per-request arena. `<message>` is the server's own `{"error": "..."}` text, falling back to
+    `defaultMessage(code)` (429/413/403/404, else generic). `main.zig` prints
+    `server error (<code>): <message>` itself via `reportApiError`, so CLI output is unchanged.
+  - **409 is an outcome, not an error.** `updateTasks` returns
+    `UpdateResult = union(enum){ ok: []Task, conflict: []Task }`. The server's conflict body already
+    carries the fresh tasks (`{"conflicts": [Task, …]}` — `types.ConflictResponse`), and there is
+    **no single-task GET endpoint**, so parsing it is the only way to reconcile without a full
+    refetch. `parseConflict` yields an empty slice for an unparseable body (OOM still propagates).
+    The status→result decision lives in the pure `updateResultFrom` so the 409 branch is unit
+    testable — no CLI invocation can reach it (the CLI refetches immediately before every update).
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by

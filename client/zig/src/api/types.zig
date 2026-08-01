@@ -42,3 +42,11 @@ pub const UpdateResponse = struct {
     state_version: u64 = 0,
     tasks: []Task,
 };
+
+// POST /api/tasks/update 409 response. The server's optimistic-concurrency failure
+// already carries the *fresh* server-side tasks (server/handlers.go: ConflictError ->
+// `{"conflicts": [Task, ...]}`), so a caller can resolve a conflict without refetching —
+// there is no single-task GET endpoint.
+pub const ConflictResponse = struct {
+    conflicts: []Task,
+};

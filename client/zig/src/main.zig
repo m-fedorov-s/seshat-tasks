@@ -41,6 +41,18 @@ fn stdoutErr(err: anyerror) anyerror {
     return if (err == error.WriteFailed) error.StdoutClosed else err;
 }
 
+// api/client.zig no longer prints: a non-2xx response is *recorded* on the Client (so a
+// future alt-screen TUI can put it in a status line instead of corrupting the display) and
+// surfaced as `error.ApiFailed`. The CLI's user-facing line is emitted here instead —
+// same text, same `error.Reported` → silent exit 1 as before. Any other error (network,
+// OOM) passes through untouched to main's catch-all.
+fn reportApiError(client: *Client, err: anyerror) anyerror {
+    if (err != error.ApiFailed) return err;
+    const e = client.lastError() orelse return err;
+    std.debug.print("server error ({d}): {s}\n", .{ e.code, e.message });
+    return error.Reported;
+}
+
 fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -86,18 +98,18 @@ fn run(init: std.process.Init) !void {
             std.debug.print("Usage: seshat delete <id>\n", .{});
             return error.Reported;
         }
-        const tasks = try client.fetchTasks();
+        const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(&client, err);
         const t = view.resolve(tasks, args[2]) catch |err| {
             reportResolveError(err, args[2]);
             return error.Reported;
         };
-        try client.deleteTask(t.id);
+        client.deleteTask(allocator, t.id) catch |err| return reportApiError(&client, err);
     } else if (std.mem.eql(u8, cmd, "done")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat done <id>\n", .{});
             return error.Reported;
         }
-        try markDone(&client, args[2]);
+        try markDone(allocator, &client, args[2]);
     } else if (std.mem.eql(u8, cmd, "update")) {
         try runUpdate(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -133,7 +145,7 @@ fn runShow(
     defer argparse.deinit(allocator, &parsed);
 
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s));
-    const tasks = try client.fetchTasks();
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     var idx = try view.Index.build(allocator, tasks);
     defer idx.deinit();
 
@@ -278,8 +290,8 @@ fn reportResolveError(err: view.ResolveError, id_prefix: []const u8) void {
 
 // markDone fetches fresh, resolves the id prefix, flips status to done, sends a
 // batch update with the current version. A conflict is reported plainly.
-fn markDone(client: *Client, id_prefix: []const u8) !void {
-    const tasks = try client.fetchTasks();
+fn markDone(allocator: std.mem.Allocator, client: *Client, id_prefix: []const u8) !void {
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     const t = view.resolve(tasks, id_prefix) catch |err| {
         reportResolveError(err, id_prefix);
         return error.Reported;
@@ -287,13 +299,16 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
     var content = t.content;
     content.status = .done;
     const ops = [_]types.UpdateOp{.{ .id = t.id, .content = content, .expected_version = t.meta.version }};
-    _ = client.updateTasks(&ops) catch |err| {
-        if (err == error.Conflict) {
+    const result = client.updateTasks(allocator, &ops) catch |err| return reportApiError(client, err);
+    switch (result) {
+        // The CLI refetched immediately above, so a conflict here means a genuine race
+        // with another writer; it has nothing useful to do with the fresh tasks.
+        .conflict => {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
             return error.Reported;
-        }
-        return err;
-    };
+        },
+        .ok => {},
+    }
 }
 
 fn runAdd(
@@ -334,7 +349,7 @@ fn runAdd(
         return;
     }
 
-    const created = try client.addTask(new_content, null);
+    const created = client.addTask(allocator, new_content, null) catch |err| return reportApiError(client, err);
     if (parsed.getBool("verbose")) {
         const one = [_]task.Task{created};
         try renderOne(allocator, init, out, client, &one, created, .compact, now);
@@ -370,7 +385,7 @@ fn runUpdate(
         return error.Reported;
     }
 
-    const tasks = try client.fetchTasks();
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     const t = view.resolve(tasks, id) catch |err| {
         reportResolveError(err, id);
         return error.Reported;
@@ -389,12 +404,15 @@ fn runUpdate(
     }
 
     const ops = [_]types.UpdateOp{.{ .id = t.id, .content = new_content, .expected_version = t.meta.version }};
-    const updated = client.updateTasks(&ops) catch |err| {
-        if (err == error.Conflict) {
+    const result = client.updateTasks(allocator, &ops) catch |err| return reportApiError(client, err);
+    const updated = switch (result) {
+        // As in markDone: this process refetched a moment ago, so the fresh tasks the 409
+        // carries add nothing the user can act on here. The TUI is the caller that uses them.
+        .conflict => {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
             return error.Reported;
-        }
-        return err;
+        },
+        .ok => |tasks_out| tasks_out,
     };
 
     if (parsed.getBool("verbose") and updated.len > 0) {
