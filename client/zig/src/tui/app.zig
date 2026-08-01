@@ -24,14 +24,18 @@
 //!     never on the request thread. Freeing it earlier is a use-after-free inside
 //!     the model; never freeing it is a leak per request.
 //!
-//! There are no unit tests here by design: a loop's behaviour is a terminal. The
-//! `test { refAllDecls }` at the bottom exists only to force the compiler to
-//! ANALYSE these function bodies — a test build analyses only what a `test` block
-//! reaches, and a bare `_ = @import(...)` does not force analysis of function
-//! bodies. `refAllDecls` references `run`, and every helper below is reachable
-//! from `run`, so a type error anywhere in this file fails `zig build test` with a
-//! reference trace. Keep it that way: a helper nothing calls is a helper nothing
-//! typechecks.
+//! Almost nothing here is unit tested, by design: a loop's behaviour is a
+//! terminal. The `test { refAllDecls }` at the bottom exists mainly to force the
+//! compiler to ANALYSE these function bodies — a test build analyses only what a
+//! `test` block reaches, and a bare `_ = @import(...)` does not force analysis of
+//! function bodies. `refAllDecls` only reaches `pub` decls, i.e. `run`, and every
+//! helper below is reachable from `run`, so a type error anywhere in this file
+//! fails `zig build test` with a reference trace. Keep it that way: a helper
+//! nothing calls is a helper nothing typechecks.
+//!
+//! The exception is the $EDITOR suspend, whose *decisions* (which editor, what
+//! counts as a cancel) were deliberately factored out of the terminal handling
+//! into pure functions so they can be tested at all — see the bottom of the file.
 //!
 //! Note on Ctrl-C: libvaxis's `makeRaw` clears `ISIG`, so Ctrl-C arrives as an
 //! ordinary keypress rather than a signal. `q` (handled by the model) is the way
@@ -206,6 +210,233 @@ fn runRequest(client: *api.Client, loop: *Loop, req: *Request, job: Job) void {
     loop.postEvent(.{ .result = .{ .req = req, .event = ev } }) catch {};
 }
 
+// ─── the external editor ─────────────────────────────────────────────────────
+
+// The parts of the shell that only `.open_editor` needs: the terminal it hands
+// over, the environment it reads $VISUAL/$EDITOR out of, and the model it seeds
+// the buffer from. Bundled so `execute` keeps a signature a human can read.
+const Shell = struct {
+    tty: *vaxis.Tty,
+    vx: *vaxis.Vaxis,
+    env: *const std.process.Environ.Map,
+    m: *const model.Model,
+};
+
+// A description is task text, not a document. A megabyte is a generous ceiling
+// that still refuses to slurp whatever the user pointed $EDITOR at by mistake.
+const max_description_bytes = 1024 * 1024;
+
+// The text $EDITOR last handed back, when this descent is a RETRY rather than a
+// first open. Seeding a retry from the SERVER's description would silently
+// replace the user's work with the value they were editing away from — the one
+// field edited outside the TUI would be the one field where a dropped
+// connection costs the whole edit.
+//
+// HONEST NOTE: on every path `model.zig` has TODAY this returns null, because
+// `openEditor` builds a fresh `.{ .external = null }` on each descent from the
+// field level — Escape is a deliberate discard, and the lossless retry is Enter
+// on the restored editor, which never re-enters $EDITOR at all. This is the
+// guard that keeps that from silently becoming a data-loss bug if a later task
+// adds a "reopen the editor" key.
+fn retainedText(m: *const model.Model) ?[]const u8 {
+    if (m.mode != .editing) return null;
+    const e = m.mode.editing;
+    if (e.field != .description) return null;
+    if (e.editor != .external) return null;
+    return e.editor.external;
+}
+
+// $VISUAL, then $EDITOR, then `vi` — the conventional chain, most specific
+// first: $VISUAL is the full-screen editor, which is exactly what a terminal we
+// have just handed back wants. An EMPTY value counts as unset, because `EDITOR=`
+// is how a shell profile disables one and spawning "" would only fail.
+fn editorCommand(env: *const std.process.Environ.Map) []const u8 {
+    if (nonEmpty(env.get("VISUAL"))) |v| return v;
+    if (nonEmpty(env.get("EDITOR"))) |v| return v;
+    return "vi";
+}
+
+fn nonEmpty(v: ?[]const u8) ?[]const u8 {
+    const s = v orelse return null;
+    return if (s.len == 0) null else s;
+}
+
+// The cancel decision, kept pure so it can be tested without a terminal: a
+// non-zero exit (or a killed editor) and text that came back unchanged are both
+// "the user did not ask for this to be saved" (spec §5).
+fn editedText(term: std.process.Child.Term, initial: []const u8, text: []const u8) ?[]const u8 {
+    if (term != .exited or term.exited != 0) return null;
+    if (std.mem.eql(u8, text, initial)) return null;
+    return text;
+}
+
+// DELIBERATE DEVIATION from the letter of "byte-identical". Nearly every editor
+// terminates the last line on save, so a description seeded WITHOUT a trailing
+// newline comes back WITH one even when the user typed nothing — which would
+// make the very first `$EDITOR` visit to every task a spurious commit that
+// appends a blank line. One trailing newline is file-format convention, not
+// content, so it is dropped before both the comparison and the commit.
+fn stripFinalNewline(text: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, text, "\n")) return text[0 .. text.len - 1];
+    return text;
+}
+
+// A single-use path in the system temp directory. UNPREDICTABLE by
+// construction: a fixed or pid-derived name in a world-writable directory is a
+// symlink-attack target — whoever wins the race owns whatever the create call
+// then follows. 128 bits of CSPRNG entropy from `io.random` (0.16 has no
+// `std.crypto.random`; entropy comes off the `std.Io` instance, and a
+// clock-seeded `DefaultPrng` would be guessable by exactly the attacker who
+// cares) plus `.exclusive` on the create, so a name that somehow already exists
+// is an error rather than a silent hijack.
+fn tempPath(io: std.Io, alloc: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+    const dir = nonEmpty(env.get("TMPDIR")) orelse "/tmp";
+    var bytes: [16]u8 = undefined;
+    io.random(&bytes);
+    const nonce = std.mem.readInt(u128, &bytes, .little);
+    return std.fmt.allocPrint(alloc, "{s}/seshat-{x}.md", .{ dir, nonce });
+}
+
+// Take the terminal back. Deliberately infallible: it runs from a `defer` on
+// every path out of `runEditor`, including the failing ones, and there is
+// nothing useful to do with an error — a complaint about a terminal we could not
+// restore would be printed into that same terminal.
+//
+// KNOWN HAZARD, documented rather than fixed: if `Tty.init` fails here, `tty.*`
+// still holds the CLOSED handle from `runEditor`'s `deinit` and `run`'s own
+// `defer tty.deinit()` will close it a second time. Reaching it means /dev/tty
+// stopped being openable mid-session; the next `vx.render` then fails on the
+// dead handle and `run` unwinds, which is the least-bad end available.
+fn resumeTui(io: std.Io, tty: *vaxis.Tty, vx: *vaxis.Vaxis, loop: *Loop, tty_buf: []u8) void {
+    tty.* = vaxis.Tty.init(io, tty_buf) catch |err| {
+        std.log.err("could not reacquire the terminal: {s}", .{@errorName(err)});
+        return;
+    };
+    vx.enterAltScreen(tty.writer()) catch {};
+    loop.start() catch {};
+    // Separate from `start()` — see client/zig/CLAUDE.md. A no-op today (the
+    // Loop remembers `resize_handler_installed` across a stop/start, and
+    // `Tty.deinit` does not clear vaxis's process-global handler), kept so this
+    // is a true mirror of `run`'s startup and stays correct if either does.
+    loop.installResizeHandler() catch {};
+    // `smcup` hands back a CLEARED alt-screen buffer, but `vx.screen_last` still
+    // describes what was on it before the suspend — so the next diff would emit
+    // almost nothing onto a blank screen. Force a full repaint.
+    vx.queueRefresh();
+    // And the terminal may have been RESIZED while the editor owned it: the
+    // SIGWINCH that reported it hit a closed handle. Re-report it through the
+    // path the loop already has, which reallocates the screen and the model's
+    // viewport together.
+    if (tty.getWinsize()) |ws| {
+        loop.postEvent(.{ .winsize = ws }) catch {};
+    } else |_| {}
+}
+
+/// Suspend the TUI, hand the terminal to the user's editor, and take it back.
+///
+/// Returns the edited text (allocated from `alloc`), or `null` for CANCEL — the
+/// editor exited non-zero, or the text came back unchanged (spec §5).
+///
+/// There is no vaxis suspend API; this composes one, and the ORDER is the whole
+/// function. Two steps produce symptoms that surface nowhere near their cause:
+///
+///  1. **`loop.stop()` FIRST**, before anything is spawned. `stop` unblocks its
+///     reader thread by writing a device-status-report and letting that thread
+///     consume the terminal's reply. Spawn first and the EDITOR consumes the
+///     reply instead — a stray escape sequence in its input, and a terminal that
+///     misbehaves long after this function returned.
+///  2. **`tty.deinit()` before the re-init.** `vaxis.Tty.init` installs a
+///     process-global SIGWINCH handler and parks the Tty in a `global_tty`
+///     singleton, so the old one has to be dead before a new one exists.
+///
+/// Everything after the `deinit` is wrapped. The resume runs from a `defer`, so
+/// a temp file that will not open, a child that will not spawn and a read that
+/// fails all still leave the user in a live TUI; the unlink runs from an
+/// `errdefer`, so none of them leave task text sitting in /tmp.
+fn runEditor(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    sh: Shell,
+    loop: *Loop,
+    initial: []const u8,
+) !?[]const u8 {
+    const tty = sh.tty;
+    const vx = sh.vx;
+
+    // 1. Stop reading the tty before anything else can read it.
+    loop.stop();
+
+    // 2. Give the terminal back. The write buffer belongs to `run`'s frame and
+    // outlives both Ttys, so capture it now — the re-init needs that same
+    // storage, and a buffer owned by THIS frame would dangle the moment we
+    // returned.
+    const tty_buf = tty.writer().buffer;
+    try vx.exitAltScreen(tty.writer());
+    tty.deinit();
+
+    // 5, registered before 3 and 4 can fail. Runs last on every path out.
+    defer resumeTui(io, tty, vx, loop, tty_buf);
+
+    // 3. The temp file: 0600 so task text never sits in a world-readable /tmp,
+    // exclusive so an attacker cannot have pre-placed the name, and seeded with
+    // the BARE description — no comment header to strip back off.
+    const path = try tempPath(io, alloc, sh.env);
+    const seed_file = try std.Io.Dir.cwd().createFile(io, path, .{
+        .exclusive = true,
+        // `Permissions` is a non-exhaustive enum over the platform's mode type;
+        // 0o600 is `-rw-------`.
+        .permissions = @enumFromInt(0o600),
+    });
+    // The file exists from here on, so every exit has to take it away again —
+    // registered before the seeding write, which can fail with it already there.
+    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        defer seed_file.close(io);
+        try seed_file.writeStreamingAll(io, initial);
+    }
+
+    // 4. The editor owns the terminal for the duration — `.inherit` on all three
+    // streams is what makes it a full-screen editor rather than something
+    // drawing into a pipe. It is spelled out rather than defaulted because it is
+    // the point. `argv[0]` is resolved against the parent's PATH.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ editorCommand(sh.env), path },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
+
+    // 6. Read it back, then remove it whatever the answer turns out to be. The
+    // editor may well have replaced the inode rather than rewritten it (vim's
+    // default `backupcopy` renames), so this reopens the PATH rather than
+    // rewinding the handle above.
+    const raw = blk: {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        var file_reader = file.reader(io, &.{});
+        break :blk try file_reader.interface.allocRemaining(alloc, .limited(max_description_bytes));
+    };
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    return editedText(term, initial, stripFinalNewline(raw));
+}
+
+// ─── executing commands ──────────────────────────────────────────────────────
+
+// A request arena, on the pending list before anything can fail with it
+// half-built. After this returns, the LIST owns `req`: `retire` frees it once
+// its event has been consumed, and `drainRequests` frees it at shutdown if no
+// event ever arrives — so no caller needs an errdefer of its own.
+fn newRequest(gpa: std.mem.Allocator, pending: *std.ArrayList(*Request)) !*Request {
+    const req = try gpa.create(Request);
+    errdefer gpa.destroy(req);
+    req.* = .{ .arena = .init(gpa) };
+    errdefer req.arena.deinit();
+    try pending.append(gpa, req);
+    return req;
+}
+
 // Execute the side effect `update` asked for.
 //
 // HAZARD 2 lives here: `cmd`'s payloads borrow from the model, and the next
@@ -218,26 +449,46 @@ fn execute(
     client: *api.Client,
     loop: *Loop,
     pending: *std.ArrayList(*Request),
+    sh: Shell,
     cmd: model.Command,
 ) !void {
     switch (cmd) {
         .none, .quit => return,
-        // ── Task 19 seam ────────────────────────────────────────────────────
-        // `.open_editor` suspends the TUI, runs $EDITOR on a temp file, resumes,
-        // and feeds the result back as `.editor_returned`. It is NOT a network
-        // request and must not take a request arena or a worker thread — it has
-        // to happen ON the loop thread, between two renders, because it hands the
-        // terminal over. Task 19 owns it. Until then it is dropped: the model is
-        // left in `.editing` with an empty `.external`, whose own Enter path
-        // already says "nothing to save yet" and whose Escape backs out cleanly.
-        .open_editor => return,
+        // `.open_editor` is NOT a network request: it hands the terminal over,
+        // so it must run ON the loop thread, between two renders, and must never
+        // touch a worker. It still reports back through an EVENT rather than
+        // calling `update` itself, so the one place events are consumed stays
+        // the one place events are consumed.
+        .open_editor => |o| {
+            const req = try newRequest(gpa, pending);
+            const a = req.arena.allocator();
+            const seed = retainedText(sh.m) orelse o.initial;
+            const text = runEditor(io, a, sh, loop, seed) catch |err| {
+                // A $EDITOR that will not start is a typo in a shell profile,
+                // not a reason to tear the session down — and `runEditor`'s own
+                // `defer` has already put the terminal back. End the descent as
+                // a cancel so the user is not parked in an empty editor, then
+                // say why. TWO requests because `retire` frees an arena as soon
+                // as its event is consumed, and the message lives in one.
+                const failure = try newRequest(gpa, pending);
+                const msg = try std.fmt.allocPrint(
+                    failure.arena.allocator(),
+                    "could not run the editor ({s})",
+                    .{@errorName(err)},
+                );
+                try loop.postEvent(.{ .result = .{ .req = req, .event = .{ .editor_returned = null } } });
+                try loop.postEvent(.{ .result = .{ .req = failure, .event = .{ .request_failed = msg } } });
+                return;
+            };
+            // `text` is arena-allocated, so it is alive until `retire` frees the
+            // arena — which the loop only does after `update` has copied it.
+            try loop.postEvent(.{ .result = .{ .req = req, .event = .{ .editor_returned = text } } });
+            return;
+        },
         else => {},
     }
 
-    const req = try gpa.create(Request);
-    errdefer gpa.destroy(req);
-    req.* = .{ .arena = .init(gpa) };
-    errdefer req.arena.deinit();
+    const req = try newRequest(gpa, pending);
     const a = req.arena.allocator();
 
     const job: Job = switch (cmd) {
@@ -252,11 +503,13 @@ fn execute(
         .none, .quit, .open_editor => unreachable, // returned above
     };
 
-    // Registered BEFORE the call: `io.async` is allowed to run the function
-    // inline (single-threaded builds, or when the thread pool is exhausted), in
-    // which case the result event is already posted by the time it returns.
-    try pending.append(gpa, req);
-    // Nothing below can fail, so `req` is never stranded off the pending list.
+    // The request is already on the pending list, which matters because
+    // `io.async` is allowed to run the function inline (single-threaded builds,
+    // or an exhausted thread pool), in which case the result event is already
+    // posted by the time it returns.
+    //
+    // Nothing between here and the assignment can fail, so `req` is never
+    // stranded with a future the loop will not await.
     req.future = io.async(runRequest, .{ client, loop, req, job });
 }
 
@@ -356,6 +609,11 @@ pub fn run(
     var vx = try vaxis.init(io, gpa, env_map, .{});
     defer vx.deinit(gpa, tty.writer());
 
+    // The terminal, the environment and the model, for the one command that
+    // needs them: `.open_editor`. Built once — every field is a pointer to
+    // something that outlives the loop below.
+    const sh: Shell = .{ .tty = &tty, .vx = &vx, .env = env_map, .m = &m };
+
     // `Loop` has a required `init` (its 512-deep queue has no default), so the
     // struct-literal form does not compile.
     var loop: Loop = .init(io, &tty, &vx);
@@ -394,7 +652,7 @@ pub fn run(
     // otherwise `R` could start a second concurrent fetch, and two workers would
     // race on the Client's recorded error. `tasks_loaded` clears it again.
     m.in_flight = .refresh;
-    try execute(io, gpa, client, &loop, &pending, .fetch);
+    try execute(io, gpa, client, &loop, &pending, sh, .fetch);
 
     render.draw(vx.window(), &m);
     try vx.render(tty.writer());
@@ -431,7 +689,7 @@ pub fn run(
             // reading from on the line above.
             if (finished) |req| retire(io, gpa, &pending, req);
             if (cmd == .quit) break;
-            try execute(io, gpa, client, &loop, &pending, cmd);
+            try execute(io, gpa, client, &loop, &pending, sh, cmd);
         } else if (finished) |req| {
             // Unreachable today (a `.result` always carries an event), but the
             // arena must not depend on that staying true.
@@ -444,10 +702,65 @@ pub fn run(
 }
 
 test {
-    // No unit tests here by design — see the file comment. This block is the ONLY
-    // thing that gets these function bodies typechecked: a test build analyses
-    // only what a `test` block reaches, and nothing in the executable graph
-    // imports this file until the `tui` subcommand is wired up. `refAllDecls`
-    // references `run`, and every helper above is reachable from `run`.
+    // Almost no unit tests here by design — see the file comment. This block is
+    // the ONLY thing that gets these function bodies typechecked: a test build
+    // analyses only what a `test` block reaches, and nothing in the executable
+    // graph imports this file until the `tui` subcommand is wired up.
+    // `refAllDecls` references `run`, and every helper above is reachable from
+    // `run`.
     std.testing.refAllDecls(@This());
+}
+
+// The three DECISIONS inside the $EDITOR suspend that are not about the
+// terminal — which editor to run, what counts as a cancel, and what counts as
+// content. They are pure by construction so they can be checked here, because
+// the rest of `runEditor` can only be checked by a human at a real terminal and
+// these are exactly the parts that human is least likely to notice going wrong.
+
+test "the editor is \\$VISUAL, then \\$EDITOR, then vi" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+
+    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+
+    try env.put("EDITOR", "nano");
+    try std.testing.expectEqualStrings("nano", editorCommand(&env));
+
+    try env.put("VISUAL", "hx");
+    try std.testing.expectEqualStrings("hx", editorCommand(&env));
+
+    // `VISUAL=` is how a profile turns one off; it must fall THROUGH rather than
+    // being spawned as the empty string.
+    try env.put("VISUAL", "");
+    try std.testing.expectEqualStrings("nano", editorCommand(&env));
+    try env.put("EDITOR", "");
+    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+}
+
+test "a non-zero exit and unchanged text are both cancels" {
+    // The happy path: exit 0 and the text moved.
+    try std.testing.expectEqualStrings("new", editedText(.{ .exited = 0 }, "old", "new").?);
+
+    // `:cq` in vim, or an editor that could not write.
+    try std.testing.expect(editedText(.{ .exited = 1 }, "old", "new") == null);
+    // Killed, so it never got to decide anything.
+    try std.testing.expect(editedText(.{ .unknown = 9 }, "old", "new") == null);
+    // Saved without changing anything: not a commit, and specifically not a
+    // commit that would bump `updated_at` for nothing.
+    try std.testing.expect(editedText(.{ .exited = 0 }, "same", "same") == null);
+    // Emptying the description IS a change.
+    try std.testing.expectEqualStrings("", editedText(.{ .exited = 0 }, "old", "").?);
+}
+
+test "one trailing newline is file format, not description content" {
+    // The case that matters: seeded without a newline, saved untouched, and the
+    // editor terminated the last line. That has to still be a cancel.
+    try std.testing.expect(editedText(.{ .exited = 0 }, "body", stripFinalNewline("body\n")) == null);
+
+    // Only ONE, so a deliberate blank last line survives.
+    try std.testing.expectEqualStrings("body\n", stripFinalNewline("body\n\n"));
+    try std.testing.expectEqualStrings("body", stripFinalNewline("body"));
+    try std.testing.expectEqualStrings("", stripFinalNewline("\n"));
+    try std.testing.expectEqualStrings("", stripFinalNewline(""));
 }
