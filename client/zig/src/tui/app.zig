@@ -217,6 +217,13 @@ fn runRequest(client: *api.Client, loop: *Loop, req: *Request, job: Job) void {
 // the buffer from. Bundled so `execute` keeps a signature a human can read.
 const Shell = struct {
     tty: *vaxis.Tty,
+    // TTY OWNERSHIP. `vaxis.Tty` has no "already closed" state — `deinit` calls
+    // `tcsetattr` and `close` unconditionally — so the one thing that closes it
+    // and reopens it has to say whether the reopen worked. True iff `tty` holds
+    // an open handle; `run`'s teardown closes it only then, because closing the
+    // same descriptor twice can take out an unrelated one a worker has since
+    // opened.
+    tty_live: *bool,
     vx: *vaxis.Vaxis,
     env: *const std.process.Environ.Map,
     m: *const model.Model,
@@ -248,17 +255,45 @@ fn retainedText(m: *const model.Model) ?[]const u8 {
 
 // $VISUAL, then $EDITOR, then `vi` — the conventional chain, most specific
 // first: $VISUAL is the full-screen editor, which is exactly what a terminal we
-// have just handed back wants. An EMPTY value counts as unset, because `EDITOR=`
-// is how a shell profile disables one and spawning "" would only fail.
+// have just handed back wants.
 fn editorCommand(env: *const std.process.Environ.Map) []const u8 {
-    if (nonEmpty(env.get("VISUAL"))) |v| return v;
-    if (nonEmpty(env.get("EDITOR"))) |v| return v;
+    if (nonBlank(env.get("VISUAL"))) |v| return v;
+    if (nonBlank(env.get("EDITOR"))) |v| return v;
     return "vi";
 }
 
-fn nonEmpty(v: ?[]const u8) ?[]const u8 {
-    const s = v orelse return null;
+// Blank counts as unset: `EDITOR=` is how a shell profile disables one, and
+// there is nothing in `"   "` to spawn either.
+fn nonBlank(v: ?[]const u8) ?[]const u8 {
+    const s = std.mem.trim(u8, v orelse return null, " \t");
     return if (s.len == 0) null else s;
+}
+
+// The editor plus the file, as argv.
+//
+// The configured value is SPLIT ON WHITESPACE, because `EDITOR="code --wait"`,
+// `EDITOR="nvim -u NONE"` and `EDITOR="emacsclient -nw"` are ordinary settings,
+// not exotic ones — treating the whole string as one program name turns any of
+// them into an opaque spawn failure at the moment the user tries to edit.
+//
+// LIMIT, deliberate: this is a plain split, not a shell. A value whose arguments
+// contain quoted embedded spaces (`EDITOR='code --wait --user-data-dir "/my
+// dir"'`) is not supported and will be split mid-argument. Real quoting means
+// either a parser or handing the string to `sh -c`, and `sh -c` would put a
+// shell between the user and their terminal for the sake of a rare case.
+fn editorArgv(
+    alloc: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    path: []const u8,
+) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    // `tokenizeAny` drops empty tokens, so runs of spaces collapse on their own.
+    var words = std.mem.tokenizeAny(u8, editorCommand(env), " \t");
+    while (words.next()) |word| try argv.append(alloc, word);
+    // `editorCommand` never returns blank, so there is always at least one word
+    // before this and `argv[0]` is never the file itself.
+    try argv.append(alloc, path);
+    return argv.toOwnedSlice(alloc);
 }
 
 // The cancel decision, kept pure so it can be tested without a terminal: a
@@ -290,7 +325,7 @@ fn stripFinalNewline(text: []const u8) []const u8 {
 // cares) plus `.exclusive` on the create, so a name that somehow already exists
 // is an error rather than a silent hijack.
 fn tempPath(io: std.Io, alloc: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
-    const dir = nonEmpty(env.get("TMPDIR")) orelse "/tmp";
+    const dir = nonBlank(env.get("TMPDIR")) orelse "/tmp";
     var bytes: [16]u8 = undefined;
     io.random(&bytes);
     const nonce = std.mem.readInt(u128, &bytes, .little);
@@ -302,16 +337,20 @@ fn tempPath(io: std.Io, alloc: std.mem.Allocator, env: *const std.process.Enviro
 // nothing useful to do with an error — a complaint about a terminal we could not
 // restore would be printed into that same terminal.
 //
-// KNOWN HAZARD, documented rather than fixed: if `Tty.init` fails here, `tty.*`
-// still holds the CLOSED handle from `runEditor`'s `deinit` and `run`'s own
-// `defer tty.deinit()` will close it a second time. Reaching it means /dev/tty
-// stopped being openable mid-session; the next `vx.render` then fails on the
-// dead handle and `run` unwinds, which is the least-bad end available.
-fn resumeTui(io: std.Io, tty: *vaxis.Tty, vx: *vaxis.Vaxis, loop: *Loop, tty_buf: []u8) void {
+// `sh.tty_live` is the whole reason this can fail safely. It is FALSE on entry
+// (`runEditor` closed the handle) and only goes true again once a new one
+// exists, so a failed re-init leaves `run`'s teardown correctly believing there
+// is nothing left to close. The session is over either way — the next
+// `vx.render` writes to a dead handle, fails, and unwinds `run` — but it ends
+// without closing a descriptor a worker may since have been given.
+fn resumeTui(io: std.Io, sh: Shell, loop: *Loop, tty_buf: []u8) void {
+    const tty = sh.tty;
+    const vx = sh.vx;
     tty.* = vaxis.Tty.init(io, tty_buf) catch |err| {
         std.log.err("could not reacquire the terminal: {s}", .{@errorName(err)});
         return;
     };
+    sh.tty_live.* = true;
     vx.enterAltScreen(tty.writer()) catch {};
     loop.start() catch {};
     // Separate from `start()` — see client/zig/CLAUDE.md. A no-op today (the
@@ -373,9 +412,14 @@ fn runEditor(
     const tty_buf = tty.writer().buffer;
     try vx.exitAltScreen(tty.writer());
     tty.deinit();
+    // The handle is gone and nothing has replaced it yet. Held false across the
+    // whole editor run, not just across the re-init, so the invariant reads
+    // "`tty_live` is true iff `tty` holds an open handle" at every instant —
+    // including a panic while the editor is up.
+    sh.tty_live.* = false;
 
     // 5, registered before 3 and 4 can fail. Runs last on every path out.
-    defer resumeTui(io, tty, vx, loop, tty_buf);
+    defer resumeTui(io, sh, loop, tty_buf);
 
     // 3. The temp file: 0600 so task text never sits in a world-readable /tmp,
     // exclusive so an attacker cannot have pre-placed the name, and seeded with
@@ -400,7 +444,7 @@ fn runEditor(
     // drawing into a pipe. It is spelled out rather than defaulted because it is
     // the point. `argv[0]` is resolved against the parent's PATH.
     var child = try std.process.spawn(io, .{
-        .argv = &.{ editorCommand(sh.env), path },
+        .argv = try editorArgv(alloc, sh.env, path),
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -604,15 +648,23 @@ pub fn run(
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
-    defer tty.deinit();
+    // `runEditor` CLOSES this handle and opens a new one in its place, so the
+    // teardown cannot be an unconditional `deinit`: if the reopen failed, `tty`
+    // is a struct wrapped around a descriptor that is already gone, and closing
+    // it again could take out one a worker has since been handed. `vaxis.Tty`
+    // has no closed state of its own, so the flag is where that lives.
+    var tty_live = true;
+    defer if (tty_live) tty.deinit();
 
     var vx = try vaxis.init(io, gpa, env_map, .{});
+    // Safe on a dead handle: `Vaxis.deinit` runs its terminal reset through
+    // `resetState(tty) catch {}` and swallows the write failure.
     defer vx.deinit(gpa, tty.writer());
 
     // The terminal, the environment and the model, for the one command that
     // needs them: `.open_editor`. Built once — every field is a pointer to
     // something that outlives the loop below.
-    const sh: Shell = .{ .tty = &tty, .vx = &vx, .env = env_map, .m = &m };
+    const sh: Shell = .{ .tty = &tty, .tty_live = &tty_live, .vx = &vx, .env = env_map, .m = &m };
 
     // `Loop` has a required `init` (its 512-deep queue has no default), so the
     // struct-literal form does not compile.
@@ -736,6 +788,46 @@ test "the editor is \\$VISUAL, then \\$EDITOR, then vi" {
     try std.testing.expectEqualStrings("nano", editorCommand(&env));
     try env.put("EDITOR", "");
     try std.testing.expectEqualStrings("vi", editorCommand(&env));
+
+    // Whitespace-only is blank too — and would otherwise split into NO words,
+    // leaving the temp file itself as `argv[0]`.
+    try env.put("EDITOR", "  \t ");
+    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+}
+
+test "a configured editor with flags becomes separate argv entries" {
+    const a = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+
+    // The default: one word, then the file.
+    {
+        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        defer a.free(argv);
+        try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "vi", "/tmp/x.md" }), argv);
+    }
+
+    // The case a single-word spawn breaks on. `code --wait` is not exotic.
+    try env.put("EDITOR", "code --wait");
+    {
+        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        defer a.free(argv);
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{ "code", "--wait", "/tmp/x.md" }),
+            argv,
+        );
+    }
+
+    // Surrounding and repeated whitespace must not produce empty argv entries.
+    try env.put("VISUAL", "  nvim   -u   NONE  ");
+    {
+        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        defer a.free(argv);
+        try std.testing.expectEqualDeep(
+            @as([]const []const u8, &.{ "nvim", "-u", "NONE", "/tmp/x.md" }),
+            argv,
+        );
+    }
 }
 
 test "a non-zero exit and unchanged text are both cancels" {
