@@ -224,6 +224,13 @@ const Shell = struct {
     // same descriptor twice can take out an unrelated one a worker has since
     // opened.
     tty_live: *bool,
+    // Set by `resumeTui` when taking the terminal back after $EDITOR failed, and
+    // checked by `run`'s loop before it blocks again. Either failure (no handle,
+    // or a handle with no reader thread behind it) makes the NEXT `nextEvent()`
+    // block forever on an empty queue — in raw mode, where Ctrl-C is not a signal
+    // (`makeRaw` clears ISIG), so the session could only be ended from another
+    // terminal. This flag is what turns that hang into an exit.
+    lost: *bool,
     vx: *vaxis.Vaxis,
     env: *const std.process.Environ.Map,
     m: *const model.Model,
@@ -348,11 +355,24 @@ fn resumeTui(io: std.Io, sh: Shell, loop: *Loop, tty_buf: []u8) void {
     const vx = sh.vx;
     tty.* = vaxis.Tty.init(io, tty_buf) catch |err| {
         std.log.err("could not reacquire the terminal: {s}", .{@errorName(err)});
+        sh.lost.* = true;
         return;
     };
     sh.tty_live.* = true;
     vx.enterAltScreen(tty.writer()) catch {};
-    loop.start() catch {};
+    loop.start() catch |err| {
+        // The one failure that USED to hang. `start` spawns the thread that reads
+        // the tty and fills the queue; without it the queued `editor_returned` is
+        // drained and then `nextEvent()` blocks forever on an empty queue, in raw
+        // mode with no signal to interrupt it. Give the terminal back NOW (this
+        // handle is real, so it must be closed or the shell is left raw) and tell
+        // `run` to stop. `loop.stop()` is a no-op when `start` never spawned.
+        std.log.err("could not restart the input loop: {s}", .{@errorName(err)});
+        tty.deinit();
+        sh.tty_live.* = false;
+        sh.lost.* = true;
+        return;
+    };
     // Separate from `start()` — see client/zig/CLAUDE.md. A no-op today (the
     // Loop remembers `resize_handler_installed` across a stop/start, and
     // `Tty.deinit` does not clear vaxis's process-global handler), kept so this
@@ -681,7 +701,10 @@ pub fn run(
     // The terminal, the environment and the model, for the one command that
     // needs them: `.open_editor`. Built once — every field is a pointer to
     // something that outlives the loop below.
-    const sh: Shell = .{ .tty = &tty, .tty_live = &tty_live, .vx = &vx, .env = env_map, .m = &m };
+    // Set only by `resumeTui`, only on a failure that would leave the loop with
+    // nothing to wake it. See `Shell.lost`.
+    var lost = false;
+    const sh: Shell = .{ .tty = &tty, .tty_live = &tty_live, .lost = &lost, .vx = &vx, .env = env_map, .m = &m };
 
     // `Loop` has a required `init` (its 512-deep queue has no default), so the
     // struct-literal form does not compile.
@@ -759,6 +782,13 @@ pub fn run(
             if (finished) |req| retire(io, gpa, &pending, req);
             if (cmd == .quit) break;
             try execute(io, gpa, client, &loop, &pending, sh, cmd);
+            // `execute` is the only thing that can hand the terminal to $EDITOR,
+            // and `resumeTui` sets this when it could not take it back. Checked
+            // HERE rather than trusted to the render below: a failed render would
+            // also unwind, but only if the descriptor is genuinely dead, and the
+            // cost of being wrong about that is a session that cannot be ended
+            // from inside the terminal it owns.
+            if (lost) return error.TerminalLost;
         } else if (finished) |req| {
             // Unreachable today (a `.result` always carries an event), but the
             // arena must not depend on that staying true.
