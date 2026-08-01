@@ -444,7 +444,7 @@ fn listMode(m: *Model, ev: Event) !Command {
             // already, because from this task onward a commit can be outstanding
             // and a second mutation must be refused rather than queued.
             ' ' => {
-                if (try busy(m)) return .none;
+                if (try refuseIfBusy(m)) return .none;
             },
             else => {},
         },
@@ -591,7 +591,7 @@ fn fieldMode(allocator: std.mem.Allocator, m: *Model, f: FieldId, ev: Event) !Co
         // one a failed commit has to restore (task 14). Refusing here keeps
         // "exactly one live editor" an invariant rather than a coincidence.
         .enter => {
-            if (try busy(m)) return .none;
+            if (try refuseIfBusy(m)) return .none;
             return openEditor(allocator, m, f);
         },
         // No editor is live in `.field`, but clearMode is the one sanctioned way
@@ -605,8 +605,9 @@ fn fieldMode(allocator: std.mem.Allocator, m: *Model, f: FieldId, ev: Event) !Co
 // At most ONE mutation may be outstanding. Every key path that would start one
 // asks here first; a refused key gets a message and is DROPPED, never queued —
 // queuing would let the user stack edits against a state the server has not
-// confirmed, which is the same trap as an optimistic write.
-fn busy(m: *Model) !bool {
+// confirmed, which is the same trap as an optimistic write. NOT a pure query: it
+// writes the status line when it returns true, hence the imperative name.
+fn refuseIfBusy(m: *Model) !bool {
     if (m.in_flight == .none) return false;
     try m.setStatus("still saving…", .{});
     return true;
@@ -701,12 +702,10 @@ fn editingMode(m: *Model, e: *Editing, ev: Event) !Command {
 }
 
 // One field in, one `Edit` out — a commit never carries a change the user did not
-// make in this editor. Strings are duped into the LIVE arena: the editor buffer
-// they are read from is handed to `in_flight` and eventually freed, while `live`
-// survives until the next task-set swap, which is exactly when the server's echo
-// replaces this content anyway.
+// make in this editor. The strings it produces still BORROW the editor buffer;
+// `ownPatch` copies them out once the edit is known good, so a rejected commit
+// costs the live arena nothing.
 fn buildPatch(m: *Model, e: *const Editing) error{ BadDate, OutOfMemory }!edit.Patch {
-    const la = m.live.allocator();
     var p = edit.Patch{};
     switch (e.editor) {
         .pick => |pe| switch (e.field) {
@@ -719,17 +718,12 @@ fn buildPatch(m: *Model, e: *const Editing) error{ BadDate, OutOfMemory }!edit.P
         .line => |le| {
             const typed = le.text();
             switch (e.field) {
-                .title => p.title = .{ .set = try la.dupe(u8, typed) },
-                .due => p.due = try edit.parseDate(typed, m.now, .due, m.offset_minutes),
-                .scheduled => p.scheduled = try edit.parseDate(typed, m.now, .scheduled, m.offset_minutes),
-                .tags => {
-                    // splitTags allocates only the OUTER slice — every segment
-                    // points into `typed`, i.e. into the editor buffer this
-                    // commit is about to move away. Dupe each one out first.
-                    const tags = try edit.splitTags(la, typed);
-                    for (tags) |*tag| tag.* = try la.dupe(u8, tag.*);
-                    p.tags = .{ .set = tags };
-                },
+                .title => p.title = .{ .set = typed },
+                .due => p.due = try parseDateField(m, typed, .due),
+                .scheduled => p.scheduled = try parseDateField(m, typed, .scheduled),
+                // splitTags allocates only the OUTER slice; the segments still
+                // point into `typed` until `ownPatch` runs.
+                .tags => p.tags = .{ .set = try edit.splitTags(m.live.allocator(), typed) },
                 else => {},
             }
         },
@@ -738,19 +732,46 @@ fn buildPatch(m: *Model, e: *const Editing) error{ BadDate, OutOfMemory }!edit.P
     return p;
 }
 
+// An EMPTY (or whitespace-only) date field clears the date, exactly as typing
+// `none` does. `edit.parseDate` deliberately rejects "" and must keep doing so —
+// the CLI's `--due ""` is a user error there. In the TUI the field arrives
+// prefilled, so deleting its contents is the obvious way to say "no date", and
+// reporting that as malformed input would be a dead end: there would be no way to
+// clear a date except by knowing the word `none`.
+fn parseDateField(m: *const Model, typed: []const u8, kind: edit.DateKind) edit.DateError!edit.DatePatch {
+    if (std.mem.trim(u8, typed, " \t").len == 0) return .{ .set = null };
+    return edit.parseDate(typed, m.now, kind, m.offset_minutes);
+}
+
+// Copy every string the patch borrows from the editor buffer into the LIVE arena.
+// Runs only AFTER validation, so a rejected edit allocates nothing; and before the
+// editor moves into `in_flight`, so the emitted Command never points at a buffer
+// that is about to be freed. `live` is reset by the next task-set swap, which is
+// exactly when the server's echo replaces this content anyway.
+fn ownPatch(m: *Model, p: *edit.Patch) !void {
+    const la = m.live.allocator();
+    switch (p.title) {
+        .set => |s| p.title = .{ .set = try la.dupe(u8, s) },
+        .unchanged => {},
+    }
+    switch (p.tags) {
+        .set => |tags| for (tags) |*tag| {
+            tag.* = try la.dupe(u8, tag.*);
+        },
+        .unchanged => {},
+    }
+}
+
 // Enter in an open editor: build the one-field patch, apply it to the task's
 // CURRENT content, validate client-side, and hand the whole result to the shell.
 // Nothing is written into `m.tasks` — the server's echo (task 14) is the only
 // thing allowed to change what the user sees, so a failed request can never
 // leave a value on screen the server never accepted.
 fn commitEdit(m: *Model, e: *Editing) !Command {
-    // Currently unreachable — `fieldMode` refuses to OPEN an editor while a
-    // commit is outstanding, so merely being in `.editing` already proves nothing
-    // is in flight (removing it changes no test). Kept as the last line of
-    // defence for the one-mutation rule, which is a memory-ownership invariant
-    // and not just a policy: the editor `in_flight` holds is the one task 14
-    // restores, and a second commit would strand it.
-    if (try busy(m)) return .none;
+    // Belt and braces: `fieldMode` already refuses to open an editor while a
+    // commit is outstanding, but the one-mutation rule guards memory ownership
+    // (the editor `in_flight` holds is the one task 14 restores), not just policy.
+    if (try refuseIfBusy(m)) return .none;
     // The external editor commits when it RETURNS (`editor_returned`), not on a
     // key — there is no typed text here to build a patch from.
     if (e.editor == .external) return .none;
@@ -764,21 +785,26 @@ fn commitEdit(m: *Model, e: *Editing) !Command {
 
     // Both failure paths below leave `Mode` UNTOUCHED: the editor stays open with
     // the user's text intact, so a typo costs a keystroke and not a retype.
-    const patch = buildPatch(m, e) catch |err| switch (err) {
+    var patch = buildPatch(m, e) catch |err| switch (err) {
         error.BadDate => {
-            try m.setStatus("not a date: {s} (try 2026-08-02, 2026-08-02T14:30, +3d or none)", .{e.editor.line.text()});
+            try m.setStatus("not a date: {s} (try 2026-08-02, 2026-08-02T14:30, +3d, or empty to clear)", .{e.editor.line.text()});
             return .none;
         },
         else => |leftover| return leftover,
     };
 
-    const content = edit.applyPatch(target.content, patch);
-    edit.validate(content) catch |err| switch (err) {
+    // Validate against a preview whose strings still borrow the editor buffer —
+    // `validate` only reads, and a rejection then costs nothing to undo.
+    edit.validate(edit.applyPatch(target.content, patch)) catch |err| switch (err) {
         error.EmptyTitle => {
             try m.setStatus("a title cannot be empty", .{});
             return .none;
         },
     };
+
+    // Known good: copy the borrowed strings out before the buffer moves.
+    try ownPatch(m, &patch);
+    const content = edit.applyPatch(target.content, patch);
 
     // Already interned (see `moveCursor`), and the `ids` arena is never reset, so
     // this stays valid for the whole round trip even if the cursor moves on.
@@ -1706,6 +1732,34 @@ test "editing the description emits open_editor rather than a commit" {
     try std.testing.expect(h.last == .open_editor);
     try std.testing.expectEqualStrings("a", h.last.open_editor.id);
     try std.testing.expect(h.m.mode.editing.editor == .external);
+}
+
+// Clearing a date must be reachable by DELETING the field's contents. Routing an
+// empty buffer through `edit.parseDate` reports it as malformed ("not a date: ")
+// and leaves the user with no way to clear a due date short of knowing the magic
+// word `none` — a dead end, not just an ugly message.
+test "emptying a date field clears the date rather than failing to parse" {
+    const a = std.testing.allocator;
+    // A buffer the user blanked, and one left holding only whitespace.
+    for ([_][]const u8{ "", "   " }) |typed| {
+        var tasks = [_]Task{t("a", .medium, .todo, NOW + DAY, &.{})};
+        var h: TestHarness = undefined;
+        try h.setup(a, &tasks);
+        defer h.deinit();
+        try std.testing.expect(h.m.tasks[0].content.due_at != null); // there IS one to clear
+
+        try h.key(.enter);
+        for (0..4) |_| try h.key(.down); // -> due
+        try h.key(.enter); // prefilled with the formatted date
+        for (0..32) |_| try h.key(.backspace); // backspace at the start is a no-op
+        for (typed) |c| try h.key(.{ .char = c });
+        try h.key(.enter);
+
+        try std.testing.expect(h.last == .commit);
+        try std.testing.expectEqual(@as(?i64, null), h.last.commit.content.due_at);
+        // A clear, not a silent no-op: the editor really did commit and move on.
+        try std.testing.expect(h.m.in_flight == .commit);
+    }
 }
 
 // True when `s` lies anywhere inside `buf`'s bytes — i.e. `s` was never copied
