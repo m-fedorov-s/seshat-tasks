@@ -60,7 +60,16 @@ The Zig client:
    accepts a short id **tail** / `#handle` — mutating via the server with optimistic concurrency.
    `add`/`update` share one flag set (`--title/--description/--status/--priority/--due/
    --scheduled/--tags`, plus `--dry-run`/`--verbose`).
-4. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
+4. On `tui`, opens a full-screen interactive view (libvaxis) over the same data. Takes `--sort`,
+   `--filter` and `--open` — the same parse/merge as `show`, but **not** `--flat`. **One screen:**
+   a ranked ledger of the forest plus a toggleable detail pane (`Tab`). Rows are ranked by
+   **subtree** urgency, and a parent auto-expands only when a descendant needs attention (high
+   priority, or due within 3 days), otherwise staying folded behind a `(+n)` badge — so a buried
+   urgent subtask is visible with no keypress. `Enter` descends list → field → edit and `Esc`
+   climbs back one level; four editor kinds (line, picker, date, and `$EDITOR` for the
+   description). Edits commit per field with optimistic concurrency; **refresh is manual** (`R`),
+   with polling deferred. See `client/zig/CLAUDE.md` for the full keymap.
+5. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
    server's error message on failure.
 
 ## Conventions

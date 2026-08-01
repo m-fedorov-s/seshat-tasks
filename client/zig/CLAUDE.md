@@ -25,7 +25,12 @@ a new test-bearing file, add it to that block (or run `zig test src/<file>.zig` 
 **Gotcha: `zig build test` does NOT typecheck the CLI.** A test build only analyzes decls reachable
 from a `test` block, and `main()`/`run()` are not — so `zig build test` can report "N/N tests
 passed" while `zig build` fails to compile `main.zig` and every `client.*` call site. Always run
-**both** `zig build` and `zig build test` before claiming a change is green.
+**both** `zig build` and `zig build test` before claiming a change is green. The converse also
+holds for `src/tui/render.zig` and `src/tui/app.zig`: neither has behavioural tests, and both are
+kept analysable by a `test { std.testing.refAllDecls(@This()); }` at the bottom — a bare
+`_ = @import(...)` in main.zig's aggregator links a file in **without** analysing a single function
+body. Since the `tui` subcommand exists, the executable graph reaches both files too, so
+`zig build` now checks them as well; don't delete either safety net.
 
 **Gotcha:** `zig test src/<file>.zig` only works for files directly under `src/`. For files under
 `src/api/*.zig` or `src/core/*.zig`, a bare `zig test` roots the module at that file's own
@@ -39,8 +44,8 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 ## Layout
 
-- `src/main.zig` — entry point + subcommand dispatch (`--version`, `show`, `add`, `update <id>`,
-  `delete <id>`, `done <id>`, `help`). `--version` is checked before the config load (and prints
+- `src/main.zig` — entry point + subcommand dispatch (`--version`, `show`, `tui`, `add`,
+  `update <id>`, `delete <id>`, `done <id>`, `help`). `--version` is checked before the config load (and prints
   `build_options.version`), so it works on a machine with no config file. Uses the 0.16
   `std.process.Init` entry signature: `pub fn main(init:
   std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
@@ -59,6 +64,26 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     **compact**). `--tags a,b,c` is a wholesale set (`--tags ""` clears). `update` needs ≥1 edit
     (else "nothing to update", nonzero). The old bare `add <title> [prio]` positional was removed
     (use `--priority`). Shared render helper `renderOne` + `resolveWidth`/`nowSeconds`.
+  - **`tui`** (`tui_specs` + `runTui`) parses `--sort`/`--filter`/`--open` with the same
+    `filterspec.parse` + merge that `runShow` uses, then calls `tui/app.zig`'s `run`. Three
+    things differ from `runShow` and all three are deliberate:
+    - **`--flat` is not accepted** (it is an `UnknownFlag` error, nonzero, before the terminal is
+      touched). In `show` it means two unrelated things — `roots_only = false` and
+      `show_children = false` — and the TUI's ledger is a tree by construction.
+    - **Nothing is freed on the way out.** `runShow`'s slices die with the function; the TUI's
+      live for the whole session, so there is no `fs.deinit` (the process arena's `free` reclaims
+      the most recent allocation and would hand the filter's own bytes out again).
+    - **`init.gpa`, not the process arena**, is handed to `app.run`. A TUI frees as it goes
+      (per-request arenas, editor buffers, the model's arenas); an arena's no-op `free` would turn
+      every refresh into permanent growth. The `Client` is still the arena-allocated one — it only
+      ever allocates the last recorded error from it.
+
+    `runTui` also passes the **filter expression text** alongside the parsed `view.Filters`,
+    because `m.filtering`/`m.filter_expr` — not `m.filters` — are what drive the header's scope
+    word, the dimming of rows that matched only via a descendant, and `ledger.buildRows`' orphan
+    gate. `--open` is spelled out as `status:todo,in_progress` so the string re-parses to exactly
+    the filters that were applied, and `Esc` (which clears the filter) has something truthful to
+    clear.
   - **Error model:** `main` calls `run` and catches: `error.Reported` (an expected failure whose
     friendly message was already printed) → `std.process.exit(1)` silently; any other error → one
     line `error: <name>` + exit 1. So all commands fail **nonzero and trace-free** — every
@@ -161,6 +186,58 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     testable — no CLI invocation can reach it (the CLI refetches immediately before every update).
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
+- `src/tui/` — the interactive client (`seshat tui`). **Five files, split on one boundary:
+  `ledger.zig`, `editors.zig` and `model.zig` never import vaxis and do no I/O; `render.zig` and
+  `app.zig` own the terminal and make no product decisions.** That line is why a TUI is testable
+  at all here — every rule that could be wrong lives on the pure side, and the shell is the part
+  a human has to eyeball. Keep it: a threshold that appears in `render.zig`, or a `vaxis.` in
+  `model.zig`, is the regression.
+  - `ledger.zig` — the ranking/folding core. `Score` per task (`own`/`sub` urgency, `attention`
+    and `descendants` counts, `all_complete`, `matches`/`self_matches`) computed by a memoized,
+    cycle-safe post-order `walk`; `needsAttention` (high priority, or due within 3 days — the
+    same bucket boundary `view.dueFactor` uses, so "soon" cannot mean two things); `buildRows`
+    (the flattened, ordered row list, auto-expanding only subtrees that contain attention,
+    emitting a `(+n)` badge otherwise, and gating an orphan pass on `filtering`); `Folds`
+    (explicit per-id overrides); `layoutFor` + `chrome_rows` (how many rows the ledger and the
+    detail pane get).
+  - `editors.zig` — `Key` (the model's terminal-free key union, declared HERE and re-exported by
+    `model.zig`), `LineEditor` (a UTF-8-boundary-safe single-line buffer) and `PickEditor` (a
+    wrapping index over an enum's declaration order).
+  - `model.zig` — the state and the event handler: `Model` (three arenas — `live`/`spare`
+    double-buffer the task set and its `Index`, `ids` is never reset and holds the cursor id,
+    fold keys, `filter_expr` and the filter's tag/status slices), `Mode`
+    (`list`/`field`/`editing`/`filter`/`add`/`confirm_delete`), `InFlight` (at most **one**
+    outstanding mutation — a refused key is dropped, never queued), `Event`, `Command`, and
+    `update(gpa, m, ev) !Command`. `recompute` is the single funnel: select → score → rank →
+    rows → re-resolve the cursor → scroll. Reuses `core/edit.zig`'s `Patch`/`applyPatch`/
+    `parseDate`/`validate` and `core/filterspec.zig` unchanged.
+  - `render.zig` — paints a `Model` onto a `vaxis.Window`: header (scope · sort · rows n–m of N ·
+    overdue count · `saving…`), ledger, optional detail pane, rule, footer (prompt > status line >
+    key bar). Maps `core/display.zig`'s `Style` to a `vaxis.Style` — that mapping is the only
+    place the TUI decides how a *task* looks, and TUI-only styling (cursor bar, focus highlight,
+    badge) stays local here rather than becoming a `display.Style` variant.
+  - `app.zig` — the shell: `vaxis.Loop`, the key translation table (`toKey`, **named keys tested
+    before `.text`** — Enter also carries `text = "\r"`), execution of `Command`s on a worker via
+    `io.async` with one arena per request (freed on the loop thread *after* `update` consumed the
+    event), and the `$EDITOR` suspend (`loop.stop()` first, `tty.deinit()` before re-init; the
+    three *decisions* inside it — which editor, what counts as a cancel, what counts as content —
+    are pure functions with unit tests).
+
+  **Keymap** (also shown in the footer key bar):
+
+  | Mode | Keys |
+  | --- | --- |
+  | list | `j`/`k` or `↓`/`↑` move · `l`/`h` or `→`/`←` expand/collapse · `Ctrl-D`/`Ctrl-U` page · `g`/`G` first/last · `Space` cycle status · `a` add · `x` delete · `/` filter · `Tab` toggle pane · `R` refresh · `Esc` clear filter · `⏎` descend to fields · `q` quit |
+  | field | `↑`/`↓` change field · `⏎` edit · `Esc` back to the list |
+  | editing | `⏎` save · `Esc` cancel (back to the field, not the list); `↑`/`↓` choose in a picker; everything else goes to the editor |
+  | filter / add prompt | `⏎` apply/create · `Esc` cancel · line editing (`←`/`→`/`Home`/`End`/`Backspace`/`Delete`) |
+  | confirm delete | `y` delete · `n` or `Esc` cancel |
+
+  Four editor kinds behind `⏎`: a **line** editor (title), a **picker** (status, priority), a
+  **date** line editor accepting everything `core/edit.zig`'s `parseDate` does, and **`$EDITOR`**
+  for the description (`$VISUAL` → `$EDITOR` → `vi`, split on whitespace; a non-zero exit or
+  unchanged text is a cancel). Refresh is **manual** (`R`) — there is no polling; see
+  `plans/todo.md`.
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by
   `make schema-test` alongside the Go side).
 
@@ -199,13 +276,20 @@ These are the 0.16 patterns this codebase relies on. The new I/O model threads a
 - **UTF-8:** `std.unicode.utf8ByteSequenceLength(lead_byte)` (`!u3`) to walk codepoints without
   splitting them; `std.unicode.utf8ValidateSlice`.
 
-### libvaxis 0.6.0 (learned from `src/spike.zig`, `zig build spike`)
+### libvaxis 0.6.0 (verified against the real API, not guessed)
 
 Added as the `vaxis` dependency in `build.zig.zon`, pinned to a commit sha (not a tag — see below).
-Imported as `@import("vaxis")` from `src/main.zig`, `src/spike.zig`, and the unit-test root, wired
-in `build.zig` via `b.dependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug })` then
-`.root_module.addImport("vaxis", vaxis_dep.module("vaxis"))`. Pulls in `zigimg` (non-lazy) and
-`uucode` (lazy) transitively — three packages total, matching upstream's own `build.zig.zon`.
+Imported as `@import("vaxis")` from `src/tui/render.zig` and `src/tui/app.zig` (the only two files
+allowed to — see the `src/tui/` boundary above), wired in `build.zig` via
+`b.dependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug })` then
+`.root_module.addImport("vaxis", vaxis_dep.module("vaxis"))` on **both** the exe and the test
+artifact. Pulls in `zigimg` (non-lazy) and `uucode` (lazy) transitively — three packages total,
+matching upstream's own `build.zig.zon`. It is what makes the binary ~35 MB.
+
+The notes below were established with a throwaway `src/spike.zig` (`zig build spike`), which has
+since been **deleted** — the real TUI subsumes it, and a second reachable `main` next to the CLI
+is a liability. Re-verify against the installed dependency source (`~/.cache/zig/p/…`), not
+against a spike that no longer exists.
 
 **Pinning note:** upstream `rockorager/libvaxis` has no `v0.6.0` git tag (`git ls-remote --tags`
 tops out at `v0.5.1`), but `main`'s current HEAD already declares `.version = "0.6.0"` in its own

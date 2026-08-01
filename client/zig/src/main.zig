@@ -9,6 +9,7 @@ const view = @import("core/view.zig");
 const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
 const filterspec = @import("core/filterspec.zig");
+const app = @import("tui/app.zig");
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -91,6 +92,8 @@ fn run(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "show")) {
         try runShow(allocator, init, &client, &out.interface, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "tui")) {
+        try runTui(allocator, init, &client, args[2..]);
     } else if (std.mem.eql(u8, cmd, "add")) {
         try runAdd(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "delete")) {
@@ -217,6 +220,90 @@ fn runShow(
 
     formatter.render(out, opts, now, selected, &idx) catch |err| return stdoutErr(err);
     out.flush() catch |err| return stdoutErr(err);
+}
+
+// The TUI takes the view flags that mean something to a full-screen tree:
+// `--filter`, `--open` and `--sort`, parsed and merged exactly as `runShow` does.
+//
+// `--flat` is deliberately NOT accepted. In `show` it does two unrelated things —
+// `roots_only = false` (rank every task as a top-level entry) and
+// `show_children = false` (print no subtrees) — and the TUI's ledger is a tree by
+// construction: folding, the `(+n)` badge and subtree scoring all assume roots
+// with descendants under them. There is no flat mode to turn on.
+const tui_specs = [_]argparse.OptionSpec{
+    .{ .name = "sort", .kind = .value },
+    .{ .name = "filter", .kind = .multi },
+    .{ .name = "open", .kind = .boolean },
+};
+
+fn runTui(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    client: *Client,
+    flag_argv: []const []const u8,
+) !void {
+    var parsed = argparse.parse(allocator, flag_argv, &tui_specs) catch |err| {
+        std.debug.print("Bad arguments to `tui`: {s}\n", .{@errorName(err)});
+        return error.Reported;
+    };
+    defer argparse.deinit(allocator, &parsed);
+
+    // LIFETIME: everything below is handed to `app.run` and read for the whole
+    // session, so unlike `runShow` nothing here is freed on the way out. In
+    // particular there is no `fs.deinit` — `allocator` is the process arena, whose
+    // `free` reclaims the most recent allocation, which would hand the filter's
+    // own bytes to the next allocation in the session.
+    const fs = filterspec.parse(allocator, parsed.getMulti("filter")) catch |e| switch (e) {
+        error.BadFilter => {
+            std.debug.print("error: bad --filter expression (want tag:NAME, status:S1,S2, or overdue)\n", .{});
+            return error.Reported;
+        },
+        error.OutOfMemory => return e,
+    };
+
+    var status_list = std.ArrayList(task.Status).empty;
+    if (parsed.getBool("open")) {
+        try status_list.append(allocator, .todo);
+        try status_list.append(allocator, .in_progress);
+    }
+    try status_list.appendSlice(allocator, fs.statuses);
+
+    const filters = view.Filters{
+        // Always a forest: see the `--flat` note above.
+        .roots_only = true,
+        .tags = fs.tags,
+        .statuses = try status_list.toOwnedSlice(allocator),
+        .overdue = fs.overdue,
+    };
+
+    const strategy: view.Strategy = blk: {
+        const s = parsed.getValue("sort") orelse break :blk .urgency;
+        break :blk std.meta.stringToEnum(view.Strategy, s) orelse {
+            std.debug.print("Unknown sort strategy: {s}\n", .{s});
+            return error.Reported;
+        };
+    };
+
+    // The filter EXPRESSION travels alongside the parsed filters because the
+    // model's three filter-aware behaviours read the text and the flag, not
+    // `m.filters`: the header's scope word, the dimming of rows that matched only
+    // via a descendant, and `ledger.buildRows`' orphan gate. Handing over
+    // `filters` alone would apply the filter while rendering as if none were set.
+    //
+    // `--open` is spelled out as the status expression it stands for, so the
+    // string re-parses to exactly these filters — that keeps the header honest and
+    // gives `Esc` (which clears the whole filter) something truthful to clear.
+    // Joined with spaces because that is the form the `/` prompt takes: one line,
+    // whitespace where the flag repeat used to be.
+    var exprs = std.ArrayList([]const u8).empty;
+    if (parsed.getBool("open")) try exprs.append(allocator, "status:todo,in_progress");
+    try exprs.appendSlice(allocator, parsed.getMulti("filter"));
+    const filter_expr = try std.mem.join(allocator, " ", exprs.items);
+
+    // `init.gpa`, NOT the process arena: a TUI session is long-lived and frees as
+    // it goes (per-request arenas, editor buffers, the model's own arenas), and an
+    // arena's no-op `free` would turn every refresh into permanent growth.
+    try app.run(init.io, init.gpa, init.environ_map, client, filters, strategy, filter_expr);
 }
 
 // auto -> on only if stdout is a TTY and NO_COLOR is unset; --no-color forces off.
@@ -433,6 +520,10 @@ fn usage() void {
         \\                      --detailed    rich output (tags, dates, ids, description)
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
+        \\  tui [flags]       Interactive full-screen view. Flags:
+        \\                      --sort <priority|due|title|created|urgency>  (default urgency)
+        \\                      --filter <tag:NAME|status:S1,S2|overdue>     (repeatable, AND)
+        \\                      --open        only todo/in_progress
         \\  add <title> [edits]   Add a top-level task. Accepts the edit flags below.
         \\  update <id> [edits]   Edit a task (id tail / #handle). Edit flags:
         \\                      --title S  --description S  --status S  --priority S

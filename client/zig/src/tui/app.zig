@@ -622,6 +622,13 @@ fn nowSeconds(io: std.Io) i64 {
 /// and `std.process.Init` already hands `main.zig` exactly the `*Environ.Map` it
 /// wants. The UTC offset comes from `client.config`, so it needs no parameter of
 /// its own.
+///
+/// `filter_expr` is the `--filter` expression AS TYPED (space-joined when the flag
+/// repeats), or `""` for no filter. It is not decoration: `m.filtering` and
+/// `m.filter_expr` — not `m.filters` — are what the header's scope word, the
+/// dimming of rows that matched only through a descendant, and `ledger.buildRows`'
+/// orphan gate all read. Passing filters without the text would apply the filter
+/// while rendering as though none were set.
 pub fn run(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -629,6 +636,7 @@ pub fn run(
     client: *api.Client,
     filters: view.Filters,
     strategy: view.Strategy,
+    filter_expr: []const u8,
 ) !void {
     // HAZARD 4: `Client.deinit` frees the last recorded error message. Under the
     // CLI's process arena nobody missed it; here `gpa` is a real allocator and a
@@ -645,6 +653,15 @@ pub fn run(
     // outlive `run`; the `/` prompt replaces them with id-arena copies of its own.
     m.filters = filters;
     m.strategy = strategy;
+    if (filter_expr.len > 0) {
+        // INTERNED, exactly as `model.applyFilter` does for a filter typed at the
+        // `/` prompt: `filter_expr` survives every task-set swap, so it has to
+        // live in the id arena (the only one never reset) rather than borrow the
+        // caller's bytes — even though this particular caller's bytes happen to
+        // outlive us. One lifetime rule for the field, not two.
+        m.filter_expr = try m.internId(filter_expr);
+        m.filtering = true;
+    }
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
