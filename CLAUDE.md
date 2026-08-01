@@ -67,3 +67,10 @@ The Zig client:
 
 - The server is authoritative; clients must not assume local state is canonical.
 - Auth is a plain shared secret in the `Authorization` header (no Bearer prefix).
+- **Never delete an SDD workspace — archive it.** `superpowers:subagent-driven-development` tells
+  you to delete `.superpowers/sdd/<plan>/` once a plan's final review is clean. Do not. Move it to
+  `sdd_archive/<plan>/` instead. The ledger, task briefs, implementer reports and review write-ups
+  are the only record of *why* the code looks the way it does — which plan steps were wrong, which
+  findings were adjudicated how, which deviations were deliberate. The plans themselves are
+  gitignored and the commits carry only the outcome, so this is the audit trail for later
+  investigation. `sdd_archive/` is gitignored.

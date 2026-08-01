@@ -22,6 +22,9 @@ server/config.yaml
 plans/
 docs/
 
+# Archived subagent-driven-development ledgers (see CLAUDE.md → Conventions)
+sdd_archive/
+
 # Go build binary
 /server/seshat
 
