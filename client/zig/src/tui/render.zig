@@ -82,10 +82,11 @@ pub fn draw(win: vaxis.Window, m: *const Model) void {
     win.clear();
     win.hideCursor(); // only an open prompt/editor turns it back on
 
-    // 3 = header + the rule above the footer + the footer, matching the
-    // `viewport.rows -| 3` that `model.recompute` fed to `ensureVisible`. If this
-    // and that ever disagree, the scroll offset stops matching what is on screen.
-    const layout = ledger.layoutFor(win.height -| 3, m.pane_open);
+    // The header, the rule above the footer, and the footer. `chrome_rows` is
+    // shared with `model.recompute`, which subtracts the same amount before
+    // handing `layoutFor`'s result to `ensureVisible` — if the two ever disagreed,
+    // `scroll_top` would stop describing what is on screen.
+    const layout = ledger.layoutFor(win.height -| ledger.chrome_rows, m.pane_open);
     const ledger_rows = clampU16(layout.ledger_rows);
     const pane_rows = clampU16(layout.pane_rows);
 
@@ -94,7 +95,7 @@ pub fn draw(win: vaxis.Window, m: *const Model) void {
     if (pane_rows > 0)
         drawPane(win.child(.{ .y_off = 1 + @as(i17, ledger_rows), .height = pane_rows }), m);
 
-    // The one row `layoutFor`'s `-| 3` reserves that is neither header nor footer.
+    // The one row of `chrome_rows` that is neither the header nor the footer.
     drawRule(win.child(.{ .y_off = win.height -| 2, .height = 1 }));
     drawFooter(win.child(.{ .y_off = win.height -| 1, .height = 1 }), m);
 }
@@ -195,7 +196,7 @@ fn drawRow(win: vaxis.Window, m: *const Model, row: ledger.Row, y: u16, is_curso
             col = put(win, y, col, "  ", onCursor(chrome, is_cursor)); // no fold marker
             col = drawTreeRail(win, y, col, row, is_cursor);
             var buf: [40]u8 = undefined;
-            const handle = display.handleText(&buf, row.id, handle_len);
+            const handle = display.handleText(&buf, row.id, m.handle_len);
             col = put(win, y, col, "[missing: ", onCursor(vxStyle(.dim), is_cursor));
             col = put(win, y, col, handle, onCursor(vxStyle(.dim), is_cursor));
             _ = put(win, y, col, "]", onCursor(vxStyle(.dim), is_cursor));
@@ -247,7 +248,7 @@ fn drawRow(win: vaxis.Window, m: *const Model, row: ledger.Row, y: u16, is_curso
         .overdue => |x| x.text,
     } else "";
     var handle_buf: [40]u8 = undefined;
-    const handle = display.handleText(&handle_buf, t.id, handle_len);
+    const handle = display.handleText(&handle_buf, t.id, m.handle_len);
 
     const tail_cols = win.gwidth(badge) + win.gwidth(due_text) + win.gwidth(handle) + 3;
     const budget = (win.width -| col) -| tail_cols;
@@ -282,12 +283,6 @@ fn collapsedBadge(buf: []u8, row: ledger.Row) []const u8 {
         return std.fmt.bufPrint(buf, "(+{d})", .{row.descendants}) catch "";
     return std.fmt.bufPrint(buf, "(+{d} · ⚠{d})", .{ row.descendants, row.attention }) catch "";
 }
-
-// The CLI derives this from `view.minUniqueSuffixLen` over the whole fetched set,
-// which needs an allocator and can fail — neither of which a `draw` has. 4 is that
-// function's own floor. See the task report: the per-session value belongs on the
-// Model, computed once in `recompute`, not here.
-const handle_len: usize = 4;
 
 fn lookup(m: *const Model, id: []const u8) ?Task {
     if (!m.idx_built) return null;

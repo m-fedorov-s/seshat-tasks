@@ -267,6 +267,22 @@ The 0.16 `std.Io`-threaded model applies throughout — same pattern as the rest
   `col_offset` (both default 0), `wrap: enum { grapheme, word, none } = .grapheme`, and `commit:
   bool = true` (set false to measure without drawing). Returns `PrintResult{ col, row, overflow:
   bool }` — non-void, so a bare call needs `_ = win.printSegment(...)`.
+- **`PrintResult.col` under `wrap = .none` is exactly the next free column**, i.e. where a
+  following run would start. The `.none` branch just accumulates `col +|= w` per grapheme and
+  returns it. This is what lets one screen row be composed left-to-right out of differently-styled
+  runs by chaining `col = put(win, y, col, text, style)` — no width bookkeeping of your own.
+  **Under the default `.grapheme` wrap the same field is reset to 0 (and `row` bumped) on
+  overflow**, so the identical chain silently corrupts the row. If you are chaining, `.none` is
+  load-bearing, not a stylistic choice.
+- **`Window.gwidth(str: []const u8) u16`:** the terminal-capability-aware display width of a
+  string (uses the screen's `width_method`). Two uses in `tui/render.zig`: reserving the trailing
+  columns of a ledger row before handing the remainder to `display.truncate`, and converting a
+  `LineEditor`'s **byte** cursor into a **column** for `showCursor`.
+- **`Window.showCursor(col: u16, row: u16)` / `Window.hideCursor()`:** set/clear the screen's
+  cursor position and visibility. `showCursor` already adds the window's own `x_off`/`y_off` and
+  silently no-ops when the coordinate falls outside the window, so a prompt drawn in a 1-row footer
+  child can pass plain window-local coordinates with no clamping. `render.draw` calls
+  `win.hideCursor()` up front and only an open prompt/line editor turns it back on.
 - **`Window.child(opts: ChildOptions) Window`:** field names are `x_off: i17 = 0`, `y_off: i17 = 0`,
   `width: ?u16 = null` (null = "fill remaining", not a magic sentinel — confirms the v0.5.0
   changelog's stated breaking change already landed), `height: ?u16 = null`, and `border:

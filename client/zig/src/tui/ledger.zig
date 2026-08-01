@@ -272,6 +272,19 @@ fn emit(
 
 pub const Layout = struct { ledger_rows: usize, pane_rows: usize };
 
+// Screen rows the shell spends on chrome rather than content: the header, the
+// rule above the footer, and the footer. Subtract this from the terminal height
+// before calling `layoutFor`.
+//
+// It lives HERE, next to `layoutFor`, because it had been written out longhand in
+// two places — `model.recompute` (feeding `ensureVisible`) and `render.draw`
+// (sizing the child windows). Those two must agree exactly or `scroll_top` stops
+// describing what is actually on screen, and the symptom (the cursor scrolling
+// out of view) shows up nowhere near the constant that caused it.
+// `u16` to match both call sites' operand (`Viewport.rows` and vaxis's
+// `Window.height`), so each can write a plain saturating `-| chrome_rows`.
+pub const chrome_rows: u16 = 3;
+
 pub fn ensureVisible(cursor_index: usize, row_count: usize, height: usize, scroll_top: usize) usize {
     if (height == 0) return scroll_top;
     // Clamp first: a filter or a collapse can leave scroll_top past the end.

@@ -135,6 +135,12 @@ pub const Model = struct {
     filter_expr: []const u8 = "", // interned; drives the header and empty state
     filtering: bool = false,
     strategy: view.Strategy = .urgency,
+    // The `#handle` tail length: the shortest id suffix that is unique across the
+    // WHOLE fetched set. Derived state, recomputed by `recompute`; the default is
+    // `view.minUniqueSuffixLen`'s own floor, for a model that has never had one.
+    // It lives on the Model rather than in the renderer because computing it needs
+    // an allocator and can fail, and `render.draw(win, m) void` has neither.
+    handle_len: usize = 4,
     now: i64,
     offset_minutes: i32,
 
@@ -318,6 +324,22 @@ fn recompute(m: *Model) !void {
     // already gone and the anchor `replaceTasks` snapshotted is all there is.
     const old_index = m.cursorIndex() orelse m.cursor_anchor;
 
+    // The `#handle` length, derived the SAME way `main.zig` derives it for the CLI
+    // (`view.minUniqueSuffixLen` over every fetched id) so a handle names the same
+    // task in both front ends. A fixed length would print two identical handles
+    // wherever two ids share a 4-char tail while `seshat show` widened to five —
+    // precisely the CLI/TUI drift `core/display.zig` exists to prevent.
+    //
+    // Done FIRST, before anything is torn down: `minUniqueSuffixLen` allocates a
+    // hash map per candidate length and so can fail, and failing here leaves the
+    // model exactly as it was rather than half-rebuilt.
+    {
+        const ids = try m.gpa.alloc([]const u8, m.tasks.len);
+        defer m.gpa.free(ids);
+        for (m.tasks, ids) |task_, *dst| dst.* = task_.id;
+        m.handle_len = try view.minUniqueSuffixLen(m.gpa, ids);
+    }
+
     m.gpa.free(m.rows);
     m.rows = &.{};
     m.scores.deinit();
@@ -373,7 +395,7 @@ fn recompute(m: *Model) !void {
     // them back there instead of at the top of the list.
     m.cursor_anchor = m.cursorIndex() orelse m.cursor_anchor;
 
-    const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules
+    const layout = ledger.layoutFor(m.viewport.rows -| ledger.chrome_rows, m.pane_open);
     // Clamp into the current list: a stale anchor left over from a longer one
     // must not drag the viewport past the end.
     const focus = @min(m.cursor_anchor, m.rows.len -| 1);
@@ -754,7 +776,7 @@ fn scanTaskRow(rows: []const ledger.Row, start: usize, dir: Dir) ?usize {
 // ahead/behind.
 fn pageBy(m: *Model, dir: Dir) !void {
     const cur = m.cursorIndex() orelse return;
-    const layout = ledger.layoutFor(m.viewport.rows -| 3, m.pane_open); // 3 = header + 2 rules, matching recompute
+    const layout = ledger.layoutFor(m.viewport.rows -| ledger.chrome_rows, m.pane_open); // same reservation recompute used
     const half = ledger.halfPage(layout.ledger_rows);
     const target = switch (dir) {
         .next => @min(cur + half, m.rows.len -| 1),
@@ -1357,6 +1379,31 @@ test "a model initialises, accepts a task set, and tears down with no leaks" {
     // The model owns its strings: mutating the source must not affect it.
     tasks[0].content.title = "MUTATED";
     try std.testing.expectEqualStrings("aaa", m.tasks[0].content.title);
+}
+
+test "handle_len widens past a colliding id tail, exactly as the CLI does" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    // Never recomputed: the floor, so a model with no data still renders handles.
+    try std.testing.expectEqual(@as(usize, 4), m.handle_len);
+
+    var distinct = [_]Task{
+        t("AAAAWORK1", .none, .todo, null, &.{}),
+        t("AAAARPT01", .none, .todo, null, &.{}),
+    };
+    try loadInto(&m, &distinct);
+    try std.testing.expectEqual(@as(usize, 4), m.handle_len);
+
+    // Both ids end "0001", so a fixed 4 would put the SAME handle on both rows
+    // while `seshat show` printed two different ones. That drift is the bug.
+    var colliding = [_]Task{
+        t("AAAX0001", .none, .todo, null, &.{}),
+        t("AAAY0001", .none, .todo, null, &.{}),
+    };
+    try loadInto(&m, &colliding);
+    try std.testing.expectEqual(@as(usize, 5), m.handle_len);
 }
 
 test "replaceTasks can be called repeatedly without leaking" {
