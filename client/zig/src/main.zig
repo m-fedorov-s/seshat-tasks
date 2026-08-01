@@ -463,4 +463,8 @@ test {
     _ = @import("tui/ledger.zig");
     _ = @import("tui/editors.zig");
     _ = @import("tui/model.zig");
+    // render.zig has no tests of its own (spec §14) and nothing imports it yet, so
+    // this import plus its own `refAllDecls` block is the ONLY thing that gets its
+    // function bodies typechecked at all.
+    _ = @import("tui/render.zig");
 }
