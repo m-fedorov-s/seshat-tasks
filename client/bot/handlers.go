@@ -156,3 +156,54 @@ func (b *Bot) Capture(ctx context.Context, chatID int64, token, text, note strin
 	_, err = b.s.Send(ctx, chatID, body, CardKeyboard(created, Origin{HasList: false}))
 	return err
 }
+
+// deliver sends a new message, or edits an existing one when editMsgID is
+// non-zero. Navigation edits in place so the chat does not fill with dead lists.
+func (b *Bot) deliver(ctx context.Context, chatID, editMsgID int64, text string, kb [][]Button) error {
+	if editMsgID != 0 {
+		return b.s.Edit(ctx, chatID, editMsgID, text, kb)
+	}
+	_, err := b.s.Send(ctx, chatID, text, kb)
+	return err
+}
+
+// ShowList renders /list (query == "") or /find (query != "") at the given page.
+func (b *Bot) ShowList(ctx context.Context, chatID, editMsgID int64, token, query string, page int) error {
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	now := b.now()
+
+	var groups []Group
+	overflow := 0
+	if query == "" {
+		groups = ListGroups(tasks, ix, now)
+	} else {
+		groups, overflow = FindGroups(tasks, ix, query)
+	}
+	// Paginate clamps: a recorded page can outlive the set it referred to.
+	p := Paginate(groups, page)
+	text, kb := RenderPage(p, query, overflow, now, b.cfg.OffsetMinutes())
+	return b.deliver(ctx, chatID, editMsgID, text, kb)
+}
+
+// OpenCard renders one task's card. It re-fetches rather than trusting anything
+// captured at render time.
+func (b *Bot) OpenCard(ctx context.Context, chatID, editMsgID int64, token, taskID string, o Origin) error {
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	t, ok := ix.Get(taskID)
+	if !ok {
+		// Deleted from another client while this card was open. Say so; do not
+		// pretend the button was merely stale.
+		return b.deliver(ctx, chatID, editMsgID,
+			"That task no longer exists — it may have been deleted elsewhere.", nil)
+	}
+	return b.deliver(ctx, chatID, editMsgID,
+		CardText(t, ix, b.now(), b.cfg.OffsetMinutes()), CardKeyboard(t, o))
+}

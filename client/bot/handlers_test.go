@@ -125,10 +125,10 @@ func TestHandleStartExplainsCaptureFirst(t *testing.T) {
 
 func TestParseCaptureSplitsOnFirstNewline(t *testing.T) {
 	cases := []struct {
-		in       string
-		title    string
-		desc     string
-		ok       bool
+		in    string
+		title string
+		desc  string
+		ok    bool
 	}{
 		{"call the dentist", "call the dentist", "", true},
 		{"call the dentist\nask about the crown", "call the dentist", "ask about the crown", true},
@@ -173,7 +173,7 @@ func TestCaptureCreatesTodoTaskAndShowsCard(t *testing.T) {
 			json.NewDecoder(r.Body).Decode(&got)
 			json.NewEncoder(w).Encode(map[string]any{
 				"state_version": 1,
-				"task": task.Task{ID: "NEW", Content: got.Content, Meta: task.Meta{Version: 1}},
+				"task":          task.Task{ID: "NEW", Content: got.Content, Meta: task.Meta{Version: 1}},
 			})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -231,7 +231,7 @@ func TestCapturePrefixesANoteWhenGiven(t *testing.T) {
 	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"state_version": 1,
-			"task": task.Task{ID: "NEW", Content: task.Content{Title: "x"}, Meta: task.Meta{Version: 1}},
+			"task":          task.Task{ID: "NEW", Content: task.Content{Title: "x"}, Meta: task.Meta{Version: 1}},
 		})
 	})
 	defer done()
@@ -258,4 +258,124 @@ func TestCaptureSurfacesServerErrorText(t *testing.T) {
 	if len(f.sent) != 1 || !strings.Contains(f.sent[0].Text, "title must be non-empty") {
 		t.Errorf("server error text was not surfaced verbatim: %+v", f.sent)
 	}
+}
+
+func seedServer(t *testing.T, tasks []task.Task) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tasks/get" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"state_version": 1, "tasks": tasks})
+	}
+}
+
+func TestShowListSendsAPageWhenNotEditing(t *testing.T) {
+	tasks := []task.Task{mk("a"), mk("b")}
+	b, f, done := botWithServer(t, seedServer(t, tasks))
+	defer done()
+
+	if err := b.ShowList(context.Background(), 42, 0, "sekrit", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.sent) != 1 || len(f.edited) != 0 {
+		t.Fatalf("want one Send and no Edit, got %d/%d", len(f.sent), len(f.edited))
+	}
+}
+
+func TestShowListEditsInPlaceWhenGivenAMessageID(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{mk("a")}))
+	defer done()
+
+	if err := b.ShowList(context.Background(), 42, 77, "sekrit", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.edited) != 1 || len(f.sent) != 0 {
+		t.Fatalf("navigation must edit in place, got %d sends / %d edits", len(f.sent), len(f.edited))
+	}
+}
+
+func TestShowListClampsAnOutOfRangePage(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{mk("a")}))
+	defer done()
+
+	// Page 9 no longer exists — clamping must not error or render an empty screen.
+	if err := b.ShowList(context.Background(), 42, 0, "sekrit", "", 9); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.sent) != 1 || !strings.Contains(f.sent[0].Text, "a") {
+		t.Errorf("clamped page did not render: %+v", f.sent)
+	}
+}
+
+func TestShowListEmpty(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, nil))
+	defer done()
+
+	if err := b.ShowList(context.Background(), 42, 0, "sekrit", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToLower(f.sent[0].Text), "nothing open") {
+		t.Errorf("empty list text = %q", f.sent[0].Text)
+	}
+}
+
+func TestShowListWithQueryFiltersByTitle(t *testing.T) {
+	a, bb := mk("a"), mk("b")
+	a.Content.Title = "call the dentist"
+	bb.Content.Title = "buy milk"
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{a, bb}))
+	defer done()
+
+	if err := b.ShowList(context.Background(), 42, 0, "sekrit", "dent", 0); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.sent[0].Text, "buy milk") {
+		t.Errorf("find leaked a non-match:\n%s", f.sent[0].Text)
+	}
+	if !strings.Contains(f.sent[0].Text, "call the dentist") {
+		t.Errorf("find dropped the match:\n%s", f.sent[0].Text)
+	}
+}
+
+func TestOpenCardRendersTheRightTask(t *testing.T) {
+	a, bb := mk("A"), mk("B")
+	a.Content.Title = "first"
+	bb.Content.Title = "second"
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{a, bb}))
+	defer done()
+
+	o := Origin{HasList: true, Page: 0}
+	if err := b.OpenCard(context.Background(), 42, 55, "sekrit", "B", o); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.edited) != 1 {
+		t.Fatalf("card should edit in place, got %+v", f)
+	}
+	if !strings.Contains(f.edited[0].Text, "second") {
+		t.Errorf("wrong task rendered:\n%s", f.edited[0].Text)
+	}
+}
+
+func TestOpenCardReportsAVanishedTask(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{mk("A")}))
+	defer done()
+
+	err := b.OpenCard(context.Background(), 42, 55, "sekrit", "GONE", Origin{HasList: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.ToLower(strings.Join([]string{textOf(f.sent), textOf(f.edited)}, " "))
+	if !strings.Contains(joined, "no longer exists") {
+		t.Errorf("a task deleted elsewhere must be reported plainly, got %q", joined)
+	}
+}
+
+func textOf(ms []sentMsg) string {
+	var out []string
+	for _, m := range ms {
+		out = append(out, m.Text)
+	}
+	return strings.Join(out, " ")
 }
