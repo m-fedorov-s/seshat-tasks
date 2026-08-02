@@ -816,24 +816,52 @@ func TestHandleCallbackNoopDoesNothingVisible(t *testing.T) {
 	}
 }
 
+// cardMarker appears only in CardText (see render.go's "priority  <code>" line),
+// never in a list render — it is the cheapest way to tell "rendered a card" from
+// "rendered a list" without duplicating render.go's layout.
+const cardMarker = "priority  <code>"
+
+// kindsIn collects every button's Action.Kind across a keyboard, so a test can
+// assert WHICH picker (or confirmation) was shown rather than just that some
+// keyboard was shown.
+func kindsIn(kb [][]Button) map[ActionKind]bool {
+	m := map[ActionKind]bool{}
+	for _, row := range kb {
+		for _, btn := range row {
+			m[btn.Action.Kind] = true
+		}
+	}
+	return m
+}
+
+// TestHandleCallbackRoutesEachKind checks not just whether a kind writes, but
+// what it actually rendered — a card vs. a list, and (for pickers and the
+// delete confirmation) which keyboard was swapped in. A write/no-write bit
+// alone cannot catch e.g. KindOpenTask and KindPage being swapped, or
+// KindPickStatus and KindPickPriority swapping keyboard builders: both members
+// of any such pair still produce zero writes (or the same write) and exactly
+// one Answer call.
 func TestHandleCallbackRoutesEachKind(t *testing.T) {
 	cases := []struct {
 		kind      ActionKind
 		arg       string
 		wantWrite bool // does it POST an update or delete?
+		wantCard  bool // rendered text is the task card (has cardMarker), not a list
+		checkKB   bool
+		wantKB    ActionKind // a button of this kind must appear in the resulting keyboard
 	}{
-		{KindOpenTask, "", false},
-		{KindPage, "", false},
-		{KindBack, "", false},
-		{KindPickStatus, "", false},
-		{KindPickPriority, "", false},
-		{KindPickDue, "", false},
-		{KindSetStatus, "done", true},
-		{KindSetPriority, "high", true},
-		{KindSetDue, "today", true},
-		{KindClearTags, "", true},
-		{KindConfirmDelete, "", false},
-		{KindDoDelete, "", true},
+		{kind: KindOpenTask, wantCard: true, checkKB: true, wantKB: KindDone},
+		{kind: KindPage, wantCard: false},
+		{kind: KindBack, wantCard: false},
+		{kind: KindPickStatus, wantCard: true, checkKB: true, wantKB: KindSetStatus},
+		{kind: KindPickPriority, wantCard: true, checkKB: true, wantKB: KindSetPriority},
+		{kind: KindPickDue, wantCard: true, checkKB: true, wantKB: KindSetDue},
+		{kind: KindSetStatus, arg: "done", wantWrite: true, wantCard: true, checkKB: true, wantKB: KindDone},
+		{kind: KindSetPriority, arg: "high", wantWrite: true, wantCard: true, checkKB: true, wantKB: KindDone},
+		{kind: KindSetDue, arg: "today", wantWrite: true, wantCard: true, checkKB: true, wantKB: KindDone},
+		{kind: KindClearTags, wantWrite: true, wantCard: true, checkKB: true, wantKB: KindDone},
+		{kind: KindConfirmDelete, wantCard: false, checkKB: true, wantKB: KindDoDelete},
+		{kind: KindDoDelete, wantWrite: true, wantCard: false},
 	}
 	for _, c := range cases {
 		u := &updateRecorder{tasks: []task.Task{targetTask()}}
@@ -850,7 +878,41 @@ func TestHandleCallbackRoutesEachKind(t *testing.T) {
 		if len(f.answered) != 1 {
 			t.Errorf("kind %v: answered %d times, want 1", c.kind, len(f.answered))
 		}
+		// msgID (55) is always non-zero here, so every path above edits in place —
+		// never sends a new message.
+		if len(f.edited) == 0 {
+			t.Fatalf("kind %v: expected an in-place edit, got none (sent=%d)", c.kind, len(f.sent))
+		}
+		last := f.edited[len(f.edited)-1]
+		if gotCard := strings.Contains(last.Text, cardMarker); gotCard != c.wantCard {
+			t.Errorf("kind %v: rendered a card=%v, want %v (text:\n%s)", c.kind, gotCard, c.wantCard, last.Text)
+		}
+		if c.checkKB && !kindsIn(last.KB)[c.wantKB] {
+			t.Errorf("kind %v: keyboard is missing a %v button — wrong picker/confirmation shown", c.kind, c.wantKB)
+		}
 		done()
+	}
+}
+
+// showPicker's vanished-task branch has no direct coverage from the table above
+// (every case there targets a task that exists), so — following the convention
+// of TestOpenCardReportsAVanishedTask and TestSetFieldReportsAVanishedTask —
+// this exercises it on its own.
+func TestShowPickerReportsAVanishedTask(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{mk("OTHER")}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindPickStatus, TaskID: "GONE"}
+	if err := b.showPicker(context.Background(), 42, 55, "sekrit", a, StatusPickerKeyboard("GONE", Origin{})); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 0 {
+		t.Error("a task absent from the fetched set must not be POSTed")
+	}
+	joined := strings.ToLower(textOf(f.sent) + " " + textOf(f.edited))
+	if !strings.Contains(joined, "no longer exists") {
+		t.Errorf("expected a 'no longer exists' reply, got %q", joined)
 	}
 }
 
