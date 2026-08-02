@@ -355,3 +355,155 @@ func (b *Bot) DoDelete(ctx context.Context, chatID, editMsgID int64, token strin
 	}
 	return b.ShowList(ctx, chatID, editMsgID, token, a.Query, a.Page)
 }
+
+var promptCopy = map[string]string{
+	"title":       "Send me the new title.",
+	"description": "Send me the new description.",
+	"tags":        "Send me the tags, comma-separated.",
+}
+
+// applyTextPatch builds the content mutation for a free-text field.
+func applyTextPatch(field, value string) func(*task.Content) {
+	switch field {
+	case "title":
+		return func(c *task.Content) { c.Title = value }
+	case "description":
+		return func(c *task.Content) { c.Description = value }
+	case "tags":
+		var tags []string
+		for _, part := range strings.Split(value, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				tags = append(tags, trimmed)
+			}
+		}
+		if tags == nil {
+			tags = []string{}
+		}
+		return func(c *task.Content) { c.Tags = tags }
+	default:
+		return nil
+	}
+}
+
+// PromptField sends a ForceReply prompt and pins meta.version as of now.
+//
+// The prompt is a NEW message, not an edit: ForceReply cannot be attached through
+// EditMessageText, which accepts only inline keyboards.
+func (b *Bot) PromptField(ctx context.Context, chatID int64, token string, a Action) error {
+	copyText, ok := promptCopy[a.Arg]
+	if !ok {
+		return b.failInternal(ctx, chatID, errors.New("unknown prompt field "+a.Arg))
+	}
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	t, found := ix.Get(a.TaskID)
+	if !found {
+		_, err := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		return err
+	}
+	if a.Arg == "tags" && len(t.Content.Tags) > 0 {
+		copyText += "\n\nCurrently: " + EscapeHTML(strings.Join(t.Content.Tags, ", "))
+	}
+	msgID, err := b.s.Prompt(ctx, chatID, copyText)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	pinned := a
+	// Pin the version as of prompt time. The user is about to compose a reply
+	// against text they read on a card that may be minutes old; sending a freshly
+	// fetched version at write time would silently clobber a concurrent change.
+	pinned.ExpectedVersion = t.Meta.Version
+	return b.reg.PutPrompt(pinned, msgID)
+}
+
+// HandleReply processes a reply to a ForceReply prompt.
+func (b *Bot) HandleReply(ctx context.Context, chatID, promptMsgID, replyMsgID int64, token, text string) error {
+	a, ok := b.reg.GetByPrompt(promptMsgID)
+	if !ok {
+		// The prompt is gone — a restart, or LRU eviction. Capture rather than
+		// discard: losing typed words is worse than creating a task the user can
+		// delete from the card we are about to show them.
+		return b.Capture(ctx, chatID, token, text,
+			"That edit prompt expired, so I added this as a new task instead.")
+	}
+	value := strings.TrimSpace(text)
+	if a.Arg == "title" && value == "" {
+		_, err := b.s.Send(ctx, chatID, "A task needs a title.", nil)
+		return err
+	}
+	patch := applyTextPatch(a.Arg, value)
+	if patch == nil {
+		return b.failInternal(ctx, chatID, errors.New("unknown prompt field "+a.Arg))
+	}
+
+	// Tidy up the prompt so the chat does not accumulate them. Best-effort.
+	_ = b.s.DeleteMessage(ctx, chatID, promptMsgID)
+
+	_, err := b.applyEdit(ctx, token, a.TaskID, a.ExpectedVersion, patch)
+	if errors.Is(err, errTaskGone) {
+		_, sErr := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		return sErr
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusConflict {
+		return b.showConflict(ctx, chatID, token, a, value)
+	}
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	return b.OpenCard(ctx, chatID, 0, token, a.TaskID, b.originOf(a))
+}
+
+// showConflict surfaces a free-text conflict as DATA, not an error: both values,
+// and a choice. This mirrors the TUI's Stage 1 decision that the user's typed
+// value is never lost to a conflict.
+func (b *Bot) showConflict(ctx context.Context, chatID int64, token string, a Action, typed string) error {
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	t, ok := ix.Get(a.TaskID)
+	if !ok {
+		_, sErr := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		return sErr
+	}
+	var theirs string
+	switch a.Arg {
+	case "title":
+		theirs = t.Content.Title
+	case "description":
+		theirs = t.Content.Description
+	case "tags":
+		theirs = strings.Join(t.Content.Tags, ", ")
+	}
+	text := "That task changed while you were typing.\n\n" +
+		"<b>Theirs:</b>\n" + EscapeHTML(theirs) + "\n\n" +
+		"<b>Yours:</b>\n" + EscapeHTML(typed)
+
+	o := b.originOf(a)
+	kb := [][]Button{{
+		{"Overwrite", Action{Kind: KindOverwrite, TaskID: a.TaskID, Arg: a.Arg, Text: typed, Page: o.Page, Query: o.Query}},
+		{"Keep theirs", Action{Kind: KindKeepTheirs, TaskID: a.TaskID, Page: o.Page, Query: o.Query}},
+	}}
+	_, err = b.s.Send(ctx, chatID, text, kb)
+	return err
+}
+
+// ResolveConflict applies the user's choice from showConflict.
+func (b *Bot) ResolveConflict(ctx context.Context, chatID, editMsgID int64, token string, a Action) error {
+	if a.Kind == KindKeepTheirs {
+		return b.OpenCard(ctx, chatID, editMsgID, token, a.TaskID, b.originOf(a))
+	}
+	patch := applyTextPatch(a.Arg, a.Text)
+	if patch == nil {
+		return b.failInternal(ctx, chatID, errors.New("unknown field "+a.Arg))
+	}
+	// The user has now SEEN the other value and chosen to overwrite, so the fresh
+	// version is the right guard (pinnedVersion 0).
+	_, err := b.applyEdit(ctx, token, a.TaskID, 0, patch)
+	return b.afterMutation(ctx, chatID, editMsgID, token, a, err)
+}

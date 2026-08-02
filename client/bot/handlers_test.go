@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -582,5 +583,190 @@ func TestSetFieldReportsAVanishedTask(t *testing.T) {
 	joined := strings.ToLower(textOf(f.sent) + " " + textOf(f.edited))
 	if !strings.Contains(joined, "no longer exists") {
 		t.Errorf("expected a 'no longer exists' reply, got %q", joined)
+	}
+}
+
+func TestPromptFieldPinsTheVersionAtPromptTime(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}} // version 4
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindPromptField, TaskID: "T", Arg: "title", Page: 1}
+	if err := b.PromptField(context.Background(), 42, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("want one ForceReply prompt, got %d", len(f.prompts))
+	}
+	got, ok := b.reg.GetByPrompt(f.nextMsgID)
+	if !ok {
+		t.Fatal("prompt was not registered against its message id")
+	}
+	if got.ExpectedVersion != 4 {
+		t.Errorf("pinned version = %d, want 4 (as of prompt time)", got.ExpectedVersion)
+	}
+	if got.Arg != "title" || got.TaskID != "T" || got.Page != 1 {
+		t.Errorf("prompt record lost context: %+v", got)
+	}
+}
+
+func TestHandleReplyAppliesTheEditWithThePinnedVersion(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title", ExpectedVersion: 2}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", "a new title"); err != nil {
+		t.Fatal(err)
+	}
+	if len(u.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(u.updates))
+	}
+	op := u.updates[0][0]
+	if op.ExpectedVersion != 2 {
+		t.Errorf("expected_version = %d, want the PINNED 2, not the fetched 4", op.ExpectedVersion)
+	}
+	if op.Content.Title != "a new title" {
+		t.Errorf("title = %q", op.Content.Title)
+	}
+}
+
+// The crux: free-text edits must NOT auto-retry, or a concurrent change is
+// silently clobbered.
+func TestHandleReplyDoesNotRetryOnConflict(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}, conflictOn: 1}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title", ExpectedVersion: 2}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", "mine"); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 1 {
+		t.Errorf("update calls = %d, want exactly 1 — free-text edits never auto-retry", u.updateCalls)
+	}
+	body := textOf(f.sent) + textOf(f.edited)
+	if !strings.Contains(body, "mine") {
+		t.Errorf("the user's typed value must be preserved in the conflict prompt:\n%s", body)
+	}
+	var kinds = map[ActionKind]bool{}
+	for _, m := range append(append([]sentMsg{}, f.sent...), f.edited...) {
+		for _, row := range m.KB {
+			for _, btn := range row {
+				kinds[btn.Action.Kind] = true
+			}
+		}
+	}
+	if !kinds[KindOverwrite] || !kinds[KindKeepTheirs] {
+		t.Error("a free-text conflict must offer Overwrite and Keep theirs")
+	}
+}
+
+func TestHandleReplyOnExpiredPromptCapturesInstead(t *testing.T) {
+	var added task.AddRequest
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tasks/add" {
+			json.NewDecoder(r.Body).Decode(&added)
+			json.NewEncoder(w).Encode(map[string]any{"state_version": 1,
+				"task": task.Task{ID: "NEW", Content: added.Content, Meta: task.Meta{Version: 1}}})
+			return
+		}
+		t.Errorf("unexpected path %s", r.URL.Path)
+	})
+	defer done()
+
+	// No prompt registered for 12345.
+	if err := b.HandleReply(context.Background(), 42, 12345, 12346, "sekrit", "some words"); err != nil {
+		t.Fatal(err)
+	}
+	if added.Content.Title != "some words" {
+		t.Errorf("expired prompt should capture the text, got %+v", added.Content)
+	}
+	if !strings.Contains(strings.ToLower(textOf(f.sent)), "expired") {
+		t.Errorf("the user must be told why this became a task:\n%s", textOf(f.sent))
+	}
+}
+
+func TestHandleReplyParsesTags(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "tags", ExpectedVersion: 4}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", " work , urgent ,, q3 "); err != nil {
+		t.Fatal(err)
+	}
+	got := u.updates[0][0].Content.Tags
+	want := []string{"work", "urgent", "q3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tags = %v, want %v (split, trimmed, empties dropped)", got, want)
+	}
+}
+
+func TestHandleReplyRejectsAnEmptyTitleClientSide(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title", ExpectedVersion: 4}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", "    "); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 0 {
+		t.Error("an empty title must not reach the server")
+	}
+	if !strings.Contains(strings.ToLower(textOf(f.sent)), "title") {
+		t.Errorf("expected a 'needs a title' reply, got %q", textOf(f.sent))
+	}
+}
+
+func TestPromptDeletesItsOwnMessageAfterHandling(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title", ExpectedVersion: 4}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", "new"); err != nil {
+		t.Fatal(err)
+	}
+	var sawPrompt bool
+	for _, id := range f.deleted {
+		if id == 900 {
+			sawPrompt = true
+		}
+	}
+	if !sawPrompt {
+		t.Error("the bot should delete its own ForceReply prompt after handling the reply")
+	}
+}
+
+func TestResolveConflictOverwriteWritesWithTheFreshVersion(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindOverwrite, TaskID: "T", Arg: "title", Text: "mine wins"}
+	if err := b.ResolveConflict(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if len(u.updates) != 1 || u.updates[0][0].Content.Title != "mine wins" {
+		t.Errorf("overwrite did not apply: %+v", u.updates)
+	}
+	if u.updates[0][0].ExpectedVersion != 4 {
+		t.Errorf("overwrite should use the fresh version, got %d", u.updates[0][0].ExpectedVersion)
+	}
+}
+
+func TestResolveConflictKeepTheirsDiscardsTheEdit(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindKeepTheirs, TaskID: "T"}
+	if err := b.ResolveConflict(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 0 {
+		t.Error("Keep theirs must not write anything")
 	}
 }
