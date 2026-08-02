@@ -1,6 +1,7 @@
 # Zig client build artifacts
 client/zig/.zig-cache/
 client/zig/zig-out/
+client/zig/zig-pkg/
 
 # Server runtime data + atomic-write temp files
 server/seshat-data.json
@@ -20,6 +21,9 @@ server/config.yaml
 .roo
 plans/
 docs/
+
+# Archived subagent-driven-development ledgers (see CLAUDE.md → Conventions)
+sdd_archive/
 
 # Go build binary
 /server/seshat

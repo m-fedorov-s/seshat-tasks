@@ -12,8 +12,15 @@ pub const Index = struct {
     referenced: std.StringHashMap(void),
 
     pub fn build(allocator: std.mem.Allocator, tasks: []const Task) !Index {
+        // The errdefers matter for non-arena callers: tui/model.zig's replaceTasks
+        // builds the Index from the long-lived gpa (a managed StringHashMap stores
+        // its allocator, so an arena-backed one would die with the arena). Every
+        // earlier caller passed an arena that swallowed a partial build; this one
+        // would leak both maps on an OOM partway through.
         var by_id = std.StringHashMap(Task).init(allocator);
+        errdefer by_id.deinit();
         var referenced = std.StringHashMap(void).init(allocator);
+        errdefer referenced.deinit();
         for (tasks) |t| {
             try by_id.put(t.id, t);
             for (t.content.child_ids) |c| try referenced.put(c, {});
@@ -83,6 +90,100 @@ test "select applies AND-combined filters over the top level" {
     try std.testing.expectEqualStrings("a", od[0].id);
 }
 
+test "select surfaces a root whose descendant matches the tag filter" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "untagged root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "ops kid", .status = .todo, .tags = @constCast(&[_][]const u8{"ops"}) }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("root", sel[0].id);
+}
+
+test "select surfaces a root whose descendant is overdue" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "kid", .status = .todo, .due_at = 50 }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .overdue = true }, 100);
+    defer a.free(sel);
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("root", sel[0].id);
+}
+
+test "select still drops a root with no match anywhere in its subtree" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "root", .content = .{ .title = "root", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "kid", .content = .{ .title = "kid", .status = .todo }, .meta = .{ .created_at = 2 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"kid"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.len);
+}
+
+test "subtree matching terminates on a cycle below a real root" {
+    const a = std.testing.allocator;
+    // `r` IS a root; x<->y is a cycle inside its subtree. Without `r` the cycle
+    // members are never roots, subtreeMatches is never called, and the test is vacuous.
+    var tasks = [_]Task{
+        .{ .id = "r", .content = .{ .title = "r", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "x", .content = .{ .title = "x", .status = .todo }, .meta = .{ .created_at = 2 } },
+        .{ .id = "y", .content = .{ .title = "y", .status = .todo, .tags = @constCast(&[_][]const u8{"ops"}) }, .meta = .{ .created_at = 3 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"x"});
+    tasks[1].content.child_ids = @constCast(&[_][]const u8{"y"});
+    tasks[2].content.child_ids = @constCast(&[_][]const u8{"x"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    // Terminates AND finds the tagged node through the cycle.
+    try std.testing.expectEqual(@as(usize, 1), sel.len);
+    try std.testing.expectEqualStrings("r", sel[0].id);
+}
+
+test "subtree matching terminates on a cycle with no match anywhere" {
+    // Unlike the cycle test above, nothing here matches the filter, so
+    // subtreeMatches cannot short-circuit on a self-match — it is forced to
+    // walk the full cycle (including the x<->y back-edge) and the cycle guard
+    // is the only thing that stops it from recursing forever.
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        .{ .id = "r", .content = .{ .title = "r", .status = .todo }, .meta = .{ .created_at = 1 } },
+        .{ .id = "x", .content = .{ .title = "x", .status = .todo }, .meta = .{ .created_at = 2 } },
+        .{ .id = "y", .content = .{ .title = "y", .status = .todo }, .meta = .{ .created_at = 3 } },
+    };
+    tasks[0].content.child_ids = @constCast(&[_][]const u8{"x"});
+    tasks[1].content.child_ids = @constCast(&[_][]const u8{"y"});
+    tasks[2].content.child_ids = @constCast(&[_][]const u8{"x"});
+    var idx = try Index.build(a, &tasks);
+    defer idx.deinit();
+
+    const sel = try select(a, &tasks, &idx, .{ .roots_only = true, .tags = &[_][]const u8{"ops"} }, 100);
+    defer a.free(sel);
+    // Terminates without a match anywhere in the cycle.
+    try std.testing.expectEqual(@as(usize, 0), sel.len);
+}
+
 fn hasAllTags(t: Task, tags: []const []const u8) bool {
     for (tags) |want| {
         var found = false;
@@ -108,22 +209,54 @@ fn isOverdue(t: Task, now: i64) bool {
     return due < now;
 }
 
-fn passes(t: Task, idx: *const Index, f: Filters, now: i64) bool {
-    if (f.roots_only and !idx.isRoot(t.id)) return false;
+// The per-task filter predicate. No roots_only handling — that is select's job.
+pub fn matchesSelf(t: Task, f: Filters, now: i64) bool {
     if (f.tags.len != 0 and !hasAllTags(t, f.tags)) return false;
     if (f.statuses.len != 0 and !statusInSet(t.content.status, f.statuses)) return false;
     if (f.overdue and !isOverdue(t, now)) return false;
     return true;
 }
 
+fn subtreeMatches(
+    t: Task,
+    idx: *const Index,
+    f: Filters,
+    now: i64,
+    seen: *std.StringHashMap(void),
+) !bool {
+    if (seen.contains(t.id)) return false; // cycle guard
+    try seen.put(t.id, {});
+    if (matchesSelf(t, f, now)) return true;
+    for (t.content.child_ids) |cid| {
+        const child = idx.by_id.get(cid) orelse continue;
+        if (try subtreeMatches(child, idx, f, now, seen)) return true;
+    }
+    return false;
+}
+
 // Returns a newly-allocated slice of the tasks that pass all filters.
 // Caller owns the slice (free with allocator.free); the Task values are shallow
 // copies referencing the original (arena-backed) string data.
+//
+// When f.roots_only is set, a root is kept iff it or anything in its subtree
+// matches (so a matching descendant is never silently erased). When false
+// (the CLI's --flat path), the per-task predicate applies directly with no
+// subtree walk.
 pub fn select(allocator: std.mem.Allocator, tasks: []const Task, idx: *const Index, f: Filters, now: i64) ![]Task {
     var list: std.ArrayList(Task) = .empty;
     errdefer list.deinit(allocator);
-    for (tasks) |t| {
-        if (passes(t, idx, f, now)) try list.append(allocator, t);
+    if (f.roots_only) {
+        var seen = std.StringHashMap(void).init(allocator);
+        defer seen.deinit();
+        for (tasks) |t| {
+            if (!idx.isRoot(t.id)) continue;
+            seen.clearRetainingCapacity();
+            if (try subtreeMatches(t, idx, f, now, &seen)) try list.append(allocator, t);
+        }
+    } else {
+        for (tasks) |t| {
+            if (matchesSelf(t, f, now)) try list.append(allocator, t);
+        }
     }
     return list.toOwnedSlice(allocator);
 }
@@ -210,15 +343,9 @@ fn isCompleted(t: Task) bool {
 
 const RankCtx = struct { strategy: Strategy, now: i64 };
 
-// true if a should sort before b.
-fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
-    // 1. completed always sinks
-    const ca = isCompleted(a);
-    const cb = isCompleted(b);
-    if (ca != cb) return !ca; // non-completed (false) comes first
-
-    // 2. strategy key
-    const key: ?bool = switch (ctx.strategy) {
+// Returns null when a and b are equal on the strategy key.
+fn strategyDiffers(ctx: RankCtx, a: Task, b: Task) ?bool {
+    return switch (ctx.strategy) {
         .priority => blk: {
             const pa = priorityWeight(a.content.priority);
             const pb = priorityWeight(b.content.priority);
@@ -252,7 +379,17 @@ fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
             break :blk null;
         },
     };
-    if (key) |k| return k;
+}
+
+// true if a should sort before b.
+fn lessThan(ctx: RankCtx, a: Task, b: Task) bool {
+    // 1. completed always sinks
+    const ca = isCompleted(a);
+    const cb = isCompleted(b);
+    if (ca != cb) return !ca; // non-completed (false) comes first
+
+    // 2. strategy key
+    if (strategyDiffers(ctx, a, b)) |ord| return ord;
 
     // stable tiebreak: oldest first, then id ascending (ids are unique -> total order)
     if (a.meta.created_at != b.meta.created_at) return a.meta.created_at < b.meta.created_at;
@@ -263,6 +400,35 @@ pub fn rank(tasks: []Task, strategy: Strategy, now: i64) void {
     // lessThan is a strict total order (the created_at,id tiebreak resolves all
     // ties), so stability is irrelevant; use the faster unstable sort.
     std.mem.sortUnstable(Task, tasks, RankCtx{ .strategy = strategy, .now = now }, lessThan);
+}
+
+const Ranked = struct { t: Task, score: i64, complete: bool };
+
+fn rankedLessThan(ctx: RankCtx, a: Ranked, b: Ranked) bool {
+    if (a.complete != b.complete) return !a.complete;
+    switch (ctx.strategy) {
+        .urgency => if (a.score != b.score) return a.score > b.score,
+        else => if (strategyDiffers(ctx, a.t, b.t)) |ord| return ord,
+    }
+    if (a.t.meta.created_at != b.t.meta.created_at) return a.t.meta.created_at < b.t.meta.created_at;
+    return std.mem.order(u8, a.t.id, b.t.id) == .lt;
+}
+
+// tasks.len == scores.len == all_complete.len. Sorts `tasks` in place.
+pub fn rankByScore(
+    allocator: std.mem.Allocator,
+    tasks: []Task,
+    scores: []const i64,
+    all_complete: []const bool,
+    strategy: Strategy,
+    now: i64,
+) !void {
+    std.debug.assert(tasks.len == scores.len and tasks.len == all_complete.len);
+    const pairs = try allocator.alloc(Ranked, tasks.len);
+    defer allocator.free(pairs);
+    for (tasks, scores, all_complete, 0..) |task_, s, c, i| pairs[i] = .{ .t = task_, .score = s, .complete = c };
+    std.mem.sortUnstable(Ranked, pairs, RankCtx{ .strategy = strategy, .now = now }, rankedLessThan);
+    for (pairs, 0..) |p, i| tasks[i] = p.t;
 }
 
 test "rank: due strategy sorts soonest first and sinks undated" {
@@ -276,6 +442,64 @@ test "rank: due strategy sorts soonest first and sinks undated" {
     try std.testing.expectEqualStrings("soon", tasks[0].id);
     try std.testing.expectEqualStrings("late", tasks[1].id);
     try std.testing.expectEqualStrings("undated", tasks[2].id);
+}
+
+test "rankByScore orders by the injected score, not the task's own urgency" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        // created_at ordering is DELIBERATELY opposite the score ordering, so a
+        // stub that ignores `scores` and falls through to the tiebreak fails.
+        .{ .id = "a", .content = .{ .title = "a" }, .meta = .{ .created_at = 9 } },
+        .{ .id = "b", .content = .{ .title = "b" }, .meta = .{ .created_at = 1 } },
+    };
+    const scores = [_]i64{ 20, 5 };
+    const complete = [_]bool{ false, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("a", tasks[0].id);
+}
+
+test "rankByScore sinks on all_complete, not on the task's own status" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        .{ .id = "donep", .content = .{ .title = "done parent", .status = .done }, .meta = .{ .created_at = 1 } },
+        .{ .id = "live", .content = .{ .title = "live", .priority = .low }, .meta = .{ .created_at = 2 } },
+    };
+    // The done parent has a live overdue child, so its subtree is NOT complete.
+    const scores = [_]i64{ 13, 1 };
+    const complete = [_]bool{ false, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("donep", tasks[0].id);
+}
+
+test "rankByScore sinks a fully-complete subtree whose own status is live" {
+    const a = std.testing.allocator;
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        // NOT .done — so a stub using the existing own-status sink fails here.
+        .{ .id = "allDone", .content = .{ .title = "all done", .priority = .high }, .meta = .{ .created_at = 1 } },
+        .{ .id = "live", .content = .{ .title = "live", .priority = .low }, .meta = .{ .created_at = 2 } },
+    };
+    const scores = [_]i64{ 5, 1 };
+    const complete = [_]bool{ true, false };
+    try rankByScore(a, &tasks, &scores, &complete, .urgency, now);
+    try std.testing.expectEqualStrings("live", tasks[0].id);
+}
+
+test "rank still behaves exactly as before" {
+    const now: i64 = 1000;
+    var tasks = [_]Task{
+        .{ .id = "z", .content = .{ .title = "z", .priority = .low }, .meta = .{ .created_at = 1 } },
+        .{ .id = "d", .content = .{ .title = "d", .priority = .high, .status = .done }, .meta = .{ .created_at = 2 } },
+        .{ .id = "h1", .content = .{ .title = "h1", .priority = .high }, .meta = .{ .created_at = 5 } },
+        .{ .id = "h2", .content = .{ .title = "h2", .priority = .high }, .meta = .{ .created_at = 3 } },
+    };
+    rank(&tasks, .priority, now);
+    try std.testing.expectEqualStrings("h2", tasks[0].id);
+    try std.testing.expectEqualStrings("h1", tasks[1].id);
+    try std.testing.expectEqualStrings("z", tasks[2].id);
+    try std.testing.expectEqualStrings("d", tasks[3].id);
 }
 
 pub const ResolveError = error{ NoSuchId, AmbiguousId };

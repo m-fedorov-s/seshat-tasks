@@ -8,6 +8,8 @@ const formatter = @import("formatter.zig");
 const view = @import("core/view.zig");
 const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
+const filterspec = @import("core/filterspec.zig");
+const app = @import("tui/app.zig");
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -38,6 +40,18 @@ pub fn main(init: std.process.Init) !void {
 // ONLY at stdout write/flush sites — never wrap a `client.*` call with it.
 fn stdoutErr(err: anyerror) anyerror {
     return if (err == error.WriteFailed) error.StdoutClosed else err;
+}
+
+// api/client.zig no longer prints: a non-2xx response is *recorded* on the Client (so a
+// future alt-screen TUI can put it in a status line instead of corrupting the display) and
+// surfaced as `error.ApiFailed`. The CLI's user-facing line is emitted here instead —
+// same text, same `error.Reported` → silent exit 1 as before. Any other error (network,
+// OOM) passes through untouched to main's catch-all.
+fn reportApiError(client: *Client, err: anyerror) anyerror {
+    if (err != error.ApiFailed) return err;
+    const e = client.lastError() orelse return err;
+    std.debug.print("server error ({d}): {s}\n", .{ e.code, e.message });
+    return error.Reported;
 }
 
 fn run(init: std.process.Init) !void {
@@ -78,6 +92,8 @@ fn run(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "show")) {
         try runShow(allocator, init, &client, &out.interface, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "tui")) {
+        try runTui(allocator, init, &client, args[2..]);
     } else if (std.mem.eql(u8, cmd, "add")) {
         try runAdd(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "delete")) {
@@ -85,18 +101,18 @@ fn run(init: std.process.Init) !void {
             std.debug.print("Usage: seshat delete <id>\n", .{});
             return error.Reported;
         }
-        const tasks = try client.fetchTasks();
+        const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(&client, err);
         const t = view.resolve(tasks, args[2]) catch |err| {
             reportResolveError(err, args[2]);
             return error.Reported;
         };
-        try client.deleteTask(t.id);
+        client.deleteTask(allocator, t.id) catch |err| return reportApiError(&client, err);
     } else if (std.mem.eql(u8, cmd, "done")) {
         if (args.len < 3) {
             std.debug.print("Usage: seshat done <id>\n", .{});
             return error.Reported;
         }
-        try markDone(&client, args[2]);
+        try markDone(allocator, &client, args[2]);
     } else if (std.mem.eql(u8, cmd, "update")) {
         try runUpdate(allocator, init, &client, &out.interface, args[2..]);
     } else if (std.mem.eql(u8, cmd, "help")) {
@@ -132,47 +148,36 @@ fn runShow(
     defer argparse.deinit(allocator, &parsed);
 
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s));
-    const tasks = try client.fetchTasks();
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     var idx = try view.Index.build(allocator, tasks);
     defer idx.deinit();
 
     // --- build Filters ---
+    // filterspec.parse only knows about `--filter` expressions; `--open` (seeds the
+    // status list) and `--flat` (roots_only) are merged in here, not inside the parser —
+    // see client/zig/src/core/filterspec.zig for why.
+    const fs = filterspec.parse(allocator, parsed.getMulti("filter")) catch |e| switch (e) {
+        error.BadFilter => {
+            std.debug.print("error: bad --filter expression (want tag:NAME, status:S1,S2, or overdue)\n", .{});
+            return error.Reported;
+        },
+        error.OutOfMemory => return e,
+    };
+    defer fs.deinit(allocator);
+
     var status_list = std.ArrayList(task.Status).empty;
     defer status_list.deinit(allocator);
-    var tag_list = std.ArrayList([]const u8).empty;
-    defer tag_list.deinit(allocator);
-    var overdue = false;
-
     if (parsed.getBool("open")) {
         try status_list.append(allocator, .todo);
         try status_list.append(allocator, .in_progress);
     }
-    for (parsed.getMulti("filter")) |expr| {
-        if (std.mem.startsWith(u8, expr, "tag:")) {
-            try tag_list.append(allocator, expr["tag:".len..]);
-        } else if (std.mem.startsWith(u8, expr, "status:")) {
-            var it = std.mem.splitScalar(u8, expr["status:".len..], ',');
-            while (it.next()) |s| {
-                if (std.meta.stringToEnum(task.Status, s)) |st| {
-                    try status_list.append(allocator, st);
-                } else {
-                    std.debug.print("Unknown status in filter: {s}\n", .{s});
-                    return error.Reported;
-                }
-            }
-        } else if (std.mem.eql(u8, expr, "overdue")) {
-            overdue = true;
-        } else {
-            std.debug.print("Unknown filter: {s}\n", .{expr});
-            return error.Reported;
-        }
-    }
+    try status_list.appendSlice(allocator, fs.statuses);
 
     const filters = view.Filters{
         .roots_only = !parsed.getBool("flat"),
-        .tags = tag_list.items,
+        .tags = fs.tags,
         .statuses = status_list.items,
-        .overdue = overdue,
+        .overdue = fs.overdue,
     };
 
     // --- sort strategy ---
@@ -215,6 +220,90 @@ fn runShow(
 
     formatter.render(out, opts, now, selected, &idx) catch |err| return stdoutErr(err);
     out.flush() catch |err| return stdoutErr(err);
+}
+
+// The TUI takes the view flags that mean something to a full-screen tree:
+// `--filter`, `--open` and `--sort`, parsed and merged exactly as `runShow` does.
+//
+// `--flat` is deliberately NOT accepted. In `show` it does two unrelated things —
+// `roots_only = false` (rank every task as a top-level entry) and
+// `show_children = false` (print no subtrees) — and the TUI's ledger is a tree by
+// construction: folding, the `(+n)` badge and subtree scoring all assume roots
+// with descendants under them. There is no flat mode to turn on.
+const tui_specs = [_]argparse.OptionSpec{
+    .{ .name = "sort", .kind = .value },
+    .{ .name = "filter", .kind = .multi },
+    .{ .name = "open", .kind = .boolean },
+};
+
+fn runTui(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    client: *Client,
+    flag_argv: []const []const u8,
+) !void {
+    var parsed = argparse.parse(allocator, flag_argv, &tui_specs) catch |err| {
+        std.debug.print("Bad arguments to `tui`: {s}\n", .{@errorName(err)});
+        return error.Reported;
+    };
+    defer argparse.deinit(allocator, &parsed);
+
+    // LIFETIME: everything below is handed to `app.run` and read for the whole
+    // session, so unlike `runShow` nothing here is freed on the way out. In
+    // particular there is no `fs.deinit` — `allocator` is the process arena, whose
+    // `free` reclaims the most recent allocation, which would hand the filter's
+    // own bytes to the next allocation in the session.
+    const fs = filterspec.parse(allocator, parsed.getMulti("filter")) catch |e| switch (e) {
+        error.BadFilter => {
+            std.debug.print("error: bad --filter expression (want tag:NAME, status:S1,S2, or overdue)\n", .{});
+            return error.Reported;
+        },
+        error.OutOfMemory => return e,
+    };
+
+    var status_list = std.ArrayList(task.Status).empty;
+    if (parsed.getBool("open")) {
+        try status_list.append(allocator, .todo);
+        try status_list.append(allocator, .in_progress);
+    }
+    try status_list.appendSlice(allocator, fs.statuses);
+
+    const filters = view.Filters{
+        // Always a forest: see the `--flat` note above.
+        .roots_only = true,
+        .tags = fs.tags,
+        .statuses = try status_list.toOwnedSlice(allocator),
+        .overdue = fs.overdue,
+    };
+
+    const strategy: view.Strategy = blk: {
+        const s = parsed.getValue("sort") orelse break :blk .urgency;
+        break :blk std.meta.stringToEnum(view.Strategy, s) orelse {
+            std.debug.print("Unknown sort strategy: {s}\n", .{s});
+            return error.Reported;
+        };
+    };
+
+    // The filter EXPRESSION travels alongside the parsed filters because the
+    // model's three filter-aware behaviours read the text and the flag, not
+    // `m.filters`: the header's scope word, the dimming of rows that matched only
+    // via a descendant, and `ledger.buildRows`' orphan gate. Handing over
+    // `filters` alone would apply the filter while rendering as if none were set.
+    //
+    // `--open` is spelled out as the status expression it stands for, so the
+    // string re-parses to exactly these filters — that keeps the header honest and
+    // gives `Esc` (which clears the whole filter) something truthful to clear.
+    // Joined with spaces because that is the form the `/` prompt takes: one line,
+    // whitespace where the flag repeat used to be.
+    var exprs = std.ArrayList([]const u8).empty;
+    if (parsed.getBool("open")) try exprs.append(allocator, "status:todo,in_progress");
+    try exprs.appendSlice(allocator, parsed.getMulti("filter"));
+    const filter_expr = try std.mem.join(allocator, " ", exprs.items);
+
+    // `init.gpa`, NOT the process arena: a TUI session is long-lived and frees as
+    // it goes (per-request arenas, editor buffers, the model's own arenas), and an
+    // arena's no-op `free` would turn every refresh into permanent growth.
+    try app.run(init.io, init.gpa, init.environ_map, client, filters, strategy, filter_expr);
 }
 
 // auto -> on only if stdout is a TTY and NO_COLOR is unset; --no-color forces off.
@@ -288,8 +377,8 @@ fn reportResolveError(err: view.ResolveError, id_prefix: []const u8) void {
 
 // markDone fetches fresh, resolves the id prefix, flips status to done, sends a
 // batch update with the current version. A conflict is reported plainly.
-fn markDone(client: *Client, id_prefix: []const u8) !void {
-    const tasks = try client.fetchTasks();
+fn markDone(allocator: std.mem.Allocator, client: *Client, id_prefix: []const u8) !void {
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     const t = view.resolve(tasks, id_prefix) catch |err| {
         reportResolveError(err, id_prefix);
         return error.Reported;
@@ -297,13 +386,16 @@ fn markDone(client: *Client, id_prefix: []const u8) !void {
     var content = t.content;
     content.status = .done;
     const ops = [_]types.UpdateOp{.{ .id = t.id, .content = content, .expected_version = t.meta.version }};
-    _ = client.updateTasks(&ops) catch |err| {
-        if (err == error.Conflict) {
+    const result = client.updateTasks(allocator, &ops) catch |err| return reportApiError(client, err);
+    switch (result) {
+        // The CLI refetched immediately above, so a conflict here means a genuine race
+        // with another writer; it has nothing useful to do with the fresh tasks.
+        .conflict => {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
             return error.Reported;
-        }
-        return err;
-    };
+        },
+        .ok => {},
+    }
 }
 
 fn runAdd(
@@ -344,7 +436,7 @@ fn runAdd(
         return;
     }
 
-    const created = try client.addTask(new_content, null);
+    const created = client.addTask(allocator, new_content, null) catch |err| return reportApiError(client, err);
     if (parsed.getBool("verbose")) {
         const one = [_]task.Task{created};
         try renderOne(allocator, init, out, client, &one, created, .compact, now);
@@ -380,7 +472,7 @@ fn runUpdate(
         return error.Reported;
     }
 
-    const tasks = try client.fetchTasks();
+    const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
     const t = view.resolve(tasks, id) catch |err| {
         reportResolveError(err, id);
         return error.Reported;
@@ -399,12 +491,15 @@ fn runUpdate(
     }
 
     const ops = [_]types.UpdateOp{.{ .id = t.id, .content = new_content, .expected_version = t.meta.version }};
-    const updated = client.updateTasks(&ops) catch |err| {
-        if (err == error.Conflict) {
+    const result = client.updateTasks(allocator, &ops) catch |err| return reportApiError(client, err);
+    const updated = switch (result) {
+        // As in markDone: this process refetched a moment ago, so the fresh tasks the 409
+        // carries add nothing the user can act on here. The TUI is the caller that uses them.
+        .conflict => {
             std.debug.print("Conflict: task changed on the server. Re-run after a fresh `show`.\n", .{});
             return error.Reported;
-        }
-        return err;
+        },
+        .ok => |tasks_out| tasks_out,
     };
 
     if (parsed.getBool("verbose") and updated.len > 0) {
@@ -425,6 +520,10 @@ fn usage() void {
         \\                      --detailed    rich output (tags, dates, ids, description)
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
+        \\  tui [flags]       Interactive full-screen view. Flags:
+        \\                      --sort <priority|due|title|created|urgency>  (default urgency)
+        \\                      --filter <tag:NAME|status:S1,S2|overdue>     (repeatable, AND)
+        \\                      --open        only todo/in_progress
         \\  add <title> [edits]   Add a top-level task. Accepts the edit flags below.
         \\  update <id> [edits]   Edit a task (id tail / #handle). Edit flags:
         \\                      --title S  --description S  --status S  --priority S
@@ -450,5 +549,17 @@ test {
     _ = @import("formatter.zig");
     _ = @import("core/config.zig");
     _ = @import("core/edit.zig");
+    _ = @import("core/filterspec.zig");
     _ = @import("api/client.zig");
+    _ = @import("tui/ledger.zig");
+    _ = @import("tui/editors.zig");
+    _ = @import("tui/model.zig");
+    // render.zig has no tests of its own (spec §14) and nothing imports it yet, so
+    // this import plus its own `refAllDecls` block is the ONLY thing that gets its
+    // function bodies typechecked at all.
+    _ = @import("tui/render.zig");
+    // Same story for app.zig: no tests of its own, and nothing in the exe graph
+    // reaches it until the `tui` subcommand exists. This import plus its own
+    // `refAllDecls` block is what typechecks the event loop at all.
+    _ = @import("tui/app.zig");
 }

@@ -11,6 +11,9 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
 
+    const vaxis_dep = b.dependency("vaxis", .{ .target = b.graph.host, .optimize = .Debug });
+    const vaxis_mod = vaxis_dep.module("vaxis");
+
     const exe = b.addExecutable(.{
         .name = "seshat",
         .root_module = b.createModule(.{
@@ -19,6 +22,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", options);
+    exe.root_module.addImport("vaxis", vaxis_mod);
 
     b.installArtifact(exe);
 
@@ -40,6 +44,7 @@ pub fn build(b: *std.Build) void {
     // The test root is main.zig, which imports build_options — so the test artifact
     // needs the same options module or `zig build test` fails to compile.
     unit_tests.root_module.addOptions("build_options", options);
+    unit_tests.root_module.addImport("vaxis", vaxis_mod);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
