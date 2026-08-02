@@ -5,13 +5,21 @@
 //! rule, it belongs in `ledger.zig` — that separation is what keeps the whole model
 //! layer testable without a terminal.
 //!
-//! There are no tests of what this file DRAWS, by design (spec §14) — a
-//! renderer's output is the screen, and that is the human checkpoint's job. The
-//! `test { refAllDecls }` at the bottom exists only to force the compiler to
+//! There are no tests of what this file LOOKS LIKE, by design (spec §14) — a
+//! renderer's aesthetics are the screen, and that is the human checkpoint's job.
+//! The `test { refAllDecls }` at the bottom exists only to force the compiler to
 //! actually analyse these function bodies: a test build analyses only what a
-//! `test` block reaches. The one real test at the bottom is a MEMORY test, not a
-//! layout test: libvaxis cells borrow the strings written into them, so `draw`
-//! has to outlive itself. See "frame scratch" below.
+//! `test` block reaches.
+//!
+//! The two real tests at the bottom test INVARIANTS the look depends on, not the
+//! look. Both were written after the thing they check had already shipped broken
+//! and been found by a human at a terminal, which is the bar for adding another:
+//!  * a MEMORY invariant — libvaxis cells borrow the strings written into them,
+//!    so `draw` has to outlive itself (see "frame scratch" below);
+//!  * a LAYOUT invariant — whatever the model lets the user select, this file has
+//!    to paint a selection bar for it. A pane one row shorter than its own field
+//!    list is not an aesthetic problem, it is a selection you cannot see.
+//! A `vaxis.Window` needs only a `Screen`, so neither costs a TTY.
 const std = @import("std");
 const vaxis = @import("vaxis");
 
@@ -363,6 +371,18 @@ fn lookup(m: *const Model, id: []const u8) ?Task {
 const pane_fields = [_]FieldId{ .title, .description, .status, .priority, .due, .scheduled, .tags };
 const label_col: u16 = 14;
 
+comptime {
+    // These three numbers are the same number, and it is a bug when they are not.
+    // `model.stepField` walks the whole `FieldId` enum, this table decides what is
+    // PAINTED, and `ledger.layoutFor` decides how many rows there are to paint
+    // into. If the pane is shorter than the table, the focus can sit on a field
+    // that is never drawn — no visible selection at all, one row below the last
+    // line of the pane. Adding a field without raising `pane_min_rows` now fails
+    // to compile instead of failing on a 20-row terminal.
+    std.debug.assert(pane_fields.len == @typeInfo(FieldId).@"enum".fields.len);
+    std.debug.assert(pane_fields.len == ledger.pane_min_rows);
+}
+
 fn drawPane(win: vaxis.Window, m: *const Model) void {
     if (m.load_failed) return; // the ledger already says why there is nothing
     const t = paneTask(m) orelse {
@@ -653,4 +673,90 @@ test "the strings draw() commits to cells outlive draw()" {
     try std.testing.expect(std.mem.indexOf(u8, row, "write the report") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "OVERDUE") != null); // due wording
     try std.testing.expect(std.mem.indexOf(u8, row, "#") != null); // the handle
+}
+
+// ─── the one layout test ─────────────────────────────────────────────────────
+//
+// Also not a test of what the screen looks like — it asserts an INVARIANT the
+// screen has to satisfy: whatever field the model lets the user focus, the pane
+// has to paint a focus bar for it. The bug that earned this test (found by
+// driving a real terminal, not by review) was `layoutFor` flooring the pane at 6
+// rows while this file paints 7 fields: on any terminal 11–23 rows tall, ↓ onto
+// `tags` moved the selection one row below the last painted line of the pane and
+// the highlight simply disappeared. The comptime assert above is the real guard;
+// this is what proves the assert is guarding the right thing.
+
+// The rows of `win` whose first cell carries the cursor/focus background.
+fn testHighlightedRows(win: vaxis.Window, out: []u16) []const u16 {
+    var n: usize = 0;
+    var y: u16 = 0;
+    while (y < win.height and n < out.len) : (y += 1) {
+        const cell = win.screen.readCell(0, y) orelse continue;
+        if (std.meta.eql(cell.style.bg, cursor_bg)) {
+            out[n] = y;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "every field the focus can reach is painted, at every height that shows a pane" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+
+    // The whole band from "a pane appears at all" up past the point where the
+    // third-of-the-screen rule takes over from the floor. 20 was the height the
+    // bug was seen at; 24 was the height every earlier eyeball happened to use.
+    var rows: u16 = ledger.chrome_rows + @as(u16, ledger.pane_min_rows) + 1;
+    while (rows <= 40) : (rows += 1) {
+        var m: Model = undefined;
+        try m.init(a, now, 0);
+        defer m.deinit();
+
+        var tasks = [_]Task{.{
+            .id = "01JQRSTUVWXYZABCDEFGHJKMNP",
+            .content = .{ .title = "a task", .status = .todo },
+            .meta = .{ .created_at = now },
+        }};
+        _ = try model.update(a, &m, .{ .tasks_loaded = &tasks });
+        _ = try model.update(a, &m, .{ .resize = .{ .cols = 60, .rows = rows } });
+
+        var screen: vaxis.Screen = try .init(a, .{ .cols = 60, .rows = rows, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win: vaxis.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = screen.width,
+            .height = screen.height,
+            .screen = &screen,
+        };
+
+        // Enter opens the pane and descends to the fields; ↓ walks them.
+        _ = try model.update(a, &m, .{ .key = .enter });
+        const layout = ledger.layoutFor(rows -| ledger.chrome_rows, m.pane_open);
+        try std.testing.expect(layout.pane_rows > 0); // the band was chosen for this
+
+        for (pane_fields) |_| {
+            draw(win, &m);
+            var buf: [64]u16 = undefined;
+            const hits = testHighlightedRows(win, &buf);
+            // Two bars: the cursor's ledger row, and the focused field in the
+            // pane. Exactly one of them lands inside the pane's row range.
+            const pane_top: u16 = 1 + clampU16(layout.ledger_rows);
+            var in_pane: usize = 0;
+            for (hits) |y| {
+                if (y >= pane_top and y < pane_top + clampU16(layout.pane_rows)) in_pane += 1;
+            }
+            std.testing.expectEqual(@as(usize, 1), in_pane) catch |err| {
+                std.debug.print(
+                    "rows={d} pane_rows={d} focused field={s} had {d} highlighted pane rows\n",
+                    .{ rows, layout.pane_rows, @tagName(m.mode.field), in_pane },
+                );
+                return err;
+            };
+            _ = try model.update(a, &m, .{ .key = .down });
+        }
+    }
 }

@@ -285,6 +285,19 @@ pub const Layout = struct { ledger_rows: usize, pane_rows: usize };
 // `Window.height`), so each can write a plain saturating `-| chrome_rows`.
 pub const chrome_rows: u16 = 3;
 
+// The floor on an OPEN detail pane, and the second constant on this file's
+// don't-let-them-drift list.
+//
+// `render.drawPane` paints a FIXED list of field rows — one per `model.FieldId`
+// — and does not scroll. A pane shorter than that list therefore never draws its
+// last field, while `model.stepField` will still happily move the focus onto it:
+// the focus bar vanishes off the bottom of the pane and the user is left with a
+// selection they cannot see (observed at a real terminal, `tags` unreachable on
+// anything under 24 rows). So the floor is the FIELD COUNT, not a round number.
+// `render.zig` asserts at comptime that its `pane_fields` table is exactly this
+// long, so raising one without the other will not compile.
+pub const pane_min_rows: usize = 7;
+
 pub fn ensureVisible(cursor_index: usize, row_count: usize, height: usize, scroll_top: usize) usize {
     if (height == 0) return scroll_top;
     // Clamp first: a filter or a collapse can leave scroll_top past the end.
@@ -300,8 +313,10 @@ pub fn halfPage(height: usize) usize {
 }
 
 pub fn layoutFor(total_rows: usize, pane_open: bool) Layout {
-    if (!pane_open or total_rows < 8) return .{ .ledger_rows = total_rows, .pane_rows = 0 };
-    const pane = @max(6, total_rows / 3);
+    // `+ 1`: below this there is not room for a whole pane AND a ledger row, and
+    // a pane with nothing above it is worse than no pane.
+    if (!pane_open or total_rows < pane_min_rows + 1) return .{ .ledger_rows = total_rows, .pane_rows = 0 };
+    const pane = @max(pane_min_rows, total_rows / 3);
     return .{ .ledger_rows = total_rows - pane, .pane_rows = pane };
 }
 
@@ -681,8 +696,23 @@ test "layoutFor gives the pane a third of the screen, and nothing when closed" {
 
     const open = layoutFor(40, true);
     try std.testing.expectEqual(@as(usize, 40), open.ledger_rows + open.pane_rows);
-    try std.testing.expect(open.pane_rows >= 6);
+    try std.testing.expect(open.pane_rows >= pane_min_rows);
     try std.testing.expect(open.ledger_rows > open.pane_rows);
+}
+
+// The bug this constant exists for: an open pane one row shorter than the field
+// list hides its last field, and the focus can still be moved onto it. Checked
+// across every height, not just a sampled one, because the failing band was
+// narrow (11–23 rows) and a sampled test at 24 missed it entirely.
+test "an open pane is never shorter than the field list it paints" {
+    var total: usize = 0;
+    while (total <= 200) : (total += 1) {
+        const l = layoutFor(total, true);
+        if (l.pane_rows == 0) continue; // no pane at all: nothing to hide
+        try std.testing.expect(l.pane_rows >= pane_min_rows);
+        try std.testing.expect(l.ledger_rows >= 1); // and never at the ledger's total expense
+        try std.testing.expectEqual(total, l.ledger_rows + l.pane_rows);
+    }
 }
 
 test "layoutFor degrades gracefully on a tiny terminal" {

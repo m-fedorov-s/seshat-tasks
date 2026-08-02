@@ -260,13 +260,54 @@ fn retainedText(m: *const model.Model) ?[]const u8 {
     return e.editor.external;
 }
 
-// $VISUAL, then $EDITOR, then `vi` — the conventional chain, most specific
-// first: $VISUAL is the full-screen editor, which is exactly what a terminal we
-// have just handed back wants.
-fn editorCommand(env: *const std.process.Environ.Map) []const u8 {
+// The fallback chain, used only when the user has configured NOTHING. `vi`
+// leads it because POSIX says so and because it is the name to blame in the
+// error message when the machine has no editor at all.
+//
+// It is a LIST rather than the single name `vi` because of a bug found at a
+// real terminal: Arch and its derivatives ship `vim` WITHOUT the `vi`
+// compatibility symlink, so on a machine with a perfectly good editor and no
+// `$EDITOR` set, every single description edit failed with
+// `could not run the editor (FileNotFound)` — a message that names neither the
+// program that was missing nor the fact that the program was our own guess.
+const fallback_editors = [_][]const u8{ "vi", "vim", "nvim", "nano" };
+
+// $VISUAL, then $EDITOR, then the fallback chain — most specific first:
+// $VISUAL is the full-screen editor, which is exactly what a terminal we have
+// just handed back wants.
+fn editorCommand(io: std.Io, env: *const std.process.Environ.Map) []const u8 {
     if (nonBlank(env.get("VISUAL"))) |v| return v;
     if (nonBlank(env.get("EDITOR"))) |v| return v;
-    return "vi";
+    for (fallback_editors) |candidate| {
+        if (onPath(io, env, candidate)) return candidate;
+    }
+    // Nothing is installed. Return the conventional name anyway so the failure
+    // reads `could not run the editor 'vi' (FileNotFound)` rather than naming
+    // whichever candidate happened to be last in the list.
+    return fallback_editors[0];
+}
+
+// Is `name` an executable on PATH? Asked ONLY about the fallback list: a
+// $VISUAL/$EDITOR the user set is spawned exactly as configured and never
+// second-guessed, so a typo there still reports THEIR value instead of quietly
+// running something else. Resolution mirrors what `std.process.spawn` does with
+// a bare `argv[0]` (PATH from the parent environment; the same default when it
+// is unset), so a candidate that passes here is one spawn will find.
+//
+// The TOCTOU caveat on `Dir.access` is deliberate and harmless here: the worst
+// case is that the editor is uninstalled between this check and the spawn, and
+// the spawn then reports the same FileNotFound it would have reported anyway.
+fn onPath(io: std.Io, env: *const std.process.Environ.Map, name: []const u8) bool {
+    // Matches std.Io.Threaded's `default_PATH`.
+    const path_var = nonBlank(env.get("PATH")) orelse "/usr/local/bin:/bin/:/usr/bin";
+    var dirs = std.mem.tokenizeScalar(u8, path_var, ':');
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (dirs.next()) |dir| {
+        const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
+        std.Io.Dir.cwd().access(io, full, .{ .execute = true }) catch continue;
+        return true;
+    }
+    return false;
 }
 
 // Blank counts as unset: `EDITOR=` is how a shell profile disables one, and
@@ -289,18 +330,55 @@ fn nonBlank(v: ?[]const u8) ?[]const u8 {
 // either a parser or handing the string to `sh -c`, and `sh -c` would put a
 // shell between the user and their terminal for the sake of a rare case.
 fn editorArgv(
+    io: std.Io,
     alloc: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     path: []const u8,
 ) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     // `tokenizeAny` drops empty tokens, so runs of spaces collapse on their own.
-    var words = std.mem.tokenizeAny(u8, editorCommand(env), " \t");
+    var words = std.mem.tokenizeAny(u8, editorCommand(io, env), " \t");
     while (words.next()) |word| try argv.append(alloc, word);
     // `editorCommand` never returns blank, so there is always at least one word
     // before this and `argv[0]` is never the file itself.
     try argv.append(alloc, path);
     return argv.toOwnedSlice(alloc);
+}
+
+// Start the editor on `path` and wait for it.
+//
+// Split out of `runEditor` because it is the one step in there that needs NO
+// terminal, and it is the step that was broken: everything around it is
+// tty handover, and this is just "does the configured program start". A test
+// can call it with a controlled environment and a harmless command.
+//
+// `.inherit` on all three streams is what makes this a full-screen editor
+// rather than something drawing into a pipe; it is spelled out rather than
+// defaulted because it is the point. Two things are left to `std.process`
+// deliberately: a bare `argv[0]` is resolved against the PARENT's PATH, and a
+// null `environ_map` hands the child the parent's own environment — which is
+// what an editor needs (TERM above all). Neither is something to reimplement.
+fn spawnEditor(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    path: []const u8,
+) !std.process.Child.Term {
+    // Freed here rather than left to the caller's arena: `runEditor` does hand in
+    // an arena, but this function is also called from tests with a checked
+    // allocator, and "the argv outlives the child" is a property worth owning
+    // locally. Only the outer slice is ours — the words point into `env` and
+    // `path`. `spawn` has null-terminated its own copy before it forks, so it is
+    // released after the wait purely so nothing reads it mid-flight.
+    const argv = try editorArgv(io, alloc, env, path);
+    defer alloc.free(argv);
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    return child.wait(io);
 }
 
 // The cancel decision, kept pure so it can be tested without a terminal: a
@@ -459,17 +537,8 @@ fn runEditor(
         try seed_file.writeStreamingAll(io, initial);
     }
 
-    // 4. The editor owns the terminal for the duration — `.inherit` on all three
-    // streams is what makes it a full-screen editor rather than something
-    // drawing into a pipe. It is spelled out rather than defaulted because it is
-    // the point. `argv[0]` is resolved against the parent's PATH.
-    var child = try std.process.spawn(io, .{
-        .argv = try editorArgv(alloc, sh.env, path),
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-    });
-    const term = try child.wait(io);
+    // 4. The editor owns the terminal for the duration. See `spawnEditor`.
+    const term = try spawnEditor(io, alloc, sh.env, path);
 
     // 6. Read it back, then remove it whatever the answer turns out to be. The
     // editor may well have replaced the inode rather than rewritten it (vim's
@@ -535,10 +604,15 @@ fn execute(
                 // say why. TWO requests because `retire` frees an arena as soon
                 // as its event is consumed, and the message lives in one.
                 const failure = try newRequest(gpa, pending);
+                // NAME THE PROGRAM. Without it, a missing `vi` and a typo in
+                // the user's own $EDITOR produce the identical opaque line, and
+                // neither says whose choice the failing name was — which is
+                // exactly how a machine with vim but no `vi` symlink looked
+                // like a broken TUI rather than an unset $EDITOR.
                 const msg = try std.fmt.allocPrint(
                     failure.arena.allocator(),
-                    "could not run the editor ({s})",
-                    .{@errorName(err)},
+                    "could not run the editor '{s}' ({s})",
+                    .{ editorCommand(io, sh.env), @errorName(err) },
                 );
                 try loop.postEvent(.{ .result = .{ .req = req, .event = .{ .editor_returned = null } } });
                 try loop.postEvent(.{ .result = .{ .req = failure, .event = .{ .request_failed = msg } } });
@@ -810,46 +884,176 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-// The three DECISIONS inside the $EDITOR suspend that are not about the
-// terminal — which editor to run, what counts as a cancel, and what counts as
-// content. They are pure by construction so they can be checked here, because
-// the rest of `runEditor` can only be checked by a human at a real terminal and
-// these are exactly the parts that human is least likely to notice going wrong.
+// The `std.Io` these tests run on. Container-level and lazily evaluated, so
+// `std.testing.io`'s non-test `@compileError` is never reached in a real build.
+const test_io = std.testing.io;
 
-test "the editor is \\$VISUAL, then \\$EDITOR, then vi" {
+// The DECISIONS inside the $EDITOR suspend that are not about the terminal —
+// which editor to run, what counts as a cancel, and what counts as content —
+// plus the one STEP that is not about the terminal either: whether the chosen
+// program actually starts. The rest of `runEditor` can only be checked by a
+// human at a real terminal, and these are exactly the parts that human is least
+// likely to notice going wrong.
+
+// A throwaway directory under $TMPDIR, plus helpers to plant fake executables in
+// it. Every editor-resolution test below runs against a PATH pointing HERE and
+// nowhere else — the fallback chain's whole job is to answer "what is installed
+// on this machine", so a test that consulted the real PATH would pass or fail
+// depending on whether the developer happens to have `vi`.
+const TestBin = struct {
+    path: []const u8,
+
+    fn make(a: std.mem.Allocator) !TestBin {
+        var bytes: [16]u8 = undefined;
+        test_io.random(&bytes);
+        const p = try std.fmt.allocPrint(a, "/tmp/seshat-test-{x}", .{std.mem.readInt(u128, &bytes, .little)});
+        try std.Io.Dir.cwd().createDirPath(test_io, p);
+        return .{ .path = p };
+    }
+
+    fn destroy(b: TestBin, a: std.mem.Allocator) void {
+        std.Io.Dir.cwd().deleteTree(test_io, b.path) catch {};
+        a.free(b.path);
+    }
+
+    // An executable that exits 0 without touching its arguments. Real enough to
+    // spawn, harmless enough to spawn from a test runner.
+    fn plant(b: TestBin, a: std.mem.Allocator, name: []const u8) !void {
+        const full = try std.fmt.allocPrint(a, "{s}/{s}", .{ b.path, name });
+        defer a.free(full);
+        const f = try std.Io.Dir.cwd().createFile(test_io, full, .{ .permissions = @enumFromInt(0o755) });
+        defer f.close(test_io);
+        try f.writeStreamingAll(test_io, "#!/bin/sh\nexit 0\n");
+    }
+};
+
+test "the editor is \\$VISUAL, then \\$EDITOR, then the first installed fallback" {
     const a = std.testing.allocator;
+    const bin = try TestBin.make(a);
+    defer bin.destroy(a);
+
     var env: std.process.Environ.Map = .init(a);
     defer env.deinit();
+    try env.put("PATH", bin.path); // an empty PATH: nothing is installed
 
-    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+    // Nothing configured and nothing installed: still `vi`, because that is the
+    // conventional name and the one the failure message should blame.
+    try std.testing.expectEqualStrings("vi", editorCommand(test_io, &env));
 
     try env.put("EDITOR", "nano");
-    try std.testing.expectEqualStrings("nano", editorCommand(&env));
+    try std.testing.expectEqualStrings("nano", editorCommand(test_io, &env));
 
     try env.put("VISUAL", "hx");
-    try std.testing.expectEqualStrings("hx", editorCommand(&env));
+    try std.testing.expectEqualStrings("hx", editorCommand(test_io, &env));
 
     // `VISUAL=` is how a profile turns one off; it must fall THROUGH rather than
     // being spawned as the empty string.
     try env.put("VISUAL", "");
-    try std.testing.expectEqualStrings("nano", editorCommand(&env));
+    try std.testing.expectEqualStrings("nano", editorCommand(test_io, &env));
     try env.put("EDITOR", "");
-    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+    try std.testing.expectEqualStrings("vi", editorCommand(test_io, &env));
 
     // Whitespace-only is blank too — and would otherwise split into NO words,
     // leaving the temp file itself as `argv[0]`.
     try env.put("EDITOR", "  \t ");
-    try std.testing.expectEqualStrings("vi", editorCommand(&env));
+    try std.testing.expectEqualStrings("vi", editorCommand(test_io, &env));
+}
+
+// THE BUG. `vi` is POSIX's name for the editor, but Arch and its derivatives
+// install `vim` without the `vi` compatibility symlink — so a hardcoded `vi`
+// fallback made every description edit on such a machine fail with
+// `could not run the editor (FileNotFound)` even though a perfectly good editor
+// was one directory along. The fallback has to be the first one that EXISTS.
+test "the fallback skips editors that are not installed" {
+    const a = std.testing.allocator;
+    const bin = try TestBin.make(a);
+    defer bin.destroy(a);
+
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    try env.put("PATH", bin.path);
+
+    // `vim` but no `vi` — the exact shape of the machine the bug was found on.
+    try bin.plant(a, "vim");
+    try std.testing.expectEqualStrings("vim", editorCommand(test_io, &env));
+
+    // Earlier in the chain wins once it is there.
+    try bin.plant(a, "vi");
+    try std.testing.expectEqualStrings("vi", editorCommand(test_io, &env));
+
+    // A configured editor is NEVER second-guessed against PATH: the user asked
+    // for it, and a failure has to name their value rather than silently running
+    // something else.
+    try env.put("EDITOR", "definitely-not-installed");
+    try std.testing.expectEqualStrings("definitely-not-installed", editorCommand(test_io, &env));
+}
+
+// The one part of the suspend that needs no terminal, and the part that was
+// broken: does the program we resolved actually start? `.inherit` on all three
+// streams is what the real call uses, so the commands below are chosen to read
+// nothing and write nothing — an editor here would inherit the test runner's
+// terminal and hang the suite (it did, once, during development).
+//
+// SUBTLETY worth keeping straight, and the reason the two halves are tested
+// separately: `onPath` consults the PATH in the `Environ.Map` we are handed,
+// while `std.process.spawn` resolves a bare `argv[0]` against the PARENT
+// PROCESS's own PATH — the two are the same map in production (`run` is given
+// `init.environ_map`) but not in a test that fakes one.
+test "the resolved editor actually spawns and is waited on" {
+    const a = std.testing.allocator;
+    const bin = try TestBin.make(a);
+    defer bin.destroy(a);
+    try bin.plant(a, "vim");
+
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+
+    // An ABSOLUTE path: no PATH lookup anywhere, so this is purely "does
+    // spawn + wait work and give us the child's exit status".
+    {
+        const abs = try std.fmt.allocPrint(a, "{s}/vim", .{bin.path});
+        defer a.free(abs);
+        try env.put("EDITOR", abs);
+        const term = try spawnEditor(test_io, a, &env, "/dev/null");
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    }
+
+    // A BARE name, which is the half the bug turned on: Zig 0.16's
+    // `std.process.spawn` does resolve it against PATH rather than requiring an
+    // absolute path (that was the first hypothesis, and it is wrong). `true` is
+    // POSIX, reads nothing, and exits 0.
+    {
+        try env.put("EDITOR", "true");
+        const term = try spawnEditor(test_io, a, &env, "/dev/null");
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    }
+
+    // A non-zero exit is reported as such rather than as an error — `editedText`
+    // reads it as the user cancelling.
+    {
+        try env.put("EDITOR", "false");
+        const term = try spawnEditor(test_io, a, &env, "/dev/null");
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+    }
+
+    // And a name that resolves nowhere is exactly the FileNotFound the user
+    // saw — now reachable in a test instead of only at a real terminal.
+    try env.put("EDITOR", "seshat-no-such-editor");
+    try std.testing.expectError(error.FileNotFound, spawnEditor(test_io, a, &env, "/dev/null"));
 }
 
 test "a configured editor with flags becomes separate argv entries" {
     const a = std.testing.allocator;
+    const bin = try TestBin.make(a);
+    defer bin.destroy(a);
+
     var env: std.process.Environ.Map = .init(a);
     defer env.deinit();
+    try env.put("PATH", bin.path);
 
     // The default: one word, then the file.
     {
-        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        const argv = try editorArgv(test_io, a, &env, "/tmp/x.md");
         defer a.free(argv);
         try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "vi", "/tmp/x.md" }), argv);
     }
@@ -857,7 +1061,7 @@ test "a configured editor with flags becomes separate argv entries" {
     // The case a single-word spawn breaks on. `code --wait` is not exotic.
     try env.put("EDITOR", "code --wait");
     {
-        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        const argv = try editorArgv(test_io, a, &env, "/tmp/x.md");
         defer a.free(argv);
         try std.testing.expectEqualDeep(
             @as([]const []const u8, &.{ "code", "--wait", "/tmp/x.md" }),
@@ -868,7 +1072,7 @@ test "a configured editor with flags becomes separate argv entries" {
     // Surrounding and repeated whitespace must not produce empty argv entries.
     try env.put("VISUAL", "  nvim   -u   NONE  ");
     {
-        const argv = try editorArgv(a, &env, "/tmp/x.md");
+        const argv = try editorArgv(test_io, a, &env, "/tmp/x.md");
         defer a.free(argv);
         try std.testing.expectEqualDeep(
             @as([]const []const u8, &.{ "nvim", "-u", "NONE", "/tmp/x.md" }),

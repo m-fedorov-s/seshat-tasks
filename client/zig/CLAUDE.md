@@ -198,8 +198,13 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     same bucket boundary `view.dueFactor` uses, so "soon" cannot mean two things); `buildRows`
     (the flattened, ordered row list, auto-expanding only subtrees that contain attention,
     emitting a `(+n)` badge otherwise, and gating an orphan pass on `filtering`); `Folds`
-    (explicit per-id overrides); `layoutFor` + `chrome_rows` (how many rows the ledger and the
-    detail pane get).
+    (explicit per-id overrides); `layoutFor` + `chrome_rows` + `pane_min_rows` (how many rows
+    the ledger and the detail pane get). Both constants live here *because* two files have to
+    agree on them: `chrome_rows` is subtracted identically by `render.draw` and
+    `model.recompute`, and `pane_min_rows` is the floor on an open pane, which must be at least
+    the number of `FieldId`s `render.drawPane` paints — the pane does not scroll, so a shorter
+    one hides its last field while the focus still moves onto it. `render.zig` asserts the two
+    numbers match at comptime.
   - `editors.zig` — `Key` (the model's terminal-free key union, declared HERE and re-exported by
     `model.zig`), `LineEditor` (a UTF-8-boundary-safe single-line buffer) and `PickEditor` (a
     wrapping index over an enum's declaration order).
@@ -215,13 +220,18 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     overdue count · `saving…`), ledger, optional detail pane, rule, footer (prompt > status line >
     key bar). Maps `core/display.zig`'s `Style` to a `vaxis.Style` — that mapping is the only
     place the TUI decides how a *task* looks, and TUI-only styling (cursor bar, focus highlight,
-    badge) stays local here rather than becoming a `display.Style` variant.
+    badge) stays local here rather than becoming a `display.Style` variant. Two tests, both of
+    invariants rather than of aesthetics and both added after a human found the thing broken at
+    a terminal: cell strings must outlive `draw` (libvaxis cells borrow them), and every field
+    the model can focus must get a painted focus bar. Neither needs a TTY — a `vaxis.Window`
+    only needs a `Screen`.
   - `app.zig` — the shell: `vaxis.Loop`, the key translation table (`toKey`, **named keys tested
     before `.text`** — Enter also carries `text = "\r"`), execution of `Command`s on a worker via
     `io.async` with one arena per request (freed on the loop thread *after* `update` consumed the
     event), and the `$EDITOR` suspend (`loop.stop()` first, `tty.deinit()` before re-init; the
     three *decisions* inside it — which editor, what counts as a cancel, what counts as content —
-    are pure functions with unit tests).
+    are pure functions with unit tests, and `spawnEditor` — the one *step* that needs no
+    terminal — is tested by actually spawning something harmless).
 
   **Keymap** (also shown in the footer key bar):
 
@@ -235,9 +245,13 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
   Four editor kinds behind `⏎`: a **line** editor (title), a **picker** (status, priority), a
   **date** line editor accepting everything `core/edit.zig`'s `parseDate` does, and **`$EDITOR`**
-  for the description (`$VISUAL` → `$EDITOR` → `vi`, split on whitespace; a non-zero exit or
-  unchanged text is a cancel). Refresh is **manual** (`R`) — there is no polling; see
-  `plans/todo.md`.
+  for the description (`$VISUAL` → `$EDITOR` → the first of `vi`/`vim`/`nvim`/`nano` that is
+  actually **on PATH**, split on whitespace; a non-zero exit or unchanged text is a cancel).
+  The fallback is probed rather than hardcoded to `vi` because Arch ships `vim` with no `vi`
+  symlink, which made every description edit fail with an opaque `FileNotFound`; a `$VISUAL`/
+  `$EDITOR` the user set is never probed, and the failure message names the program it tried.
+  Refresh is **manual** (`R`, which writes `refreshing…` so a retry that fails again is
+  distinguishable from a dead key) — there is no polling; see `plans/todo.md`.
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by
   `make schema-test` alongside the Go side).
 

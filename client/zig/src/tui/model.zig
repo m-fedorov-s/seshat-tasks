@@ -469,6 +469,11 @@ fn sharedEvent(m: *Model, ev: Event) !Command {
             // failure still has to hand back, and an unrelated fetch must not free it.
             if (m.in_flight == .refresh) m.in_flight = .none;
             m.load_failed = false; // we have data again, whatever came before
+            // Retract `R`'s in-progress marker, and ONLY that one. It describes
+            // something that is no longer happening; "deleted" (whose own
+            // refetch lands right here), "saved" and "created — …" all describe
+            // something that HAPPENED and must survive the data arriving.
+            if (std.mem.eql(u8, m.status(), refreshing_status)) m.status_buf.clearRetainingCapacity();
             // WHICH task the current mode is about, read before the swap. A
             // background refresh must not close a prompt just because it landed:
             // the ONLY thing that invalidates a mode is its task disappearing.
@@ -645,6 +650,12 @@ fn restoreEditor(m: *Model) ?FieldId {
     }
 }
 
+// What `R` writes the instant it dispatches, and the one status the model ever
+// takes back (in `tasks_loaded`) — because it is the only one that describes
+// something in progress rather than something that already happened. Named so
+// the write and the retraction cannot drift apart into a message that sticks.
+const refreshing_status = "refreshing…";
+
 fn listMode(m: *Model, ev: Event) !Command {
     const k = switch (ev) {
         .key => |k| k,
@@ -669,6 +680,15 @@ fn listMode(m: *Model, ev: Event) !Command {
             'R' => {
                 if (try refuseIfBusy(m)) return .none;
                 m.in_flight = .refresh;
+                // SAY SO, before the request has been anywhere. `R` is the one
+                // key whose entire effect can be invisible: on the load-failure
+                // screen the banner is fixed text, so a retry that fails against
+                // a server that is still down repaints a byte-identical screen
+                // and the key looks dead. Reported as exactly that — "R did
+                // nothing, no matter how many times". The header's in-flight
+                // marker does not cover it: a refused connection comes back in
+                // milliseconds, so that marker is gone before the eye lands on it.
+                try m.setStatus("{s}", .{refreshing_status});
                 return .fetch;
             },
             else => {},
@@ -2103,7 +2123,7 @@ test "Tab toggles the detail pane and re-clamps the viewport" {
     var h: TestHarness = undefined;
     try h.setup(a, manyTasks(&buf, &ids));
     defer h.deinit();
-    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } }); // ledger_rows = 17 closed, 11 open
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } }); // ledger_rows = 17 closed, 10 open
 
     try h.key(.{ .char = 'G' }); // cursor -> last row, scroll_top = 39+1-17 = 23
     try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top);
@@ -2111,8 +2131,9 @@ test "Tab toggles the detail pane and re-clamps the viewport" {
     try std.testing.expect(!h.m.pane_open);
     try h.key(.tab);
     try std.testing.expect(h.m.pane_open);
-    // Layout shrinks to 11 ledger rows; ensureVisible(39, 40, 11, 23) = 39+1-11 = 29.
-    try std.testing.expectEqual(@as(usize, 29), h.m.scroll_top);
+    // Layout shrinks to 10 ledger rows (17 - `ledger.pane_min_rows`);
+    // ensureVisible(39, 40, 10, 23) = 39+1-10 = 30.
+    try std.testing.expectEqual(@as(usize, 30), h.m.scroll_top);
 
     try h.key(.tab);
     try std.testing.expect(!h.m.pane_open);
@@ -2618,6 +2639,60 @@ test "a failed INITIAL load sets load_failed; R retries and clears it" {
     var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
     _ = try update(a, &m, .{ .tasks_loaded = &tasks });
     try std.testing.expect(!m.load_failed);
+}
+
+// THE BUG behind "R did nothing, no matter how many times". The retry itself was
+// wired correctly all along — the test above already proved that — but on the
+// load-failure screen the banner is a fixed string, so a retry that failed again
+// repainted the identical error and the key was indistinguishable from a dead
+// one. `R` therefore has to change the screen the instant it is pressed, before
+// the request has been anywhere.
+test "R says so the moment it is pressed, even when the retry fails again" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init(a, NOW, 0);
+    defer m.deinit();
+    m.in_flight = .refresh;
+    _ = try update(a, &m, .{ .request_failed = "could not reach the server (ConnectionRefused)" });
+
+    // Press 1: the status stops being the error and says a retry is under way.
+    const cmd = try update(a, &m, .{ .key = .{ .char = 'R' } });
+    try std.testing.expect(cmd == .fetch);
+    try std.testing.expectEqualStrings(refreshing_status, m.status());
+
+    // The retry fails against a server that is still down. The screen has to be
+    // different from what it was mid-flight, or the next press is silent again.
+    _ = try update(a, &m, .{ .request_failed = "could not reach the server (ConnectionRefused)" });
+    try std.testing.expect(!std.mem.eql(u8, refreshing_status, m.status()));
+    try std.testing.expect(m.load_failed); // still no data, so still the error page
+
+    // Press 2 has to be just as visible as press 1.
+    _ = try update(a, &m, .{ .key = .{ .char = 'R' } });
+    try std.testing.expectEqualStrings(refreshing_status, m.status());
+}
+
+// The other half: an in-progress marker must not outlive the thing it describes,
+// and retracting it must not take a COMPLETED action's message with it. `delete`
+// is the case that makes this sharp — it reports "deleted" and then refetches, so
+// its own confirmation arrives at the same handler that clears `R`'s marker.
+test "a landed refresh retracts only R's marker, never a completed action's message" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = 'R' });
+    try std.testing.expectEqualStrings(refreshing_status, h.m.status());
+    try h.send(.{ .tasks_loaded = &tasks });
+    try std.testing.expectEqualStrings("", h.m.status()); // gone: it is not happening any more
+
+    // A delete reports, then refetches. The report has to survive the refetch.
+    h.m.in_flight = .{ .delete = .{ .id = try h.m.internId("a") } };
+    try h.send(.delete_ok);
+    try std.testing.expectEqualStrings("deleted", h.m.status());
+    try h.send(.{ .tasks_loaded = &.{} });
+    try std.testing.expectEqualStrings("deleted", h.m.status());
 }
 
 test "a failed REFRESH keeps the existing data and does not set load_failed" {
