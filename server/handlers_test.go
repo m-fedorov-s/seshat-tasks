@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"golang.org/x/time/rate"
+
+	"seshat/internal/task"
 )
 
 func newTestServer(t *testing.T) (*Server, *Store) {
@@ -52,8 +54,8 @@ func TestGetReturnsETag(t *testing.T) {
 		t.Fatalf(`expected ETag "0", got %q`, rr.Header().Get("ETag"))
 	}
 	var resp struct {
-		StateVersion uint64 `json:"state_version"`
-		Tasks        []Task `json:"tasks"`
+		StateVersion uint64      `json:"state_version"`
+		Tasks        []task.Task `json:"tasks"`
 	}
 	json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.StateVersion != 0 || len(resp.Tasks) != 0 {
@@ -79,8 +81,8 @@ func TestAddThenGet(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 	var resp struct {
-		StateVersion uint64 `json:"state_version"`
-		Task         Task   `json:"task"`
+		StateVersion uint64    `json:"state_version"`
+		Task         task.Task `json:"task"`
 	}
 	json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.Task.ID == "" || resp.StateVersion != 1 {
@@ -98,14 +100,14 @@ func TestAddBadInputIs400(t *testing.T) {
 
 func TestUpdateConflictIs409(t *testing.T) {
 	srv, st := newTestServer(t)
-	task, _, _ := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}})
-	body := `{"updates":[{"id":"` + task.ID + `","content":{"title":"y","status":"todo","priority":"none"},"expected_version":99}]}`
+	tk, _, _ := st.Add(task.AddRequest{Content: task.Content{Title: "x", Status: task.StatusTodo, Priority: task.PriorityNone}})
+	body := `{"updates":[{"id":"` + tk.ID + `","content":{"title":"y","status":"todo","priority":"none"},"expected_version":99}]}`
 	rr := do(t, srv, "POST", "/api/tasks/update", "s3cr3t", body, nil)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rr.Code)
 	}
 	var resp struct {
-		Conflicts []Task `json:"conflicts"`
+		Conflicts []task.Task `json:"conflicts"`
 	}
 	json.Unmarshal(rr.Body.Bytes(), &resp)
 	if len(resp.Conflicts) != 1 {
@@ -115,8 +117,8 @@ func TestUpdateConflictIs409(t *testing.T) {
 
 func TestDeleteHandler(t *testing.T) {
 	srv, st := newTestServer(t)
-	task, _, _ := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}})
-	body := `{"id":"` + task.ID + `"}`
+	tk, _, _ := st.Add(task.AddRequest{Content: task.Content{Title: "x", Status: task.StatusTodo, Priority: task.PriorityNone}})
+	body := `{"id":"` + tk.ID + `"}`
 	rr := do(t, srv, "POST", "/api/tasks/delete", "s3cr3t", body, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)

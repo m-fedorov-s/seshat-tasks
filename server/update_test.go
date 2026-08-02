@@ -1,13 +1,17 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"seshat/internal/task"
+)
 
 func TestUpdateContentBumpsVersion(t *testing.T) {
 	st := newTestStore(t)
-	task, _, _ := st.Add(AddRequest{Content: validContent("orig")})
-	c := task.Content
+	tk, _, _ := st.Add(task.AddRequest{Content: validContent("orig")})
+	c := tk.Content
 	c.Title = "renamed"
-	updated, sv, err := st.Update([]UpdateOp{{ID: task.ID, Content: c, ExpectedVersion: 1}})
+	updated, sv, err := st.Update([]task.UpdateOp{{ID: tk.ID, Content: c, ExpectedVersion: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,37 +25,37 @@ func TestUpdateContentBumpsVersion(t *testing.T) {
 
 func TestUpdateStaleVersionConflicts(t *testing.T) {
 	st := newTestStore(t)
-	task, _, _ := st.Add(AddRequest{Content: validContent("orig")})
-	_, _, err := st.Update([]UpdateOp{{ID: task.ID, Content: task.Content, ExpectedVersion: 99}})
+	tk, _, _ := st.Add(task.AddRequest{Content: validContent("orig")})
+	_, _, err := st.Update([]task.UpdateOp{{ID: tk.ID, Content: tk.Content, ExpectedVersion: 99}})
 	ce, ok := err.(*ConflictError)
 	if !ok {
 		t.Fatalf("expected *ConflictError, got %v", err)
 	}
-	if len(ce.Conflicts) != 1 || ce.Conflicts[0].ID != task.ID {
+	if len(ce.Conflicts) != 1 || ce.Conflicts[0].ID != tk.ID {
 		t.Fatalf("expected conflict to carry current task, got %+v", ce.Conflicts)
 	}
 }
 
 func TestUpdateRejectsDuplicateIDInBatch(t *testing.T) {
 	st := newTestStore(t)
-	task, _, _ := st.Add(AddRequest{Content: validContent("orig")})
-	c := task.Content
+	tk, _, _ := st.Add(task.AddRequest{Content: validContent("orig")})
+	c := tk.Content
 	c.Title = "renamed"
-	_, _, err := st.Update([]UpdateOp{
-		{ID: task.ID, Content: c, ExpectedVersion: 1},
-		{ID: task.ID, Content: c, ExpectedVersion: 1},
+	_, _, err := st.Update([]task.UpdateOp{
+		{ID: tk.ID, Content: c, ExpectedVersion: 1},
+		{ID: tk.ID, Content: c, ExpectedVersion: 1},
 	})
 	if _, ok := err.(*ValidationError); !ok {
 		t.Fatalf("expected *ValidationError for duplicate id, got %v", err)
 	}
-	if st.Snapshot().Tasks[task.ID].Meta.Version != 1 {
+	if st.Snapshot().Tasks[tk.ID].Meta.Version != 1 {
 		t.Fatal("expected no mutation on duplicate-id rejection")
 	}
 }
 
 func TestUpdateUnknownID(t *testing.T) {
 	st := newTestStore(t)
-	_, _, err := st.Update([]UpdateOp{{ID: "ghost", Content: validContent("x"), ExpectedVersion: 1}})
+	_, _, err := st.Update([]task.UpdateOp{{ID: "ghost", Content: validContent("x"), ExpectedVersion: 1}})
 	if err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -59,9 +63,9 @@ func TestUpdateUnknownID(t *testing.T) {
 
 func TestUpdateAtomicReparent(t *testing.T) {
 	st := newTestStore(t)
-	pOld, _, _ := st.Add(AddRequest{Content: validContent("pOld")})
-	pNew, _, _ := st.Add(AddRequest{Content: validContent("pNew")})
-	child, _, _ := st.Add(AddRequest{Content: validContent("child"), ParentID: &pOld.ID})
+	pOld, _, _ := st.Add(task.AddRequest{Content: validContent("pOld")})
+	pNew, _, _ := st.Add(task.AddRequest{Content: validContent("pNew")})
+	child, _, _ := st.Add(task.AddRequest{Content: validContent("child"), ParentID: &pOld.ID})
 
 	snap := st.Snapshot()
 	oldC := snap.Tasks[pOld.ID].Content
@@ -69,7 +73,7 @@ func TestUpdateAtomicReparent(t *testing.T) {
 	newC := snap.Tasks[pNew.ID].Content
 	newC.ChildIDs = []string{child.ID} // add child
 
-	_, _, err := st.Update([]UpdateOp{
+	_, _, err := st.Update([]task.UpdateOp{
 		{ID: pOld.ID, Content: oldC, ExpectedVersion: snap.Tasks[pOld.ID].Meta.Version},
 		{ID: pNew.ID, Content: newC, ExpectedVersion: snap.Tasks[pNew.ID].Meta.Version},
 	})
@@ -87,15 +91,15 @@ func TestUpdateAtomicReparent(t *testing.T) {
 
 func TestUpdateRejectsDoubleContainNothingApplied(t *testing.T) {
 	st := newTestStore(t)
-	pOld, _, _ := st.Add(AddRequest{Content: validContent("pOld")})
-	pNew, _, _ := st.Add(AddRequest{Content: validContent("pNew")})
-	child, _, _ := st.Add(AddRequest{Content: validContent("child"), ParentID: &pOld.ID})
+	pOld, _, _ := st.Add(task.AddRequest{Content: validContent("pOld")})
+	pNew, _, _ := st.Add(task.AddRequest{Content: validContent("pNew")})
+	child, _, _ := st.Add(task.AddRequest{Content: validContent("child"), ParentID: &pOld.ID})
 
 	snap := st.Snapshot()
 	newC := snap.Tasks[pNew.ID].Content
 	newC.ChildIDs = []string{child.ID} // add to new WITHOUT removing from old -> double contained
 
-	_, _, err := st.Update([]UpdateOp{
+	_, _, err := st.Update([]task.UpdateOp{
 		{ID: pNew.ID, Content: newC, ExpectedVersion: snap.Tasks[pNew.ID].Meta.Version},
 	})
 	if _, ok := err.(*InvariantError); !ok {
@@ -109,10 +113,10 @@ func TestUpdateRejectsDoubleContainNothingApplied(t *testing.T) {
 
 func TestUpdateTransitionSetsCompletedAt(t *testing.T) {
 	st := newTestStore(t)
-	task, _, _ := st.Add(AddRequest{Content: validContent("t")})
-	c := task.Content
-	c.Status = StatusDone
-	updated, _, _ := st.Update([]UpdateOp{{ID: task.ID, Content: c, ExpectedVersion: 1}})
+	tk, _, _ := st.Add(task.AddRequest{Content: validContent("t")})
+	c := tk.Content
+	c.Status = task.StatusDone
+	updated, _, _ := st.Update([]task.UpdateOp{{ID: tk.ID, Content: c, ExpectedVersion: 1}})
 	if updated[0].Meta.CompletedAt == nil {
 		t.Fatal("expected completed_at set on transition to done")
 	}

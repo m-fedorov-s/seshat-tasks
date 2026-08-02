@@ -1,13 +1,17 @@
 package main
 
-import "testing"
+import (
+	"testing"
 
-func mkTask(id string, children ...string) Task {
-	return Task{ID: id, Content: Content{Title: id, Status: StatusTodo, Priority: PriorityNone, ChildIDs: children, Tags: []string{}}}
+	"seshat/internal/task"
+)
+
+func mkTask(id string, children ...string) task.Task {
+	return task.Task{ID: id, Content: task.Content{Title: id, Status: task.StatusTodo, Priority: task.PriorityNone, ChildIDs: children, Tags: []string{}}}
 }
 
-func stateOf(tasks ...Task) State {
-	m := map[string]Task{}
+func stateOf(tasks ...task.Task) State {
+	m := map[string]task.Task{}
 	for _, t := range tasks {
 		m[t.ID] = t
 	}

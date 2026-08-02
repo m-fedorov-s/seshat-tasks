@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"seshat/internal/task"
 )
 
 // newTestStore returns a store backed by a temp file, with a deterministic
@@ -57,33 +59,33 @@ func TestSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st.state.Tasks["A"] = Task{
+	st.state.Tasks["A"] = task.Task{
 		ID: "A",
-		Content: Content{
+		Content: task.Content{
 			Title:       "Task A",
 			Description: "",
-			Status:      StatusInProgress,
-			Priority:    PriorityMedium,
+			Status:      task.StatusInProgress,
+			Priority:    task.PriorityMedium,
 			ChildIDs:    []string{},
 			Tags:        []string{},
 		},
-		Meta: Meta{},
+		Meta: task.Meta{},
 	}
 
 	snapshot := st.Snapshot()
-	task, ok := snapshot.Tasks["A"]
+	tk, ok := snapshot.Tasks["A"]
 	if !ok {
 		t.Fatal("Task A not in snapshot")
 	}
-	if task.Content.Title != "Task A" {
+	if tk.Content.Title != "Task A" {
 		t.Fatal("Task title is wrong in snapshot.")
 	}
 }
 
 func TestSnapshotKeepsEmptySlicesNonNil(t *testing.T) {
 	st := newTestStore(t)
-	task, _, _ := st.Add(AddRequest{Content: validContent("x")})
-	got := st.Snapshot().Tasks[task.ID]
+	tk, _, _ := st.Add(task.AddRequest{Content: validContent("x")})
+	got := st.Snapshot().Tasks[tk.ID]
 	if got.Content.ChildIDs == nil {
 		t.Fatal("snapshot child_ids must stay non-nil so JSON emits [] not null")
 	}
@@ -92,31 +94,31 @@ func TestSnapshotKeepsEmptySlicesNonNil(t *testing.T) {
 	}
 }
 
-func validContent(title string) Content {
-	return Content{Title: title, Status: StatusTodo, Priority: PriorityNone}
+func validContent(title string) task.Content {
+	return task.Content{Title: title, Status: task.StatusTodo, Priority: task.PriorityNone}
 }
 
 func TestAddRoot(t *testing.T) {
 	st := newTestStore(t)
-	task, sv, err := st.Add(AddRequest{Content: validContent("root task")})
+	tk, sv, err := st.Add(task.AddRequest{Content: validContent("root task")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.ID == "" || task.Meta.Version != 1 || task.Meta.CreatedAt != 1000 {
-		t.Fatalf("bad meta: %+v", task.Meta)
+	if tk.ID == "" || tk.Meta.Version != 1 || tk.Meta.CreatedAt != 1000 {
+		t.Fatalf("bad meta: %+v", tk.Meta)
 	}
 	if sv != 1 {
 		t.Fatalf("expected state_version 1, got %d", sv)
 	}
-	if task.Content.ChildIDs == nil || task.Content.Tags == nil {
+	if tk.Content.ChildIDs == nil || tk.Content.Tags == nil {
 		t.Fatal("nil slices must be normalized to empty")
 	}
 }
 
 func TestAddChildBumpsParentVersion(t *testing.T) {
 	st := newTestStore(t)
-	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
-	child, sv, err := st.Add(AddRequest{Content: validContent("child"), ParentID: &parent.ID})
+	parent, _, _ := st.Add(task.AddRequest{Content: validContent("parent")})
+	child, sv, err := st.Add(task.AddRequest{Content: validContent("child"), ParentID: &parent.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestAddChildBumpsParentVersion(t *testing.T) {
 func TestAddUnknownParent(t *testing.T) {
 	st := newTestStore(t)
 	ghost := "nope"
-	_, _, err := st.Add(AddRequest{Content: validContent("x"), ParentID: &ghost})
+	_, _, err := st.Add(task.AddRequest{Content: validContent("x"), ParentID: &ghost})
 	if err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -146,7 +148,7 @@ func TestAddRejectsNonEmptyChildIDs(t *testing.T) {
 	st := newTestStore(t)
 	c := validContent("x")
 	c.ChildIDs = []string{"whatever"}
-	_, _, err := st.Add(AddRequest{Content: c})
+	_, _, err := st.Add(task.AddRequest{Content: c})
 	if _, ok := err.(*ValidationError); !ok {
 		t.Fatalf("expected *ValidationError, got %v", err)
 	}
@@ -154,7 +156,7 @@ func TestAddRejectsNonEmptyChildIDs(t *testing.T) {
 
 func TestAddRejectsBadTitle(t *testing.T) {
 	st := newTestStore(t)
-	_, _, err := st.Add(AddRequest{Content: validContent("   ")})
+	_, _, err := st.Add(task.AddRequest{Content: validContent("   ")})
 	if _, ok := err.(*ValidationError); !ok {
 		t.Fatalf("expected *ValidationError, got %v", err)
 	}
@@ -163,25 +165,25 @@ func TestAddRejectsBadTitle(t *testing.T) {
 func TestAddDoneSetsCompletedAt(t *testing.T) {
 	st := newTestStore(t)
 	c := validContent("done one")
-	c.Status = StatusDone
-	task, _, err := st.Add(AddRequest{Content: c})
+	c.Status = task.StatusDone
+	tk, _, err := st.Add(task.AddRequest{Content: c})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Meta.CompletedAt == nil || *task.Meta.CompletedAt != 1000 {
+	if tk.Meta.CompletedAt == nil || *tk.Meta.CompletedAt != 1000 {
 		t.Fatal("expected completed_at set on creation as done")
 	}
 }
 
 func TestAddChildAtPosition(t *testing.T) {
 	st := newTestStore(t)
-	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
-	a, _, _ := st.Add(AddRequest{Content: validContent("a"), ParentID: &parent.ID})
-	b, _, _ := st.Add(AddRequest{Content: validContent("b"), ParentID: &parent.ID})
+	parent, _, _ := st.Add(task.AddRequest{Content: validContent("parent")})
+	a, _, _ := st.Add(task.AddRequest{Content: validContent("a"), ParentID: &parent.ID})
+	b, _, _ := st.Add(task.AddRequest{Content: validContent("b"), ParentID: &parent.ID})
 
 	// insert c between a and b
 	mid := 1
-	c, _, err := st.Add(AddRequest{Content: validContent("c"), ParentID: &parent.ID, Position: &mid})
+	c, _, err := st.Add(task.AddRequest{Content: validContent("c"), ParentID: &parent.ID, Position: &mid})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +195,7 @@ func TestAddChildAtPosition(t *testing.T) {
 
 	// out-of-range position clamps to append
 	big := 99
-	d, _, err := st.Add(AddRequest{Content: validContent("d"), ParentID: &parent.ID, Position: &big})
+	d, _, err := st.Add(task.AddRequest{Content: validContent("d"), ParentID: &parent.ID, Position: &big})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +252,7 @@ func TestDataFormatVersionSurvivesAWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := st.Add(AddRequest{Content: Content{Title: "x", Status: StatusTodo, Priority: PriorityNone}}); err != nil {
+	if _, _, err := st.Add(task.AddRequest{Content: task.Content{Title: "x", Status: task.StatusTodo, Priority: task.PriorityNone}}); err != nil {
 		t.Fatal(err)
 	}
 	if got := st.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
