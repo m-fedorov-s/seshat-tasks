@@ -192,9 +192,19 @@ fn drawHeader(win: vaxis.Window, m: *const Model, layout: ledger.Layout) void {
     }) catch buf[0..0];
 
     var col = put(win, 0, 0, text, header_style);
-    if (m.in_flight != .none) {
+    // A REFRESH IS NOT A SAVE. This marker said `saving…` for every in-flight
+    // request, so pressing `R` claimed the TUI was writing to the server when it
+    // was only reading — reported as misleading by the project owner. The word for
+    // a refresh comes from `model.refreshing_status`, the same constant the status
+    // line uses, so the two cannot drift into different vocabulary.
+    const marker: ?[]const u8 = switch (m.in_flight) {
+        .none => null,
+        .refresh => model.refreshing_status,
+        .commit, .create, .delete => "saving…",
+    };
+    if (marker) |word| {
         col = put(win, 0, col, " · ", chrome);
-        _ = put(win, 0, col, "saving…", saving_style);
+        _ = put(win, 0, col, word, saving_style);
     }
 }
 
@@ -301,10 +311,28 @@ fn drawRow(win: vaxis.Window, m: *const Model, row: ledger.Row, y: u16, is_curso
     col = put(win, y, col, display.statusGlyph(t.content.status), base_vx);
     col = put(win, y, col, " ", base_vx);
 
-    // Everything to the right of the title is measured first, so the title's
-    // truncation budget is whatever is left over. `display.truncate` counts
-    // codepoints, not columns — the same documented v1 limit the CLI has.
-    // All three come out of the FRAME buffer, not the stack: `writeCell` keeps the
+    // ── the right-hand handle column ─────────────────────────────────────────
+    //
+    // The `#handle` gets its own right-aligned column instead of trailing the
+    // title. Down a screen whose titles are all different lengths an inline handle
+    // is unfindable, and the handle is how the user names a task at the CLI.
+    //
+    // Its width is NOT a constant: `m.handle_len` is `view.minUniqueSuffixLen`
+    // over the whole fetched set and widens whenever two id tails collide, so it
+    // is read off the model — the same number the CLI uses, for the same reason.
+    const handle = if (frameTake(40)) |b| display.handleText(b, t.id, m.handle_len) else "";
+    const handle_cols = clampU16(m.handle_len + 1); // '#' plus the id tail
+    // Decided from `win.width` ALONE, never from this row's `col`: a per-row
+    // decision would make the column appear and disappear down the screen as the
+    // tree indent changes, which is the one thing a column exists to prevent.
+    const show_handle = handle.len > 0 and win.width >= handle_cols + 1 + min_row_cols;
+    // At least one blank column between the row's text and the handle.
+    const right_edge: u16 = if (show_handle) win.width -| (handle_cols + 1) else win.width;
+
+    // Everything else on the row is measured first, so the title's truncation
+    // budget is whatever is left of `right_edge`. `display.truncate` counts
+    // codepoints, not columns — the same documented v1 limit the CLI has. Both
+    // strings come out of the FRAME buffer, not the stack: `writeCell` keeps the
     // slice, and this function returns long before `vx.render` reads it.
     const badge = if (frameTake(48)) |b| collapsedBadge(b, row) else "";
     const due_buf = frameTake(96);
@@ -316,32 +344,64 @@ fn drawRow(win: vaxis.Window, m: *const Model, row: ledger.Row, y: u16, is_curso
         .due => |x| x.text,
         .overdue => |x| x.text,
     } else "";
-    const handle = if (frameTake(40)) |b| display.handleText(b, t.id, m.handle_len) else "";
 
-    const tail_cols = win.gwidth(badge) + win.gwidth(due_text) + win.gwidth(handle) + 3;
-    const budget = (win.width -| col) -| tail_cols;
+    // THE TITLE IS THE ROW, so it is the last thing to go. As the terminal
+    // narrows the optional extras are dropped in reverse order of importance —
+    // the due wording, then the collapsed badge — and only what survives is
+    // reserved. The arithmetic this replaces reserved all of them unconditionally
+    // and then blanked the TITLE when nothing was left, so a ~30-column row showed
+    // neither a name nor a handle: strictly worse than any of the things it was
+    // protecting.
+    const badge_cols: u16 = if (badge.len > 0) 1 + win.gwidth(badge) else 0;
+    const due_cols: u16 = if (due_text.len > 0) 1 + win.gwidth(due_text) else 0;
+    const room = right_edge -| col;
+    var show_badge = badge.len > 0;
+    var show_due = due_text.len > 0;
+    var budget = room -| (badge_cols + due_cols);
+    if (budget < min_title_cols and show_due) {
+        show_due = false;
+        budget = room -| badge_cols;
+    }
+    if (budget < min_title_cols and show_badge) {
+        show_badge = false;
+        budget = room;
+    }
+
     // ZERO MEANS OPPOSITE THINGS ON THE TWO SIDES OF THIS CALL. `display.truncate`
     // reads `max_cols == 0` as "no budget given, don't truncate" — a sentinel the
     // CLI relies on to avoid blanking titles. Here 0 is arrived at by arithmetic
-    // and means "no room left at all". Passing it through printed the title
-    // UNTRUNCATED past `win.width`, which then dropped the badge, the due wording
-    // and the `#handle` together (`put` refuses once `col >= win.width`) — losing
-    // the handle, which is how the user names a task at the CLI, exactly when the
-    // terminal is tight. Do NOT "fix" this in `display.truncate`; fix it here.
+    // and means "no room left at all", which only happens now when the row has no
+    // columns left for text of any kind. Do NOT "fix" this in `display.truncate`;
+    // fix it here.
     const title: []const u8 = if (budget == 0) "" else display.truncate(t.content.title, budget);
     col = put(win, y, col, title, base_vx);
 
-    if (badge.len > 0) {
+    if (show_badge) {
         col = put(win, y, col, " ", base_vx);
         col = put(win, y, col, badge, onCursor(badge_style, is_cursor));
     }
-    if (due) |w| {
+    if (show_due) {
         col = put(win, y, col, " ", base_vx);
-        col = put(win, y, col, due_text, onCursor(vxStyle(display.dueStyle(w)), is_cursor));
+        _ = put(win, y, col, due_text, onCursor(vxStyle(display.dueStyle(due.?)), is_cursor));
     }
-    col = put(win, y, col, " ", base_vx);
-    _ = put(win, y, col, handle, onCursor(vxStyle(.dim), is_cursor));
+
+    // RIGHT-ALIGNED from an ABSOLUTE column, not from wherever the title happened
+    // to end — that is the whole point, and it is why this is the one run on the
+    // row that does not chain off `col`.
+    if (show_handle)
+        _ = put(win, y, win.width -| win.gwidth(handle), handle, onCursor(vxStyle(.dim), is_cursor));
 }
+
+// How narrow a row may get before its handle column is worth more than the text
+// it would displace, and the fewest columns worth handing a title. Judgement
+// calls about legibility, so they live in the renderer: no model rule reads them.
+// `min_row_cols` covers everything a depth-0 row spends before its title — the
+// cursor marker (2), the fold marker (2), the status glyph (1) and its separating
+// space (1) — plus `min_title_cols`. Deeper rows spend 3 more per level of tree
+// rail and so get a shorter title; that is the price of deciding the column's
+// existence from the WIDTH alone, which is what keeps it a column.
+const min_title_cols: u16 = 8;
+const min_row_cols: u16 = min_title_cols + 6;
 
 // `├─`/`└─` from `last_sibling`, indented by `depth`. Depth 0 draws nothing;
 // the unreachable section starts its tasks at depth 1, so they get a rail under
@@ -571,7 +631,9 @@ fn keyBar(m: *const Model) []const u8 {
         .field => "↑/↓ field · ⏎ edit · esc back",
         .editing => |e| switch (e.editor) {
             .line => "⏎ save · esc cancel",
-            .pick => "↑/↓ choose · ⏎ save · esc cancel",
+            // Both pairs really work (`editors.PickEditor.handle`), and the pane
+            // draws `◂ ▸`, so advertising only one pair was the confusing half.
+            .pick => "←/→ or ↑/↓ choose · ⏎ save · esc cancel",
             .external => "⏎ save · esc cancel",
         },
         .filter => "tag:NAME · status:todo,done · overdue — ⏎ apply · esc cancel",
@@ -757,6 +819,237 @@ test "every field the focus can reach is painted, at every height that shows a p
                 return err;
             };
             _ = try model.update(a, &m, .{ .key = .down });
+        }
+    }
+}
+
+// ─── the handle-column layout test ───────────────────────────────────────────
+//
+// Third and last exception, and the same justification as the second: an
+// INVARIANT, not an aesthetic. "The handles line up" is the entire content of the
+// change that added the column — a claim about columns, which is the one thing a
+// human cannot verify by reading a diff — and the arithmetic it replaced had
+// already shipped a defect (a computed budget of 0 colliding with
+// `display.truncate`'s "0 means unlimited" sentinel) that blanked the TITLE on any
+// terminal under ~40 columns. Both halves are pinned here.
+
+// The column the `#` of a row's handle sits in, or null if the row has none.
+fn testHandleCol(win: vaxis.Window, y: u16) ?u16 {
+    var c: u16 = 0;
+    while (c < win.width) : (c += 1) {
+        const cell = win.screen.readCell(c, y) orelse continue;
+        if (std.mem.eql(u8, cell.char.grapheme, "#")) return c;
+    }
+    return null;
+}
+
+fn testWindow(screen: *vaxis.Screen) vaxis.Window {
+    return .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = screen,
+    };
+}
+
+test "every #handle lands in the same right-hand column whatever the row's depth" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+
+    var m: Model = undefined;
+    try m.init(a, now, 0);
+    defer m.deinit();
+
+    // A parent, its child, and a sibling: three rows at two different depths, with
+    // titles of three different lengths. Inline, the handles land in three
+    // different columns; that is the thing being fixed.
+    var kids = [_][]const u8{"01JQRSTUVWXYZABCDEFGHJKM02"};
+    var tasks = [_]Task{
+        .{
+            .id = "01JQRSTUVWXYZABCDEFGHJKM01",
+            .content = .{ .title = "a parent task", .status = .todo, .child_ids = &kids },
+            .meta = .{ .created_at = now },
+        },
+        .{
+            .id = "01JQRSTUVWXYZABCDEFGHJKM02",
+            .content = .{ .title = "a much longer child title", .status = .todo },
+            .meta = .{ .created_at = now },
+        },
+        .{
+            .id = "01JQRSTUVWXYZABCDEFGHJKM03",
+            .content = .{ .title = "x", .status = .todo },
+            .meta = .{ .created_at = now },
+        },
+    };
+    _ = try model.update(a, &m, .{ .tasks_loaded = &tasks });
+    _ = try model.update(a, &m, .{ .resize = .{ .cols = 60, .rows = 24 } });
+    // Nothing in this set needs attention, so the child is auto-collapsed. Unfold
+    // it explicitly — a depth-1 row is half the point of the test.
+    _ = try model.update(a, &m, .{ .key = .{ .char = 'l' } });
+    try std.testing.expectEqual(@as(usize, 3), m.rows.len);
+
+    var screen: vaxis.Screen = try .init(a, .{ .cols = 60, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = testWindow(&screen);
+    draw(win, &m);
+
+    // The width comes off the MODEL (`view.minUniqueSuffixLen` over the fetched
+    // set), never a constant here: these ids differ only in their last character,
+    // so a 4-char tail is unique and the column is 5 wide.
+    try std.testing.expectEqual(@as(usize, 4), m.handle_len);
+    try testHandlesAlignAt(win, &m, 60 - 5);
+
+    // ...and it MOVES when the data makes it move. These three ids share their
+    // last four characters, so `minUniqueSuffixLen` widens to five and the column
+    // has to widen with it. A hardcoded 5 here would pass the case above and put
+    // three identical handles on the screen in this one.
+    var wide = [_]Task{
+        .{ .id = "01JQRSTUVWXYZABCDEF0ABCDE", .content = .{ .title = "one", .status = .todo }, .meta = .{ .created_at = now } },
+        .{ .id = "01JQRSTUVWXYZABCDEF0BBCDE", .content = .{ .title = "two", .status = .todo }, .meta = .{ .created_at = now } },
+        .{ .id = "01JQRSTUVWXYZABCDEF0CBCDE", .content = .{ .title = "three", .status = .todo }, .meta = .{ .created_at = now } },
+    };
+    _ = try model.update(a, &m, .{ .tasks_loaded = &wide });
+    try std.testing.expectEqual(@as(usize, 5), m.handle_len);
+    draw(win, &m);
+    try testHandlesAlignAt(win, &m, 60 - 6);
+}
+
+fn testHandlesAlignAt(win: vaxis.Window, m: *const Model, expected: u16) !void {
+    for (1..1 + m.rows.len) |i| {
+        const y: u16 = @intCast(i);
+        const at = testHandleCol(win, y) orelse {
+            std.debug.print("ledger row {d} has no handle at all\n", .{y});
+            return error.TestUnexpectedResult;
+        };
+        std.testing.expectEqual(expected, at) catch |err| {
+            std.debug.print("row {d}: handle at column {d}, expected {d}\n", .{ y, at, expected });
+            return err;
+        };
+    }
+}
+
+fn testBlankAt(win: vaxis.Window, col: u16, y: u16) bool {
+    const cell = win.screen.readCell(col, y) orelse return true;
+    const g = cell.char.grapheme;
+    return g.len == 0 or std.mem.eql(u8, g, " ");
+}
+
+// The column is only a column if nothing else may enter it. Two mutations survived
+// the two tests above until this one existed: hardcoding the column's width to 5
+// (correct for the common case, one column short whenever `handle_len` widens),
+// and reserving no columns at all (the title then runs under the handle and the
+// handle overpaints it — which still LOOKS like a right-aligned handle from a
+// distance). Both are caught here by the blank gap, not by the handle's position.
+test "the handle column keeps its gap, at either handle width and every terminal width" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+    const long = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+
+    // Distinct id tails (`handle_len` 4) and colliding ones (5) — the second is
+    // exactly why the column's width is read off the model instead of written here.
+    var short_ids = [_][]const u8{ "01JQRSTUVWXYZABCDEF0AAAA1", "01JQRSTUVWXYZABCDEF0AAAA2" };
+    var wide_ids = [_][]const u8{ "01JQRSTUVWXYZABCDEF0ABCDE", "01JQRSTUVWXYZABCDEF0BBCDE" };
+    for ([_][]const []const u8{ &short_ids, &wide_ids }, [_]usize{ 4, 5 }) |ids, want_len| {
+        var width: u16 = 21;
+        while (width <= 50) : (width += 1) {
+            var m: Model = undefined;
+            try m.init(a, now, 0);
+            defer m.deinit();
+
+            var tasks: [2]Task = undefined;
+            for (ids, &tasks) |id, *dst| dst.* = .{
+                .id = id,
+                .content = .{ .title = long, .status = .todo },
+                .meta = .{ .created_at = now },
+            };
+            _ = try model.update(a, &m, .{ .tasks_loaded = &tasks });
+            _ = try model.update(a, &m, .{ .resize = .{ .cols = width, .rows = 24 } });
+            try std.testing.expectEqual(want_len, m.handle_len);
+
+            var screen: vaxis.Screen = try .init(a, .{ .cols = width, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+            defer screen.deinit(a);
+            const win = testWindow(&screen);
+            draw(win, &m);
+
+            const handle_cols: u16 = @intCast(want_len + 1);
+            const at = testHandleCol(win, 1) orelse {
+                std.debug.print("handle_len={d} width={d}: no handle\n", .{ want_len, width });
+                return error.TestUnexpectedResult;
+            };
+            std.testing.expectEqual(width - handle_cols, at) catch |err| {
+                std.debug.print("handle_len={d} width={d}: handle at {d}\n", .{ want_len, width, at });
+                return err;
+            };
+            std.testing.expect(testBlankAt(win, at - 1, 1)) catch |err| {
+                var buf: [8192]u8 = undefined;
+                std.debug.print("handle_len={d} width={d}: title touches the handle: \"{s}\"\n", .{ want_len, width, testRowText(win, &buf, 1) });
+                return err;
+            };
+        }
+    }
+}
+
+test "narrowing the terminal costs the due wording, then the handle, and the title last" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+
+    var width: u16 = 8;
+    while (width <= 80) : (width += 1) {
+        var m: Model = undefined;
+        try m.init(a, now, 0);
+        defer m.deinit();
+
+        // Overdue, so the row carries the longest optional run it ever has. This is
+        // the row that used to come out completely blank below ~40 columns.
+        var tasks = [_]Task{.{
+            .id = "01JQRSTUVWXYZABCDEFGHJKMNP",
+            .content = .{
+                .title = "ZZZZZZZZZZZZZZZZZZZZ",
+                .status = .todo,
+                .priority = .high,
+                .due_at = now - 5 * 86400,
+            },
+            .meta = .{ .created_at = now },
+        }};
+        _ = try model.update(a, &m, .{ .tasks_loaded = &tasks });
+        _ = try model.update(a, &m, .{ .resize = .{ .cols = width, .rows = 24 } });
+
+        var screen: vaxis.Screen = try .init(a, .{ .cols = width, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = testWindow(&screen);
+        draw(win, &m);
+
+        var buf: [8192]u8 = undefined;
+        const row = testRowText(win, &buf, 1);
+
+        // THE TITLE IS THE LAST THING TO GO. Every width down to 8 shows at least
+        // one character of it — the previous arithmetic showed none at all below
+        // about 40, which is worse than anything it was protecting.
+        std.testing.expect(std.mem.indexOf(u8, row, "Z") != null) catch |err| {
+            std.debug.print("width={d}: no title on the row: \"{s}\"\n", .{ width, row });
+            return err;
+        };
+
+        // The handle column exists exactly when the width rule says so, and always
+        // in the same place relative to the right edge — so it cannot creep inward
+        // as the extras are dropped.
+        const at = testHandleCol(win, 1);
+        const handle_cols: u16 = @intCast(m.handle_len + 1);
+        if (width >= handle_cols + 1 + min_row_cols) {
+            std.testing.expectEqual(@as(?u16, width - handle_cols), at) catch |err| {
+                std.debug.print("width={d}: handle at {?d}: \"{s}\"\n", .{ width, at, row });
+                return err;
+            };
+        } else {
+            // Too narrow for both: the title wins and the handle is dropped whole,
+            // rather than half a handle being printed over the title's last cells.
+            std.testing.expectEqual(@as(?u16, null), at) catch |err| {
+                std.debug.print("width={d}: unexpected handle at {?d}: \"{s}\"\n", .{ width, at, row });
+                return err;
+            };
         }
     }
 }

@@ -217,14 +217,18 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     rows → re-resolve the cursor → scroll. Reuses `core/edit.zig`'s `Patch`/`applyPatch`/
     `parseDate`/`validate` and `core/filterspec.zig` unchanged.
   - `render.zig` — paints a `Model` onto a `vaxis.Window`: header (scope · sort · rows n–m of N ·
-    overdue count · `saving…`), ledger, optional detail pane, rule, footer (prompt > status line >
+    overdue count · an in-flight marker that says `saving…` for a write and `refreshing…` for a
+    read), ledger, optional detail pane, rule, footer (prompt > status line >
     key bar). Maps `core/display.zig`'s `Style` to a `vaxis.Style` — that mapping is the only
     place the TUI decides how a *task* looks, and TUI-only styling (cursor bar, focus highlight,
-    badge) stays local here rather than becoming a `display.Style` variant. Two tests, both of
-    invariants rather than of aesthetics and both added after a human found the thing broken at
-    a terminal: cell strings must outlive `draw` (libvaxis cells borrow them), and every field
-    the model can focus must get a painted focus bar. Neither needs a TTY — a `vaxis.Window`
-    only needs a `Screen`.
+    badge) stays local here rather than becoming a `display.Style` variant. Five tests, all of
+    invariants rather than of aesthetics and every one added after a human found the thing broken
+    at a terminal: cell strings must outlive `draw` (libvaxis cells borrow them); every field
+    the model can focus must get a painted focus bar; and the `#handle` column (right-aligned,
+    width = `m.handle_len + 1` read off the model, one blank gap column always) must line up
+    whatever the row depth, keep that gap at every handle width, and never cost the title —
+    extras are dropped due-wording-first, badge-second, and the title is the last thing to go.
+    None needs a TTY — a `vaxis.Window` only needs a `Screen`.
   - `app.zig` — the shell: `vaxis.Loop`, the key translation table (`toKey`, **named keys tested
     before `.text`** — Enter also carries `text = "\r"`), execution of `Command`s on a worker via
     `io.async` with one arena per request (freed on the loop thread *after* `update` consumed the
@@ -238,8 +242,8 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   | Mode | Keys |
   | --- | --- |
   | list | `j`/`k` or `↓`/`↑` move · `l`/`h` or `→`/`←` expand/collapse · `Ctrl-D`/`Ctrl-U` page · `g`/`G` first/last · `Space` cycle status · `a` add · `x` delete · `/` filter · `Tab` toggle pane · `R` refresh · `Esc` clear filter · `⏎` descend to fields · `q` quit |
-  | field | `↑`/`↓` change field · `⏎` edit · `Esc` back to the list |
-  | editing | `⏎` save · `Esc` cancel (back to the field, not the list); `↑`/`↓` choose in a picker; everything else goes to the editor |
+  | field | `↑`/`↓` change field · `⏎` edit · `Esc` back to the list (**closes the detail pane** — leaving the task closes it, unconditionally) |
+  | editing | `⏎` save · `Esc` cancel (back to the field, not the list); `←`/`→` **or** `↑`/`↓` choose in a picker; everything else goes to the editor |
   | filter / add prompt | `⏎` apply/create · `Esc` cancel · line editing (`←`/`→`/`Home`/`End`/`Backspace`/`Delete`) |
   | confirm delete | `y` delete · `n` or `Esc` cancel |
 
@@ -252,6 +256,15 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   `$EDITOR` the user set is never probed, and the failure message names the program it tried.
   Refresh is **manual** (`R`, which writes `refreshing…` so a retry that fails again is
   distinguishable from a dead key) — there is no polling; see `plans/todo.md`.
+
+  The **status line is transient**. The footer shows `m.status()` *instead of* the key bar, so a
+  message that is never taken back costs the user their keymap for the rest of the session.
+  `model.retractStatus` clears it on the next keypress, with two exceptions: while something is
+  in flight (`refreshing…`, `still saving…`, `deleting — …`), which the reply retracts rather
+  than a key; and in `.confirm_delete`, where the status line *is* the question `y`/`n` answers.
+  That is a separate mechanism from `tasks_loaded`'s narrow retraction of `refreshing_status` —
+  an in-flight marker has to die when its request lands even if no key is touched, and clearing
+  unconditionally there eats `deleted`, whose own refetch arrives at the same handler.
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by
   `make schema-test` alongside the Go side).
 

@@ -427,6 +427,32 @@ fn nearestTaskRow(rows: []const ledger.Row, anchor: usize) ?usize {
     return null;
 }
 
+// The status line is TRANSIENT. The footer shows it INSTEAD OF the key bar, so a
+// message that is never taken back costs the user their keymap for the rest of
+// the session — reported as exactly that ("'Saved' never vanishes; the navigation
+// instructions are missing after any save"). The next keypress is the retraction:
+// by then the user has read the message and is doing the next thing.
+//
+// Two exceptions, both because the message is not a report of something that
+// already happened:
+//   * something is STILL IN FLIGHT (`refreshing…`, `still saving…`, `deleting —
+//     …`). Retracting those on an unrelated `j` would claim the request finished.
+//     They are retracted by the reply that answers them, not by a key.
+//   * `.confirm_delete`, where the status line IS the question the next keypress
+//     answers. Clearing it would leave a bare `y/n` prompt with no question.
+//
+// Note this is a SEPARATE mechanism from `tasks_loaded`'s retraction of
+// `refreshing_status`: that one exists precisely because an in-flight marker must
+// die when its request lands even if the user touches no key, and it is
+// deliberately narrow (an unconditional clear there eats `deleted`, whose own
+// refetch arrives at the same handler).
+fn retractStatus(m: *Model) void {
+    if (m.status().len == 0) return;
+    if (m.in_flight != .none) return;
+    if (m.mode == .confirm_delete) return;
+    m.status_buf.clearRetainingCapacity();
+}
+
 // ─── update ──────────────────────────────────────────────────────────────────
 //
 // The event handler, and the only entry point the shell calls. It is pure of
@@ -437,6 +463,9 @@ fn nearestTaskRow(rows: []const ledger.Row, anchor: usize) ?usize {
 // reason `Mode` is a single tagged union: the mode is what decides what a key
 // means, so there is exactly one place per mode where its key map lives.
 pub fn update(allocator: std.mem.Allocator, m: *Model, ev: Event) !Command {
+    // A status message is TRANSIENT — see `retractStatus`. Taken back BEFORE the
+    // key is dispatched, so a handler that writes a new one wins.
+    if (ev == .key) retractStatus(m);
     return switch (m.mode) {
         .list => listMode(m, ev),
         .field => |f| fieldMode(allocator, m, f, ev),
@@ -654,7 +683,9 @@ fn restoreEditor(m: *Model) ?FieldId {
 // takes back (in `tasks_loaded`) — because it is the only one that describes
 // something in progress rather than something that already happened. Named so
 // the write and the retraction cannot drift apart into a message that sticks.
-const refreshing_status = "refreshing…";
+// `pub` so `render.zig`'s header marker uses the same word: a refresh is not a
+// save, and the header saying `saving…` for one was misleading.
+pub const refreshing_status = "refreshing…";
 
 fn listMode(m: *Model, ev: Event) !Command {
     const k = switch (ev) {
@@ -1059,7 +1090,21 @@ fn fieldMode(allocator: std.mem.Allocator, m: *Model, f: FieldId, ev: Event) !Co
         },
         // No editor is live in `.field`, but clearMode is the one sanctioned way
         // back to `.list` — never hand-roll the teardown.
-        .escape => m.clearMode(),
+        //
+        // LEAVING THE TASK CLOSES THE PANE. This reverses task 11's judgement
+        // (that `pane_open` is a user-owned toggle `Enter` merely force-opens, so
+        // `Escape` should leave it alone): the project owner drove it and asked
+        // for the opposite — "the task tab does not go away, the highlighted task
+        // is rendered always". Unconditional, deliberately: remembering who opened
+        // the pane would make `Escape` mean two different things depending on
+        // history, and `Tab` is still there to open it again in one keystroke.
+        // `recompute` for the same reason `Tab` does it — the pane hands its rows
+        // back to the ledger, so the old `scroll_top` may no longer be valid.
+        .escape => {
+            m.clearMode();
+            m.pane_open = false;
+            try recompute(m);
+        },
         else => {},
     }
     return .none;
@@ -2155,11 +2200,17 @@ test "the viewport keys are inert while a field is focused" {
     try std.testing.expectEqualStrings(cursor, h.m.cursor_id.?);
 }
 
-// The previous task deliberately decided Escape does NOT clear pane_open — it is
-// a user-owned toggle that Enter force-opens; clearing it on Escape would close a
-// pane the user had opened themselves. Tab is the independent toggle, so this is
-// the natural place to pin that decision before it regresses silently.
-test "escape does not clear a pane the user opened with Tab" {
+// Task 11 decided the opposite of this — that Escape must NOT clear `pane_open`,
+// because the pane is a user-owned toggle that Enter merely force-opens — and
+// pinned it here. The project owner drove the real TUI and OVERRULED it: leaving
+// the task closes the pane, full stop. The test stays, inverted, so the new rule
+// is pinned exactly as firmly as the old one was.
+//
+// UNCONDITIONAL is the point. The hard case is the one below — the user opened
+// the pane with Tab, THEN descended with Enter — and closing it there is still
+// what was asked for. Remembering who opened the pane would make Escape mean two
+// different things depending on history; Tab reopens it in one keystroke.
+test "escape out of a task closes the pane, even one the user opened with Tab" {
     const a = std.testing.allocator;
     var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
     var h: TestHarness = undefined;
@@ -2169,9 +2220,38 @@ test "escape does not clear a pane the user opened with Tab" {
     try h.key(.tab);
     try std.testing.expect(h.m.pane_open);
     try h.key(.enter); // -> .field
+    try std.testing.expect(h.m.pane_open);
     try h.key(.escape); // -> .list
     try std.testing.expect(h.m.mode == .list);
-    try std.testing.expect(h.m.pane_open); // still open: escape is not a pane toggle
+    try std.testing.expect(!h.m.pane_open);
+
+    // Tab is still an independent toggle, and still works after Escape used it.
+    try h.key(.tab);
+    try std.testing.expect(h.m.pane_open);
+    try h.key(.tab);
+    try std.testing.expect(!h.m.pane_open);
+}
+
+// Escape changes the layout, so it owes the viewport the same `recompute` Tab
+// does. Without it `scroll_top` describes a ledger that is `pane_min_rows`
+// shorter than the one now on screen, and the cursor row is off the bottom —
+// which is a scrolling bug nobody would think to blame on Escape.
+test "escape out of a task re-clamps the viewport for the taller ledger" {
+    const a = std.testing.allocator;
+    var buf: [40]Task = undefined;
+    var ids: [40][4]u8 = undefined;
+    var h: TestHarness = undefined;
+    try h.setup(a, manyTasks(&buf, &ids));
+    defer h.deinit();
+    try h.send(.{ .resize = .{ .cols = 80, .rows = 20 } }); // 17 ledger rows closed, 10 open
+
+    try h.key(.{ .char = 'G' }); // last row; scroll_top = 40 - 17 = 23
+    try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top);
+    try h.key(.enter); // pane opens: ledger shrinks to 10, top = 40 - 10 = 30
+    try std.testing.expectEqual(@as(usize, 30), h.m.scroll_top);
+    try h.key(.escape); // pane closes: 17 rows again, so the top must come back
+    try std.testing.expect(!h.m.pane_open);
+    try std.testing.expectEqual(@as(usize, 23), h.m.scroll_top);
 }
 
 test "committing a pick emits one Command.commit with exactly one field changed" {
@@ -2199,6 +2279,41 @@ test "committing a pick emits one Command.commit with exactly one field changed"
     try std.testing.expectEqual(FieldId.priority, h.m.mode.field);
     // No optimistic write.
     try std.testing.expectEqual(Priority.medium, h.m.tasks[0].content.priority);
+}
+
+// `←`/`→` now rotate an open picker (the pane draws `◂ ▸`, so they are the keys
+// the screen advertises). The hazard worth pinning is not the picker itself —
+// `editors.zig` covers that — but the ROUTING: the same two keys mean fold and
+// unfold in `.list`, and stealing them there would break the tree.
+test "left and right rotate an open picker without disturbing the fold keys" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("root", .medium, .todo, null, &.{"kid"}),
+        t("kid", .medium, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    // In `.list` the two keys still fold and unfold the cursor's subtree.
+    try h.key(.right);
+    try std.testing.expectEqual(true, h.m.folds.get("root").?);
+    try h.key(.left);
+    try std.testing.expectEqual(false, h.m.folds.get("root").?);
+
+    try h.key(.enter); // -> .field (title)
+    for (0..3) |_| try h.key(.down); // -> priority
+    try h.key(.enter); // pick opens at index 2 (medium)
+    try h.key(.right);
+    try std.testing.expectEqual(@as(usize, 3), h.m.mode.editing.editor.pick.index); // high
+    try h.key(.left);
+    try std.testing.expectEqual(@as(usize, 2), h.m.mode.editing.editor.pick.index);
+    try h.key(.left);
+    try std.testing.expectEqual(@as(usize, 1), h.m.mode.editing.editor.pick.index); // low
+
+    try h.key(.enter); // and the rotated value is what commits
+    try std.testing.expect(h.last == .commit);
+    try std.testing.expectEqual(Priority.low, h.last.commit.content.priority);
 }
 
 test "committing a date parses with the configured offset" {
@@ -2693,6 +2808,84 @@ test "a landed refresh retracts only R's marker, never a completed action's mess
     try std.testing.expectEqualStrings("deleted", h.m.status());
     try h.send(.{ .tasks_loaded = &.{} });
     try std.testing.expectEqualStrings("deleted", h.m.status());
+}
+
+// THE BUG behind "'Saved' never vanishes; the navigation instructions are missing
+// after any save". The footer shows `m.status()` INSTEAD OF the key bar, so the
+// first message of a session took the keymap off the screen and nothing ever put
+// it back. A status is a report, and a report is transient.
+test "a completed action's status is retracted by the next keypress" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .medium, .in_progress, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = ' ' }); // cycle the status -> a commit goes out
+    var echoed = [_]Task{t("a", .medium, .done, null, &.{})};
+    try h.send(.{ .commit_ok = &echoed });
+    try std.testing.expectEqualStrings("saved", h.m.status());
+
+    // Any key at all, including one that does nothing else whatsoever.
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("", h.m.status()); // the key bar is back
+}
+
+// The first exception. A message about something that has NOT finished must not
+// be retracted by an unrelated key — that would claim the request came back. Its
+// retraction is the reply, not the keyboard.
+test "an in-flight message is not retracted by an unrelated keypress" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{
+        t("a", .high, .todo, null, &.{}),
+        t("b", .low, .todo, null, &.{}),
+    };
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = 'R' });
+    try std.testing.expectEqualStrings(refreshing_status, h.m.status());
+    try h.key(.{ .char = 'j' }); // moves the cursor; the refresh is still outstanding
+    try std.testing.expectEqualStrings(refreshing_status, h.m.status());
+
+    // `still saving…` is the same class, and is written by a key rather than by a
+    // handler — so it has to survive the NEXT key too, or it flashes for one press.
+    try h.key(.{ .char = 'a' }); // refused while busy
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "still saving") != null);
+    try h.key(.{ .char = 'k' });
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "still saving") != null);
+
+    // Once the slot empties it is an ordinary report again.
+    try h.send(.{ .tasks_loaded = &tasks });
+    try std.testing.expect(h.m.in_flight == .none);
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("", h.m.status());
+}
+
+// The second exception. In `.confirm_delete` the status line IS the question the
+// next keypress answers, so retracting it would leave a bare y/n prompt with
+// nothing above it — and `confirmDeleteMode` deliberately swallows every other
+// key, which is exactly the case that would blank it.
+test "the delete confirmation question survives the keys that do not answer it" {
+    const a = std.testing.allocator;
+    var tasks = [_]Task{t("a", .high, .todo, null, &.{})};
+    var h: TestHarness = undefined;
+    try h.setup(a, &tasks);
+    defer h.deinit();
+
+    try h.key(.{ .char = 'x' });
+    try std.testing.expect(h.m.mode == .confirm_delete);
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "delete this task?") != null);
+
+    try h.key(.{ .char = 'j' }); // swallowed by the prompt
+    try std.testing.expect(std.mem.indexOf(u8, h.m.status(), "delete this task?") != null);
+
+    try h.key(.{ .char = 'n' });
+    try std.testing.expectEqualStrings("cancelled", h.m.status());
+    // ...and back in the list, "cancelled" is an ordinary report like any other.
+    try h.key(.{ .char = 'j' });
+    try std.testing.expectEqualStrings("", h.m.status());
 }
 
 test "a failed REFRESH keeps the existing data and does not set load_failed" {

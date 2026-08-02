@@ -83,11 +83,18 @@ pub const PickEditor = struct {
     len: usize,
     index: usize = 0,
 
+    // BOTH axes rotate the picker. It is drawn as `◂ value ▸`, so `←`/`→` is the
+    // guess the screen invites; but a picker is also one item of a vertical field
+    // list, so `↑`/`↓` is the guess the surrounding UI invites. Accepting only
+    // `↑`/`↓` while drawing `◂ ▸` was reported as confusing by the project owner,
+    // and there is no third meaning for either pair INSIDE an open picker to
+    // conflict with — `←`/`→` fold and unfold in `.list` mode, which no open
+    // editor can be in, and `.field` mode ignores them entirely.
     pub fn handle(self: *PickEditor, k: Key) void {
         if (self.len == 0) return;
         switch (k) {
-            .up => self.index = if (self.index == 0) self.len - 1 else self.index - 1,
-            .down => self.index = (self.index + 1) % self.len,
+            .up, .left => self.index = if (self.index == 0) self.len - 1 else self.index - 1,
+            .down, .right => self.index = (self.index + 1) % self.len,
             else => {},
         }
     }
@@ -186,4 +193,32 @@ test "PickEditor wraps at both ends and ignores other keys" {
     try std.testing.expectEqual(@as(usize, 1), p.index);
     p.handle(.{ .char = 'q' });
     try std.testing.expectEqual(@as(usize, 1), p.index);
+}
+
+// The picker is drawn as `◂ value ▸` but only ever answered to `↑`/`↓`, which the
+// project owner hit at a real terminal: "right and left arrows appear, but you
+// need up and down — quite confusing." Both pairs now work, and the on-screen
+// hint says so. This is the half of that fix that can be pinned.
+test "PickEditor rotates on left/right exactly as it does on up/down" {
+    var p = PickEditor{ .len = 4, .index = 0 };
+    p.handle(.left);
+    try std.testing.expectEqual(@as(usize, 3), p.index); // wraps backward, like .up
+    p.handle(.right);
+    try std.testing.expectEqual(@as(usize, 0), p.index); // wraps forward, like .down
+    p.handle(.right);
+    try std.testing.expectEqual(@as(usize, 1), p.index);
+
+    // Not two independent cursors — the same motion under two names, over a
+    // sequence long enough to wrap.
+    var horizontal = PickEditor{ .len = 3 };
+    var vertical = PickEditor{ .len = 3 };
+    for ([_]Key{ .right, .right, .right, .right, .left }) |k| horizontal.handle(k);
+    for ([_]Key{ .down, .down, .down, .down, .up }) |k| vertical.handle(k);
+    try std.testing.expectEqual(vertical.index, horizontal.index);
+
+    // The empty-picker guard covers the new keys too.
+    var empty = PickEditor{ .len = 0 };
+    empty.handle(.left);
+    empty.handle(.right);
+    try std.testing.expectEqual(@as(usize, 0), empty.index);
 }
