@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"seshat/internal/task"
 )
 
 // fakeSender records calls so handler behaviour can be asserted without Telegram.
@@ -115,5 +120,142 @@ func TestHandleStartExplainsCaptureFirst(t *testing.T) {
 	// The primary affordance must be stated first.
 	if !strings.Contains(body, "task") {
 		t.Errorf("help should lead with 'any message becomes a task':\n%s", f.sent[0].Text)
+	}
+}
+
+func TestParseCaptureSplitsOnFirstNewline(t *testing.T) {
+	cases := []struct {
+		in       string
+		title    string
+		desc     string
+		ok       bool
+	}{
+		{"call the dentist", "call the dentist", "", true},
+		{"call the dentist\nask about the crown", "call the dentist", "ask about the crown", true},
+		{"title\nline one\nline two", "title", "line one\nline two", true},
+		{"  padded  \n  body  ", "padded", "body", true},
+		{"", "", "", false},
+		{"   ", "", "", false},
+		{"\n\n", "", "", false},
+		{"\nonly a body", "", "", false}, // an empty first line is not a title
+	}
+	for _, c := range cases {
+		title, desc, ok := ParseCapture(c.in)
+		if ok != c.ok {
+			t.Errorf("ParseCapture(%q) ok = %v, want %v", c.in, ok, c.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if title != c.title || desc != c.desc {
+			t.Errorf("ParseCapture(%q) = (%q, %q), want (%q, %q)", c.in, title, desc, c.title, c.desc)
+		}
+	}
+}
+
+// botWithServer wires a Bot against a real httptest server so the read-modify-write
+// paths are exercised end to end without Telegram.
+func botWithServer(t *testing.T, h http.HandlerFunc) (*Bot, *fakeSender, func()) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	f := &fakeSender{}
+	cfg := testConfig()
+	b := NewBot(cfg, NewClient(srv.URL), NewRegistry(100), f, func() int64 { return 0 })
+	return b, f, srv.Close
+}
+
+func TestCaptureCreatesTodoTaskAndShowsCard(t *testing.T) {
+	var got task.AddRequest
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tasks/add":
+			json.NewDecoder(r.Body).Decode(&got)
+			json.NewEncoder(w).Encode(map[string]any{
+				"state_version": 1,
+				"task": task.Task{ID: "NEW", Content: got.Content, Meta: task.Meta{Version: 1}},
+			})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	})
+	defer done()
+
+	if err := b.Capture(context.Background(), 42, "sekrit", "call the dentist\nask about the crown", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got.Content.Title != "call the dentist" || got.Content.Description != "ask about the crown" {
+		t.Errorf("sent content = %+v", got.Content)
+	}
+	if got.Content.Status != task.StatusTodo || got.Content.Priority != task.PriorityNone {
+		t.Errorf("capture defaults wrong: status=%q priority=%q", got.Content.Status, got.Content.Priority)
+	}
+	if got.ParentID != nil {
+		t.Error("capture never sets a parent — hierarchy mutation is a v1 non-goal")
+	}
+	if len(f.sent) != 1 {
+		t.Fatalf("want one reply, got %d", len(f.sent))
+	}
+	if !strings.Contains(f.sent[0].Text, "call the dentist") {
+		t.Errorf("reply is not the task card:\n%s", f.sent[0].Text)
+	}
+	// The card reached by capture has no originating list, so no Back button.
+	for _, row := range f.sent[0].KB {
+		for _, btn := range row {
+			if btn.Action.Kind == KindBack {
+				t.Error("a capture card must not offer Back")
+			}
+		}
+	}
+}
+
+func TestCaptureRejectsEmptyTitleWithoutCallingServer(t *testing.T) {
+	called := false
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	})
+	defer done()
+
+	if err := b.Capture(context.Background(), 42, "sekrit", "   \n  ", ""); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Error("an empty title must be rejected client-side, with no server round-trip")
+	}
+	if len(f.sent) != 1 || !strings.Contains(strings.ToLower(f.sent[0].Text), "title") {
+		t.Errorf("expected a 'needs a title' reply, got %+v", f.sent)
+	}
+}
+
+func TestCapturePrefixesANoteWhenGiven(t *testing.T) {
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"state_version": 1,
+			"task": task.Task{ID: "NEW", Content: task.Content{Title: "x"}, Meta: task.Meta{Version: 1}},
+		})
+	})
+	defer done()
+
+	note := "That edit prompt expired, so I added this as a new task instead."
+	if err := b.Capture(context.Background(), 42, "sekrit", "x", note); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.sent[0].Text, "expired") {
+		t.Errorf("note was not surfaced:\n%s", f.sent[0].Text)
+	}
+}
+
+func TestCaptureSurfacesServerErrorText(t *testing.T) {
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"title must be non-empty"}`))
+	})
+	defer done()
+
+	if err := b.Capture(context.Background(), 42, "sekrit", "x", ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.sent) != 1 || !strings.Contains(f.sent[0].Text, "title must be non-empty") {
+		t.Errorf("server error text was not surfaced verbatim: %+v", f.sent)
 	}
 }
