@@ -147,3 +147,142 @@ func RenderPage(p Page, query string, overflow int, now int64, offsetMin int) (s
 	}
 	return b.String(), kb
 }
+
+// Origin names the listing a card was opened from, so Back returns there. A card
+// reached by capture has HasList false and shows no Back button — a Back that
+// jumped somewhere the user has never been would be worse than none.
+type Origin struct {
+	HasList bool
+	Page    int
+	Query   string
+}
+
+func (o Origin) act(kind ActionKind, taskID, arg string) Action {
+	return Action{Kind: kind, TaskID: taskID, Arg: arg,
+		Page: o.Page, Query: o.Query, HasList: o.HasList}
+}
+
+// CardText renders the detail view. Alignment uses newlines and <code> spans, not
+// space padding — phone clients render proportional fonts, so columns built from
+// spaces do not survive.
+func CardText(t task.Task, ix *Index, now int64, offsetMin int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s <b>%s</b>\n", StatusGlyph(t.Content.Status), EscapeHTML(t.Content.Title))
+	if p, ok := ix.ParentOf(t.ID); ok {
+		fmt.Fprintf(&b, "<i>in %s</i>\n", EscapeHTML(p.Content.Title))
+	}
+	if t.Content.Description != "" {
+		fmt.Fprintf(&b, "\n%s\n", EscapeHTML(t.Content.Description))
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "status    <code>%s</code>\n", EscapeHTML(string(t.Content.Status)))
+	fmt.Fprintf(&b, "priority  <code>%s</code>\n", EscapeHTML(string(t.Content.Priority)))
+
+	due := "—"
+	if t.Content.DueAt != nil {
+		due = FormatDate(*t.Content.DueAt, offsetMin)
+		if rel := FormatDue(t.Content.DueAt, now, offsetMin); rel != "" {
+			due += " (" + rel + ")"
+		}
+	}
+	fmt.Fprintf(&b, "due       <code>%s</code>\n", EscapeHTML(due))
+
+	tags := "—"
+	if len(t.Content.Tags) > 0 {
+		tags = strings.Join(t.Content.Tags, ", ")
+	}
+	fmt.Fprintf(&b, "tags      <code>%s</code>\n", EscapeHTML(tags))
+
+	if n := len(t.Content.ChildIDs); n > 0 {
+		fmt.Fprintf(&b, "subtasks  <code>%d</code>\n", n)
+	}
+	return b.String()
+}
+
+func CardKeyboard(t task.Task, o Origin) [][]Button {
+	id := t.ID
+	kb := [][]Button{
+		{
+			{"✓ Done", o.act(KindDone, id, "")},
+			{"Status", o.act(KindPickStatus, id, "")},
+			{"Priority", o.act(KindPickPriority, id, "")},
+		},
+		{
+			{"Due", o.act(KindPickDue, id, "")},
+			{"Tags", o.act(KindPromptField, id, "tags")},
+			// Without this the last tag can never be removed: a ForceReply reply
+			// is never empty, and Telegram allows only one reply_markup per
+			// message, so the button cannot live on the prompt itself.
+			{"Clear tags", o.act(KindClearTags, id, "")},
+		},
+		{
+			{"✎ Title", o.act(KindPromptField, id, "title")},
+			{"✎ Description", o.act(KindPromptField, id, "description")},
+		},
+	}
+	last := []Button{{"🗑 Delete", o.act(KindConfirmDelete, id, "")}}
+	if o.HasList {
+		last = append(last, Button{"◀ Back", o.act(KindBack, id, "")})
+	}
+	return append(kb, last)
+}
+
+func pickerKeyboard(kind ActionKind, taskID string, o Origin, opts [][2]string) [][]Button {
+	var kb [][]Button
+	var row []Button
+	for _, opt := range opts {
+		row = append(row, Button{opt[0], o.act(kind, taskID, opt[1])})
+		if len(row) == 3 {
+			kb = append(kb, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		kb = append(kb, row)
+	}
+	return append(kb, []Button{{"◀", o.act(KindOpenTask, taskID, "")}})
+}
+
+func StatusPickerKeyboard(taskID string, o Origin) [][]Button {
+	return pickerKeyboard(KindSetStatus, taskID, o, [][2]string{
+		{"○ todo", "todo"},
+		{"◐ in progress", "in_progress"},
+		{"✓ done", "done"},
+		{"✗ cancelled", "cancelled"},
+	})
+}
+
+func PriorityPickerKeyboard(taskID string, o Origin) [][]Button {
+	return pickerKeyboard(KindSetPriority, taskID, o, [][2]string{
+		{"none", "none"}, {"low", "low"}, {"medium", "medium"}, {"high", "high"},
+	})
+}
+
+// DuePickerKeyboard offers fixed choices only. Free-text dates are a v1 non-goal:
+// they would need edit.zig's parser ported to Go. Every Arg here must be a
+// keyword DueFromKeyword accepts.
+func DuePickerKeyboard(taskID string, o Origin) [][]Button {
+	return pickerKeyboard(KindSetDue, taskID, o, [][2]string{
+		{"Today", "today"}, {"Tomorrow", "tomorrow"}, {"+3 days", "+3d"},
+		{"+1 week", "+1w"}, {"Clear", "clear"},
+	})
+}
+
+// DeleteConfirmText names the consequence. server/store.go:364 deletes
+// non-recursively — "its former children become unreferenced roots" — and a phone
+// user cannot see that from a card, so silently detaching a subtree must not be
+// the outcome of a two-tap gesture.
+func DeleteConfirmText(t task.Task) string {
+	msg := fmt.Sprintf("Delete <b>%s</b>?", EscapeHTML(t.Content.Title))
+	if n := len(t.Content.ChildIDs); n > 0 {
+		msg += fmt.Sprintf("\n\nIts %d subtask(s) will become top-level tasks.", n)
+	}
+	return msg
+}
+
+func DeleteConfirmKeyboard(taskID string, o Origin) [][]Button {
+	return [][]Button{{
+		{"Yes, delete", o.act(KindDoDelete, taskID, "")},
+		{"Cancel", o.act(KindOpenTask, taskID, "")},
+	}}
+}

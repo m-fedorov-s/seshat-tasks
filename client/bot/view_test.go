@@ -491,3 +491,62 @@ func TestFindReportsOverflowAboveCeiling(t *testing.T) {
 		t.Errorf("overflow = %d, want 7", overflow)
 	}
 }
+
+func TestDueFromKeywordEndOfLocalDay(t *testing.T) {
+	// 2026-08-02T12:00:00Z
+	const now = int64(1785672000)
+
+	got, err := DueFromKeyword("today", now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// End of 2026-08-02 UTC == 23:59:59
+	if want := int64(1785715199); *got != want {
+		t.Errorf("today at +00:00 = %d, want %d", *got, want)
+	}
+
+	// At +03:00 local it is 15:00 on the 2nd, so "today" is the end of the local
+	// 2nd, which is 20:59:59Z.
+	got, err = DueFromKeyword("today", now, 180)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(1785715199 - 180*60); *got != want {
+		t.Errorf("today at +03:00 = %d, want %d", *got, want)
+	}
+}
+
+func TestDueFromKeywordOffsets(t *testing.T) {
+	const now = int64(1785672000) // 2026-08-02T12:00:00Z
+	base, _ := DueFromKeyword("today", now, 0)
+	cases := map[string]int64{
+		"tomorrow": 1,
+		"+3d":      3,
+		"+1w":      7,
+	}
+	for kw, days := range cases {
+		got, err := DueFromKeyword(kw, now, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", kw, err)
+		}
+		if want := *base + days*86400; *got != want {
+			t.Errorf("%s = %d, want %d (%d days after today)", kw, *got, want, days)
+		}
+	}
+}
+
+func TestDueFromKeywordClear(t *testing.T) {
+	got, err := DueFromKeyword("clear", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("clear must produce nil (a cleared due_at), got %d", *got)
+	}
+}
+
+func TestDueFromKeywordRejectsUnknown(t *testing.T) {
+	if _, err := DueFromKeyword("next tuesday", 0, 0); err == nil {
+		t.Error("free-text dates are a v1 non-goal; unknown keywords must error")
+	}
+}

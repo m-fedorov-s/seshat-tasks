@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -360,4 +361,44 @@ func FindGroups(tasks []task.Task, ix *Index, needle string) ([]Group, int) {
 		groups = append(groups, Group{row})
 	}
 	return groups, overflow
+}
+
+// DueFromKeyword resolves a due-picker keyword to a UTC instant, or nil for
+// "clear". A bare due date means 23:59:59 LOCAL, converted to UTC through the
+// offset — matching client/zig/src/core/edit.zig:61-66, where timeOfDay(.due) is
+// 86399. If this diverges, bot-set and CLI-set due dates disagree by a day at the
+// boundary. Free-text dates are a v1 non-goal, so anything else is an error.
+func DueFromKeyword(kw string, now int64, offsetMin int) (*int64, error) {
+	var addDays int64
+	switch kw {
+	case "clear":
+		return nil, nil
+	case "today":
+		addDays = 0
+	case "tomorrow":
+		addDays = 1
+	case "+3d":
+		addDays = 3
+	case "+1w":
+		addDays = 7
+	default:
+		return nil, fmt.Errorf("unknown due keyword %q", kw)
+	}
+	off := int64(offsetMin) * 60
+	// Local wall-clock instant, expressed as if it were UTC.
+	local := now + off
+	localDayStart := floorDiv(local, day) * day
+	localEnd := localDayStart + addDays*day + 86399
+	utc := localEnd - off
+	return &utc, nil
+}
+
+// floorDiv divides rounding toward negative infinity, so pre-epoch local times do
+// not jump forward a day the way Go's truncating division would.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if (a%b != 0) && ((a < 0) != (b < 0)) {
+		q--
+	}
+	return q
 }

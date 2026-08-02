@@ -3,10 +3,9 @@ package main
 import (
 	"strings"
 	"testing"
-)
 
-// NOTE: do NOT import seshat/internal/task here yet — nothing in this file uses
-// it until Task 9 adds cardTask(). An unused import is a compile error in Go.
+	"seshat/internal/task"
+)
 
 func TestEscapeHTML(t *testing.T) {
 	cases := map[string]string{
@@ -242,5 +241,195 @@ func TestRenderPageStaysUnderTelegramLimits(t *testing.T) {
 	}
 	if total > maxRowsPerPage+3 {
 		t.Errorf("keyboard has %d buttons, more than one per row plus nav", total)
+	}
+}
+
+func cardTask() task.Task {
+	t := mk("01JTASK")
+	t.Content.Title = "call the dentist"
+	t.Content.Description = "Ask about the crown."
+	t.Content.Status = task.StatusTodo
+	t.Content.Priority = task.PriorityNone
+	t.Content.Tags = []string{}
+	return t
+}
+
+func TestCardTextShowsFields(t *testing.T) {
+	tk := cardTask()
+	ix := BuildIndex([]task.Task{tk})
+	got := CardText(tk, ix, 0, 0)
+	for _, want := range []string{"call the dentist", "Ask about the crown.", "todo", "none"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("card is missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestCardTextEscapesEverything(t *testing.T) {
+	tk := cardTask()
+	tk.Content.Title = "a < b"
+	tk.Content.Description = "x & y"
+	tk.Content.Tags = []string{"<tag>"}
+	ix := BuildIndex([]task.Task{tk})
+	got := CardText(tk, ix, 0, 0)
+	if strings.Contains(got, "a < b") || strings.Contains(got, "x & y") || strings.Contains(got, "<tag>") {
+		t.Errorf("card leaked unescaped text:\n%s", got)
+	}
+}
+
+func TestCardTextOmitsEmptyDescription(t *testing.T) {
+	tk := cardTask()
+	tk.Content.Description = ""
+	ix := BuildIndex([]task.Task{tk})
+	got := CardText(tk, ix, 0, 0)
+	if strings.Contains(got, "\n\n\n") {
+		t.Errorf("empty description left a hole:\n%s", got)
+	}
+}
+
+func TestCardTextShowsParentBreadcrumb(t *testing.T) {
+	parent := mk("P")
+	parent.Content.Title = "Health"
+	parent.Content.ChildIDs = []string{"01JTASK"}
+	tk := cardTask()
+	ix := BuildIndex([]task.Task{parent, tk})
+	got := CardText(tk, ix, 0, 0)
+	if !strings.Contains(got, "Health") {
+		t.Errorf("card lost its parent breadcrumb:\n%s", got)
+	}
+}
+
+func TestCardTextShowsSubtaskCount(t *testing.T) {
+	tk := cardTask()
+	tk.Content.ChildIDs = []string{"a", "b"}
+	ix := BuildIndex([]task.Task{tk})
+	got := CardText(tk, ix, 0, 0)
+	if !strings.Contains(got, "2") {
+		t.Errorf("card must show the subtask count — delete is non-recursive:\n%s", got)
+	}
+}
+
+func TestCardKeyboardHasBackOnlyWhenThereIsAList(t *testing.T) {
+	tk := cardTask()
+
+	_, withList := lastRowKinds(CardKeyboard(tk, Origin{HasList: true, Page: 2, Query: "x"}))
+	if !withList[KindBack] {
+		t.Error("a card opened from a list must offer Back")
+	}
+	_, fromCapture := lastRowKinds(CardKeyboard(tk, Origin{HasList: false}))
+	if fromCapture[KindBack] {
+		t.Error("a card reached by capture has no originating page, so no Back button")
+	}
+}
+
+func lastRowKinds(kb [][]Button) ([][]Button, map[ActionKind]bool) {
+	kinds := map[ActionKind]bool{}
+	for _, row := range kb {
+		for _, b := range row {
+			kinds[b.Action.Kind] = true
+		}
+	}
+	return kb, kinds
+}
+
+func TestCardKeyboardCarriesOriginOnEveryButton(t *testing.T) {
+	tk := cardTask()
+	o := Origin{HasList: true, Page: 3, Query: "dentist"}
+	kb := CardKeyboard(tk, o)
+	for _, row := range kb {
+		for _, b := range row {
+			if b.Action.Kind == KindNoop {
+				continue
+			}
+			if b.Action.Page != 3 || b.Action.Query != "dentist" {
+				t.Errorf("button %q lost its origin: page=%d query=%q", b.Label, b.Action.Page, b.Action.Query)
+			}
+			if b.Action.TaskID != tk.ID {
+				t.Errorf("button %q lost the task id", b.Label)
+			}
+		}
+	}
+}
+
+func TestCardKeyboardHasTheExpectedActions(t *testing.T) {
+	_, kinds := lastRowKinds(CardKeyboard(cardTask(), Origin{HasList: true}))
+	for _, want := range []ActionKind{KindDone, KindPickStatus, KindPickPriority, KindPickDue, KindPromptField, KindConfirmDelete} {
+		if !kinds[want] {
+			t.Errorf("card keyboard is missing kind %v", want)
+		}
+	}
+	// Delete must never be a single tap.
+	if kinds[KindDoDelete] {
+		t.Error("the card must not expose DoDelete directly; it goes through a confirm")
+	}
+}
+
+func TestPickerKeyboards(t *testing.T) {
+	o := Origin{HasList: true, Page: 1}
+
+	statuses := map[string]bool{}
+	for _, row := range StatusPickerKeyboard("T", o) {
+		for _, b := range row {
+			if b.Action.Kind == KindSetStatus {
+				statuses[b.Action.Arg] = true
+			}
+		}
+	}
+	for _, want := range []string{"todo", "in_progress", "done", "cancelled"} {
+		if !statuses[want] {
+			t.Errorf("status picker is missing %q", want)
+		}
+	}
+
+	prios := map[string]bool{}
+	for _, row := range PriorityPickerKeyboard("T", o) {
+		for _, b := range row {
+			if b.Action.Kind == KindSetPriority {
+				prios[b.Action.Arg] = true
+			}
+		}
+	}
+	for _, want := range []string{"none", "low", "medium", "high"} {
+		if !prios[want] {
+			t.Errorf("priority picker is missing %q", want)
+		}
+	}
+
+	dues := map[string]bool{}
+	for _, row := range DuePickerKeyboard("T", o) {
+		for _, b := range row {
+			if b.Action.Kind == KindSetDue {
+				dues[b.Action.Arg] = true
+			}
+		}
+	}
+	for _, want := range []string{"today", "tomorrow", "+3d", "+1w", "clear"} {
+		if !dues[want] {
+			t.Errorf("due picker is missing %q", want)
+		}
+	}
+	// Every keyword the picker offers must resolve.
+	for kw := range dues {
+		if _, err := DueFromKeyword(kw, 0, 0); err != nil {
+			t.Errorf("due picker offers %q which DueFromKeyword rejects", kw)
+		}
+	}
+}
+
+func TestDeleteConfirmNamesTheConsequence(t *testing.T) {
+	tk := cardTask()
+	tk.Content.ChildIDs = []string{"a", "b"}
+	got := DeleteConfirmText(tk)
+	if !strings.Contains(got, "2") {
+		t.Errorf("confirm must state the subtask count:\n%s", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "top-level") {
+		t.Errorf("confirm must say children are promoted to top level (store.go:364 is non-recursive):\n%s", got)
+	}
+
+	// No children: no scary sentence.
+	plain := DeleteConfirmText(cardTask())
+	if strings.Contains(strings.ToLower(plain), "top-level") {
+		t.Errorf("a childless task needs no subtask warning:\n%s", plain)
 	}
 }
