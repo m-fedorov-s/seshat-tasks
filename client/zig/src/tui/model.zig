@@ -683,9 +683,10 @@ fn restoreEditor(m: *Model) ?FieldId {
 // takes back (in `tasks_loaded`) — because it is the only one that describes
 // something in progress rather than something that already happened. Named so
 // the write and the retraction cannot drift apart into a message that sticks.
-// `pub` so `render.zig`'s header marker uses the same word: a refresh is not a
-// save, and the header saying `saving…` for one was misleading.
-pub const refreshing_status = "refreshing…";
+// The STATUS LINE is the only surface that reports a refresh. `render.zig`'s
+// header marker deliberately says nothing for `.refresh` — it means "a write is
+// outstanding" and nothing else — so this stays private to the model.
+const refreshing_status = "refreshing…";
 
 fn listMode(m: *Model, ev: Event) !Command {
     const k = switch (ev) {

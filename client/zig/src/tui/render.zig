@@ -192,19 +192,27 @@ fn drawHeader(win: vaxis.Window, m: *const Model, layout: ledger.Layout) void {
     }) catch buf[0..0];
 
     var col = put(win, 0, 0, text, header_style);
-    // A REFRESH IS NOT A SAVE. This marker said `saving…` for every in-flight
-    // request, so pressing `R` claimed the TUI was writing to the server when it
-    // was only reading — reported as misleading by the project owner. The word for
-    // a refresh comes from `model.refreshing_status`, the same constant the status
-    // line uses, so the two cannot drift into different vocabulary.
-    const marker: ?[]const u8 = switch (m.in_flight) {
-        .none => null,
-        .refresh => model.refreshing_status,
-        .commit, .create, .delete => "saving…",
+    // A REFRESH IS NOT A SAVE, and this marker used to claim one for every
+    // in-flight request — pressing `R` said the TUI was writing to the server when
+    // it was only reading. So the marker now means exactly one thing: A WRITE IS
+    // OUTSTANDING. A refresh gets no header marker at all.
+    //
+    // ONE SURFACE, not two. The refresh signal lives on the STATUS LINE
+    // (`model.refreshing_status`, written by `R` the instant it dispatches and
+    // held until the reply, because `retractStatus` will not take back an
+    // in-flight message). That is the surface the user is actually reading — it
+    // sits beside the key bar and the prompt at the bottom of the screen — and it
+    // is there precisely BECAUSE this header marker lost that argument once
+    // already: for a refused connection it lives for milliseconds, "gone before
+    // the eye reaches it", which is what made `R` look like a dead key. Echoing
+    // the same word up here would be noise on the one line that is now scarce.
+    const outstanding_write = switch (m.in_flight) {
+        .commit, .create, .delete => true,
+        .none, .refresh => false,
     };
-    if (marker) |word| {
+    if (outstanding_write) {
         col = put(win, 0, col, " · ", chrome);
-        _ = put(win, 0, col, word, saving_style);
+        _ = put(win, 0, col, "saving…", saving_style);
     }
 }
 
@@ -604,8 +612,8 @@ fn drawFooter(win: vaxis.Window, m: *const Model) void {
     // A prompt outranks the status line: the user is typing into it right now,
     // and it is the only place the typed text appears.
     switch (m.mode) {
-        .filter => |le| return drawPrompt(win, "filter ", &le),
-        .add => |le| return drawPrompt(win, "new task ", &le),
+        .filter => |le| return drawPrompt(win, "filter ", &le, m),
+        .add => |le| return drawPrompt(win, "new task ", &le, m),
         else => {},
     }
     const s = m.status();
@@ -616,10 +624,43 @@ fn drawFooter(win: vaxis.Window, m: *const Model) void {
     _ = put(win, 0, 0, keyBar(m), chrome);
 }
 
-fn drawPrompt(win: vaxis.Window, label: []const u8, le: *const editors.LineEditor) void {
+fn drawPrompt(win: vaxis.Window, label: []const u8, le: *const editors.LineEditor, m: *const Model) void {
+    const txt = le.text();
+
+    // A REJECTED PROMPT HAS TO SAY SO WHILE IT IS STILL OPEN. `applyFilter` and
+    // `submitAdd` both deliberately KEEP the prompt open on a rejection so the
+    // typo can be fixed in place — and both write a message saying why. The
+    // prompt used to own the whole footer row, so that message was written and
+    // never drawn: type a bad filter, press Enter, watch nothing happen. Exactly
+    // the "indistinguishable from a dead key" failure the `R` marker fixed.
+    //
+    // The message shares the prompt's line, RIGHT-ALIGNED, drawn FIRST so the
+    // prompt overpaints it rather than the reverse — the prompt is what the user
+    // is typing into and must never be the thing that gives way.
+    //
+    // Why not borrow a row from the pane or the ledger instead: their heights come
+    // from `ledger.layoutFor`/`chrome_rows`, numbers `render.draw` and
+    // `model.recompute` have to agree on exactly (getting that wrong is what put
+    // the field focus one row below the pane). Making that arithmetic conditional
+    // on whether a transient message happens to be pending would put a
+    // presentation state into a shared layout constant, to buy one line for a
+    // string that the next keypress retracts anyway. Right-aligning also keeps the
+    // message still while the user types, instead of being shoved along by it.
+    const s = m.status();
+    if (s.len > 0) {
+        const used = win.gwidth(label) +| win.gwidth(txt);
+        const room = win.width -| (used + 1); // +1: never let the two runs touch
+        if (room > 0) {
+            // `m.status()` is the model's own buffer and outlives the frame, and
+            // `truncate` returns a slice of it — so this must NOT go through the
+            // frame bump buffer. See `frameTake`.
+            const msg = display.truncate(s, room);
+            _ = put(win, 0, win.width -| win.gwidth(msg), msg, status_style);
+        }
+    }
+
     var col = put(win, 0, 0, label, chrome);
     const start = col;
-    const txt = le.text();
     col = put(win, 0, col, txt, .{});
     const cur = @min(le.cursor, txt.len);
     win.showCursor(start +| win.gwidth(txt[0..cur]), 0); // saturating: see drawEditor
@@ -929,6 +970,146 @@ fn testHandlesAlignAt(win: vaxis.Window, m: *const Model, expected: u16) !void {
             return err;
         };
     }
+}
+
+// ─── the footer-reachability tests ───────────────────────────────────────────
+//
+// Same class as every other test in this file, and the same origin: the MODEL
+// does the right thing and the SHELL swallows it, which no model test can see.
+// `applyFilter` and `submitAdd` deliberately keep their prompt open on a
+// rejection and write a message saying why — and the footer gave the whole row to
+// the prompt, so the message was written and never drawn. Type a bad filter,
+// press Enter, watch nothing happen: the same failure mode as the `R` bug.
+//
+// The invariant: ANYTHING THE MODEL PUTS ON THE STATUS LINE MUST BE REACHABLE ON
+// SCREEN, including while a prompt owns the footer.
+
+fn testOneRowModel(a: std.mem.Allocator, m: *Model, now: i64, tasks: []const Task, cols: u16, rows: u16) !void {
+    try m.init(a, now, 0);
+    _ = try model.update(a, m, .{ .tasks_loaded = tasks });
+    _ = try model.update(a, m, .{ .resize = .{ .cols = cols, .rows = rows } });
+}
+
+test "a rejected prompt keeps the typed text and shows the reason on the same line" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+
+    var tasks = [_]Task{.{
+        .id = "01JQRSTUVWXYZABCDEFGHJKMNP",
+        .content = .{ .title = "a task", .status = .todo },
+        .meta = .{ .created_at = now },
+    }};
+    var m: Model = undefined;
+    try testOneRowModel(a, &m, now, &tasks, 100, 24);
+    defer m.deinit();
+
+    var screen: vaxis.Screen = try .init(a, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = testWindow(&screen);
+    const footer: u16 = 23;
+    var buf: [8192]u8 = undefined;
+
+    // ── `/`, with an expression `filterspec.parse` rejects ───────────────────
+    _ = try model.update(a, &m, .{ .key = .{ .char = '/' } });
+    for ("nonsense") |c| _ = try model.update(a, &m, .{ .key = .{ .char = c } });
+    _ = try model.update(a, &m, .{ .key = .enter });
+    try std.testing.expect(m.mode == .filter); // still open, by design
+    try std.testing.expect(m.status().len > 0); // the model DID say why
+
+    draw(win, &m);
+    const row = testRowText(win, &buf, footer);
+    // The prompt still owns the left of the line, label and all, unmoved.
+    try std.testing.expect(std.mem.startsWith(u8, row, "filter nonsense"));
+    // ...and the reason is on the same line, right-aligned against the edge.
+    // "not a filter" cannot come from the typed text, so this cannot pass by
+    // accident the way a bare search for "nonsense" would (the message echoes it).
+    std.testing.expect(std.mem.indexOf(u8, row, "not a filter") != null) catch |err| {
+        std.debug.print("footer: \"{s}\"\n  status was: \"{s}\"\n", .{ row, m.status() });
+        return err;
+    };
+    try std.testing.expect(std.mem.endsWith(u8, row, "overdue)"));
+
+    // ── `a`, whose rejection comes from the SERVER and must not cost the title ─
+    _ = try model.update(a, &m, .{ .key = .escape });
+    _ = try model.update(a, &m, .{ .key = .{ .char = 'a' } });
+    for ("buy milk") |c| _ = try model.update(a, &m, .{ .key = .{ .char = c } });
+    _ = try model.update(a, &m, .{ .key = .enter }); // -> Command.create; mode stays .add
+    _ = try model.update(a, &m, .{ .request_failed = "server error (503): unavailable" });
+    try std.testing.expect(m.mode == .add);
+
+    draw(win, &m);
+    var buf2: [8192]u8 = undefined;
+    const row2 = testRowText(win, &buf2, footer);
+    try std.testing.expect(std.mem.startsWith(u8, row2, "new task buy milk"));
+    try std.testing.expect(std.mem.indexOf(u8, row2, "unavailable") != null);
+
+    // ── narrow: the prompt wins, and the two runs never touch ────────────────
+    // At 40 columns the message no longer fits beside the prompt whole, which is
+    // the case where "right-aligned" could silently become "overlapping".
+    var m2: Model = undefined;
+    try testOneRowModel(a, &m2, now, &tasks, 40, 24);
+    defer m2.deinit();
+    var screen2: vaxis.Screen = try .init(a, .{ .cols = 40, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen2.deinit(a);
+    const win2 = testWindow(&screen2);
+
+    _ = try model.update(a, &m2, .{ .key = .{ .char = '/' } });
+    for ("nonsense") |c| _ = try model.update(a, &m2, .{ .key = .{ .char = c } });
+    _ = try model.update(a, &m2, .{ .key = .enter });
+    draw(win2, &m2);
+    var buf3: [8192]u8 = undefined;
+    const row3 = testRowText(win2, &buf3, footer);
+    const prompt_cols: u16 = @intCast("filter nonsense".len);
+    try std.testing.expect(std.mem.startsWith(u8, row3, "filter nonsense"));
+    try std.testing.expect(std.mem.indexOf(u8, row3, "not a filter") != null);
+    // The blank column is the whole reason the prompt cannot be encroached on:
+    // without it the message starts under the typed text and only survives from
+    // wherever the prompt stopped overpainting it, which reads as garbage.
+    std.testing.expect(testBlankAt(win2, prompt_cols, footer)) catch |err| {
+        std.debug.print("40-col footer, no gap after the prompt: \"{s}\"\n", .{row3});
+        return err;
+    };
+}
+
+// One signal, one surface. The header marker means "a WRITE is outstanding" and
+// nothing else; the refresh signal is the status line's, because that is the
+// surface the user reads and because this marker already lost that argument once
+// (for a refused connection it is gone before the eye reaches it, which is what
+// made `R` look like a dead key). Saying it in both places is noise on the one
+// line that has to give the key bar back.
+test "a refresh is reported on the status line only; the header marker means a write" {
+    const a = std.testing.allocator;
+    const now: i64 = 100 * 86400;
+
+    var tasks = [_]Task{.{
+        .id = "01JQRSTUVWXYZABCDEFGHJKMNP",
+        .content = .{ .title = "a task", .status = .todo },
+        .meta = .{ .created_at = now },
+    }};
+    var m: Model = undefined;
+    try testOneRowModel(a, &m, now, &tasks, 100, 24);
+    defer m.deinit();
+
+    var screen: vaxis.Screen = try .init(a, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = testWindow(&screen);
+    var buf: [8192]u8 = undefined;
+    var buf2: [8192]u8 = undefined;
+
+    _ = try model.update(a, &m, .{ .key = .{ .char = 'R' } });
+    try std.testing.expect(m.in_flight == .refresh);
+    draw(win, &m);
+    const header = testRowText(win, &buf, 0);
+    try std.testing.expect(std.mem.indexOf(u8, header, "refreshing") == null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "saving") == null); // never a write
+    try std.testing.expect(std.mem.indexOf(u8, testRowText(win, &buf2, 23), "refreshing") != null);
+
+    // A real write still gets its marker, on the same in-flight machinery.
+    _ = try model.update(a, &m, .{ .tasks_loaded = &tasks });
+    _ = try model.update(a, &m, .{ .key = .{ .char = ' ' } }); // cycle the status
+    try std.testing.expect(m.in_flight == .commit);
+    draw(win, &m);
+    try std.testing.expect(std.mem.indexOf(u8, testRowText(win, &buf, 0), "saving…") != null);
 }
 
 fn testBlankAt(win: vaxis.Window, col: u16, y: u16) bool {

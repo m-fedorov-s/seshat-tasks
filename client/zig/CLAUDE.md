@@ -217,17 +217,27 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     rows → re-resolve the cursor → scroll. Reuses `core/edit.zig`'s `Patch`/`applyPatch`/
     `parseDate`/`validate` and `core/filterspec.zig` unchanged.
   - `render.zig` — paints a `Model` onto a `vaxis.Window`: header (scope · sort · rows n–m of N ·
-    overdue count · an in-flight marker that says `saving…` for a write and `refreshing…` for a
-    read), ledger, optional detail pane, rule, footer (prompt > status line >
+    overdue count · `saving…`), ledger, optional detail pane, rule, footer (prompt > status line >
     key bar). Maps `core/display.zig`'s `Style` to a `vaxis.Style` — that mapping is the only
     place the TUI decides how a *task* looks, and TUI-only styling (cursor bar, focus highlight,
-    badge) stays local here rather than becoming a `display.Style` variant. Five tests, all of
-    invariants rather than of aesthetics and every one added after a human found the thing broken
-    at a terminal: cell strings must outlive `draw` (libvaxis cells borrow them); every field
-    the model can focus must get a painted focus bar; and the `#handle` column (right-aligned,
-    width = `m.handle_len + 1` read off the model, one blank gap column always) must line up
-    whatever the row depth, keep that gap at every handle width, and never cost the title —
-    extras are dropped due-wording-first, badge-second, and the title is the last thing to go.
+    badge) stays local here rather than becoming a `display.Style` variant.
+
+    **One signal, one surface:** the header's `saving…` means *a write is outstanding* and nothing
+    else — a refresh gets no header marker, because `refreshing…` on the status line already
+    reports it and that is the surface the user reads. (This marker lost that argument once
+    already: for a refused connection it lives for milliseconds, which is what made `R` look like
+    a dead key.) **A prompt does not swallow the status:** `drawPrompt` draws `m.status()`
+    right-aligned on the prompt's own line, message first so the prompt overpaints it, with one
+    blank column reserved between — a rejected `/` or `a` keeps its typed text *and* says why.
+
+    Seven tests, all of invariants rather than of aesthetics and every one added after a human
+    found the thing broken at a terminal: cell strings must outlive `draw` (libvaxis cells borrow
+    them); every field the model can focus must get a painted focus bar; the `#handle` column
+    (right-aligned, width = `m.handle_len + 1` read off the model, one blank gap column always)
+    must line up whatever the row depth, keep that gap at every handle width, and never cost the
+    title — extras are dropped due-wording-first, badge-second, and the title is the last thing to
+    go; anything the model puts on the status line must be reachable on screen *including while a
+    prompt owns the footer*; and a refresh must be reported on exactly one surface.
     None needs a TTY — a `vaxis.Window` only needs a `Screen`.
   - `app.zig` — the shell: `vaxis.Loop`, the key translation table (`toKey`, **named keys tested
     before `.text`** — Enter also carries `text = "\r"`), execution of `Command`s on a worker via
@@ -265,6 +275,11 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   That is a separate mechanism from `tasks_loaded`'s narrow retraction of `refreshing_status` —
   an in-flight marker has to die when its request lands even if no key is touched, and clearing
   unconditionally there eats `deleted`, whose own refetch arrives at the same handler.
+  A status set while a prompt is open (`applyFilter`'s `not a filter: …`, `submitAdd`'s
+  `a title cannot be empty`, a `request_failed` that keeps the typed title) is still shown —
+  `render.drawPrompt` puts it right-aligned on the prompt's line. Both of those handlers keep
+  the prompt open *on purpose* so the typo can be fixed in place; a message that never renders
+  makes Enter look like a dead key.
 - `src/schema_test.zig` — round-trips the shared `schema/fixtures/` against `Task` (run by
   `make schema-test` alongside the Go side).
 
