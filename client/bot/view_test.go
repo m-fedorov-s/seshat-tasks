@@ -193,3 +193,104 @@ func TestSubtreeWalkToleratesACycle(t *testing.T) {
 	a, _ := ix.Get("a")
 	_ = SubtreeMaxUrgency(a, ix, 0) // must terminate
 }
+
+func groupIDs(gs []Group) [][]string {
+	out := make([][]string, len(gs))
+	for i, g := range gs {
+		ids := make([]string, len(g))
+		for j, r := range g {
+			ids[j] = r.Task.ID
+		}
+		out[i] = ids
+	}
+	return out
+}
+
+func TestListGroupsKeepsAClosedParentThatHasAnOpenChild(t *testing.T) {
+	tasks := []task.Task{
+		mk("parent", withStatus(task.StatusDone), withChildren("kid")),
+		mk("kid"), // still todo
+	}
+	ix := BuildIndex(tasks)
+	got := groupIDs(ListGroups(tasks, ix, 0))
+	want := [][]string{{"parent", "kid"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v — a done parent must be retained as context so its open child is not erased", got, want)
+	}
+}
+
+func TestListGroupsDropsAFullyClosedTree(t *testing.T) {
+	tasks := []task.Task{
+		mk("parent", withStatus(task.StatusDone), withChildren("kid")),
+		mk("kid", withStatus(task.StatusCancelled)),
+		mk("live"),
+	}
+	ix := BuildIndex(tasks)
+	got := groupIDs(ListGroups(tasks, ix, 0))
+	want := [][]string{{"live"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestListGroupsSetsDepth(t *testing.T) {
+	tasks := []task.Task{
+		mk("root", withChildren("kid")),
+		mk("kid", withChildren("grandkid")),
+		mk("grandkid"),
+	}
+	ix := BuildIndex(tasks)
+	gs := ListGroups(tasks, ix, 0)
+	if len(gs) != 1 || len(gs[0]) != 3 {
+		t.Fatalf("expected one group of three rows, got %v", groupIDs(gs))
+	}
+	for i, wantDepth := range []int{0, 1, 2} {
+		if gs[0][i].Depth != wantDepth {
+			t.Errorf("row %d (%s) depth = %d, want %d", i, gs[0][i].Task.ID, gs[0][i].Depth, wantDepth)
+		}
+	}
+}
+
+func TestListGroupsOrdersChildrenByChildIDsNotUrgency(t *testing.T) {
+	tasks := []task.Task{
+		mk("root", withChildren("second", "first")),
+		mk("first", withPriority(task.PriorityHigh)),
+		mk("second"),
+	}
+	ix := BuildIndex(tasks)
+	got := groupIDs(ListGroups(tasks, ix, 0))
+	want := [][]string{{"root", "second", "first"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v — children follow child_ids order", got, want)
+	}
+}
+
+func TestListGroupsRanksRootsBySubtreeUrgency(t *testing.T) {
+	tasks := []task.Task{
+		mk("quiet"),
+		mk("hasUrgentKid", withChildren("kid")),
+		mk("kid", withPriority(task.PriorityHigh)),
+	}
+	ix := BuildIndex(tasks)
+	got := groupIDs(ListGroups(tasks, ix, 0))
+	if got[0][0] != "hasUrgentKid" {
+		t.Errorf("a buried urgent subtask must lift its root; got %v", got)
+	}
+}
+
+func TestListGroupsIgnoresDanglingChildIDs(t *testing.T) {
+	tasks := []task.Task{mk("root", withChildren("ghost"))}
+	ix := BuildIndex(tasks)
+	got := groupIDs(ListGroups(tasks, ix, 0))
+	want := [][]string{{"root"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestListGroupsEmptyInput(t *testing.T) {
+	ix := BuildIndex(nil)
+	if got := ListGroups(nil, ix, 0); len(got) != 0 {
+		t.Errorf("want no groups, got %v", groupIDs(got))
+	}
+}

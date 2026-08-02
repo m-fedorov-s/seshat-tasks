@@ -164,3 +164,82 @@ func RankRoots(roots []task.Task, ix *Index, now int64) {
 		return LessRoots(roots[i], roots[j], ix, now)
 	})
 }
+
+// Row is one rendered task line. Depth drives indentation. ParentTitle is set
+// only for the flat rows /find produces, where the tree is not drawn but the
+// parent is still needed as context.
+type Row struct {
+	Task        task.Task
+	Depth       int
+	ParentTitle string
+}
+
+// Group is a run of rows that must never be split across a page boundary. For
+// /list a group is a root and its whole subtree; for /find it is a single row.
+type Group []Row
+
+func IsOpen(t task.Task) bool { return !t.Content.Status.Terminal() }
+
+// subtreeHasOpen reports whether t or any descendant is open. This is the
+// selection rule, and it is deliberately NOT "t is open": see view.zig:240-243.
+// Retaining a closed parent that still has open children is what stops one tap
+// on "Done" from erasing a live subtree from every future listing.
+func subtreeHasOpen(t task.Task, ix *Index, seen map[string]bool) bool {
+	if seen[t.ID] {
+		return false
+	}
+	seen[t.ID] = true
+	if IsOpen(t) {
+		return true
+	}
+	for _, cid := range t.Content.ChildIDs {
+		child, ok := ix.Get(cid)
+		if !ok {
+			continue // dangling child id: the server forbids it, but do not crash
+		}
+		if subtreeHasOpen(child, ix, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// expand flattens a root's subtree into indented rows, children in child_ids
+// order — the user's chosen sequence, not a re-ranking of it.
+func expand(t task.Task, ix *Index, depth int, seen map[string]bool, out *Group) {
+	if seen[t.ID] {
+		return
+	}
+	seen[t.ID] = true
+	*out = append(*out, Row{Task: t, Depth: depth})
+	for _, cid := range t.Content.ChildIDs {
+		child, ok := ix.Get(cid)
+		if !ok {
+			continue
+		}
+		expand(child, ix, depth+1, seen, out)
+	}
+}
+
+// ListGroups selects the roots worth showing, ranks them, and expands each into
+// a group of indented rows.
+func ListGroups(tasks []task.Task, ix *Index, now int64) []Group {
+	var roots []task.Task
+	for _, t := range tasks {
+		if !ix.IsRoot(t.ID) {
+			continue
+		}
+		if subtreeHasOpen(t, ix, make(map[string]bool)) {
+			roots = append(roots, t)
+		}
+	}
+	RankRoots(roots, ix, now)
+
+	groups := make([]Group, 0, len(roots))
+	for _, r := range roots {
+		var g Group
+		expand(r, ix, 0, make(map[string]bool), &g)
+		groups = append(groups, g)
+	}
+	return groups
+}
