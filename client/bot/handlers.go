@@ -507,3 +507,71 @@ func (b *Bot) ResolveConflict(ctx context.Context, chatID, editMsgID int64, toke
 	_, err := b.applyEdit(ctx, token, a.TaskID, 0, patch)
 	return b.afterMutation(ctx, chatID, editMsgID, token, a, err)
 }
+
+// HandleCallback resolves a button token and routes it. AnswerCallbackQuery is
+// called on EVERY path, including failures — otherwise Telegram leaves a spinner
+// stuck on the button.
+func (b *Bot) HandleCallback(ctx context.Context, chatID, msgID int64, callbackID, token, data string) error {
+	a, ok := b.reg.Get(data)
+	if !ok {
+		// Restart, or LRU eviction. Fail closed: edit nothing, say why.
+		return b.s.Answer(ctx, callbackID, "That button has expired — send /list again")
+	}
+	if err := b.s.Answer(ctx, callbackID, ""); err != nil {
+		log.Printf("answer callback: %v", err)
+	}
+
+	o := b.originOf(a)
+	switch a.Kind {
+	case KindNoop:
+		return nil
+	case KindPage, KindBack:
+		return b.ShowList(ctx, chatID, msgID, token, a.Query, a.Page)
+	case KindOpenTask:
+		return b.OpenCard(ctx, chatID, msgID, token, a.TaskID, o)
+	case KindPickStatus:
+		return b.showPicker(ctx, chatID, msgID, token, a, StatusPickerKeyboard(a.TaskID, o))
+	case KindPickPriority:
+		return b.showPicker(ctx, chatID, msgID, token, a, PriorityPickerKeyboard(a.TaskID, o))
+	case KindPickDue:
+		return b.showPicker(ctx, chatID, msgID, token, a, DuePickerKeyboard(a.TaskID, o))
+	case KindSetStatus, KindSetPriority, KindSetDue, KindClearTags:
+		return b.SetField(ctx, chatID, msgID, token, a)
+	case KindDone:
+		return b.Done(ctx, chatID, msgID, token, a)
+	case KindPromptField:
+		return b.PromptField(ctx, chatID, token, a)
+	case KindConfirmDelete:
+		return b.ConfirmDelete(ctx, chatID, msgID, token, a)
+	case KindDoDelete:
+		return b.DoDelete(ctx, chatID, msgID, token, a)
+	case KindOverwrite, KindKeepTheirs:
+		return b.ResolveConflict(ctx, chatID, msgID, token, a)
+	default:
+		return b.failInternal(ctx, chatID, errors.New("unhandled action kind"))
+	}
+}
+
+// IsPrompt reports whether messageID is an outstanding ForceReply prompt. Task 16
+// uses it to decide whether a reply is an edit or just an ordinary message that
+// happens to quote the bot — replying to a CARD must fall through to capture, not
+// produce "that edit prompt expired".
+func (b *Bot) IsPrompt(messageID int64) bool {
+	_, ok := b.reg.GetByPrompt(messageID)
+	return ok
+}
+
+// showPicker swaps the keyboard on the card in place, keeping the card's text.
+func (b *Bot) showPicker(ctx context.Context, chatID, msgID int64, token string, a Action, kb [][]Button) error {
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	t, ok := ix.Get(a.TaskID)
+	if !ok {
+		return b.deliver(ctx, chatID, msgID,
+			"That task no longer exists — it may have been deleted elsewhere.", nil)
+	}
+	return b.deliver(ctx, chatID, msgID, CardText(t, ix, b.now(), b.cfg.OffsetMinutes()), kb)
+}

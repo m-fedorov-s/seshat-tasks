@@ -770,3 +770,115 @@ func TestResolveConflictKeepTheirsDiscardsTheEdit(t *testing.T) {
 		t.Error("Keep theirs must not write anything")
 	}
 }
+
+func TestHandleCallbackAlwaysAnswers(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	tok, _ := b.reg.Put(Action{Kind: KindOpenTask, TaskID: "T"})
+	if err := b.HandleCallback(context.Background(), 42, 55, "cb1", "sekrit", tok); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.answered) != 1 {
+		t.Errorf("AnswerCallbackQuery calls = %d, want 1 — otherwise the button spins forever", len(f.answered))
+	}
+}
+
+func TestHandleCallbackUnknownTokenEditsNothing(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{mk("a")}))
+	defer done()
+
+	if err := b.HandleCallback(context.Background(), 42, 55, "cb1", "sekrit", "a:bogus"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.edited) != 0 || len(f.sent) != 0 {
+		t.Errorf("an expired token must edit nothing, got %d edits / %d sends", len(f.edited), len(f.sent))
+	}
+	if len(f.answered) != 1 || !strings.Contains(strings.ToLower(f.answered[0]), "expired") {
+		t.Errorf("expected an 'expired' callback answer, got %v", f.answered)
+	}
+}
+
+func TestHandleCallbackNoopDoesNothingVisible(t *testing.T) {
+	b, f, done := botWithServer(t, seedServer(t, []task.Task{mk("a")}))
+	defer done()
+
+	tok, _ := b.reg.Put(Action{Kind: KindNoop})
+	if err := b.HandleCallback(context.Background(), 42, 55, "cb1", "sekrit", tok); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.edited) != 0 || len(f.sent) != 0 {
+		t.Error("the page counter is inert")
+	}
+	if len(f.answered) != 1 {
+		t.Error("even an inert button must be answered")
+	}
+}
+
+func TestHandleCallbackRoutesEachKind(t *testing.T) {
+	cases := []struct {
+		kind      ActionKind
+		arg       string
+		wantWrite bool // does it POST an update or delete?
+	}{
+		{KindOpenTask, "", false},
+		{KindPage, "", false},
+		{KindBack, "", false},
+		{KindPickStatus, "", false},
+		{KindPickPriority, "", false},
+		{KindPickDue, "", false},
+		{KindSetStatus, "done", true},
+		{KindSetPriority, "high", true},
+		{KindSetDue, "today", true},
+		{KindClearTags, "", true},
+		{KindConfirmDelete, "", false},
+		{KindDoDelete, "", true},
+	}
+	for _, c := range cases {
+		u := &updateRecorder{tasks: []task.Task{targetTask()}}
+		b, f, done := botWithServer(t, u.handler(t))
+
+		tok, _ := b.reg.Put(Action{Kind: c.kind, TaskID: "T", Arg: c.arg})
+		if err := b.HandleCallback(context.Background(), 42, 55, "cb", "sekrit", tok); err != nil {
+			t.Errorf("kind %v: %v", c.kind, err)
+		}
+		wrote := u.updateCalls > 0 || u.deleted != ""
+		if wrote != c.wantWrite {
+			t.Errorf("kind %v: wrote=%v, want %v", c.kind, wrote, c.wantWrite)
+		}
+		if len(f.answered) != 1 {
+			t.Errorf("kind %v: answered %d times, want 1", c.kind, len(f.answered))
+		}
+		done()
+	}
+}
+
+func TestIsPromptDistinguishesPromptsFromOtherMessages(t *testing.T) {
+	b, _, done := botWithServer(t, seedServer(t, []task.Task{mk("a")}))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title"}, 700)
+	if !b.IsPrompt(700) {
+		t.Error("a registered prompt must be recognised")
+	}
+	// Replying to a card, not a prompt: this must fall through to capture rather
+	// than claiming an edit prompt expired.
+	if b.IsPrompt(701) {
+		t.Error("an unrelated message id must not look like a prompt")
+	}
+}
+
+func TestHandleCallbackPromptFieldSendsAPrompt(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	tok, _ := b.reg.Put(Action{Kind: KindPromptField, TaskID: "T", Arg: "title"})
+	if err := b.HandleCallback(context.Background(), 42, 55, "cb", "sekrit", tok); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prompts) != 1 {
+		t.Errorf("prompts = %d, want 1", len(f.prompts))
+	}
+}
