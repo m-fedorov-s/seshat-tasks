@@ -9,16 +9,21 @@ truth; clients fetch task data from it.
 make server-test              # Go server tests
 make schema-test              # shared Task-contract tests (Go + Zig halves)
 make client-integration-test  # spawns a real server + client through a pipe
+make bot-test                 # Go Telegram bot client tests
 cd client/zig && zig build test   # Zig client unit tests
 
 make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
 ```
 
-All four test targets must pass before any commit.
+All five test targets must pass before any commit.
 
 ## Layout
 
+- The Go module root is the repo root (`go.mod` at top level) — it is not `server/`. Wire types
+  shared by the server and the Go bot (`Task`, `Content`, `Meta`, `Status`, `Priority`,
+  `AddRequest`, `UpdateOp`) live in `internal/task/`. `State` and `CurrentDataFormatVersion` stay
+  in `server/` — they are the server's own on-disk concerns, not part of the wire contract.
 - `server/` — Go HTTP server (`package main`, split across `task.go` / `store.go` / `validate.go`
   / `handlers.go` / `main.go`). Stores tasks in memory, persisted to an atomic-rewrite JSON file,
   with a global `state_version`. Auth via a shared `secret` sent in the `Authorization` header.
@@ -32,6 +37,16 @@ All four test targets must pass before any commit.
 - `schema/` — the shared `Task` contract: `task.schema.json`, `SCHEMA.md`, golden `fixtures/`.
   Enforced across server + client by `make schema-test`.
 - `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
+- `client/bot/` — a Go Telegram bot client (`package main`), long-polling via
+  `github.com/go-telegram/bot`, over the same server API. A pure core (`view.go` select/rank,
+  `render.go` layout) is exercised without any Telegram fake; an I/O shell (`handlers.go`,
+  `seshat.go`) does the fetch/mutate/render orchestration; an LRU `Registry` (`actions.go`) maps
+  opaque callback tokens (and outstanding ForceReply prompts) back to `Action`s; `main.go` is the
+  only place Telegram's own types are touched. Any message becomes a task (capture); `/list` and
+  `/find` browse the same ranked forest as the CLI; editing is per-field through a card's inline
+  keyboard, with free-text fields (title/description/tags) taken over a ForceReply reply and
+  pinned-version optimistic concurrency. See `client/bot/README.md` for config, BotFather
+  settings, and deployment.
 - `client/fish/` — **placeholder README only**; the standalone fish client was retired and the
   shell integration (completions/prompt) is not built yet. See `plans/roadmap.md` → Stage 3.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
