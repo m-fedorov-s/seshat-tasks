@@ -2,6 +2,7 @@ package main
 
 import (
 	"sort"
+	"strings"
 
 	"seshat/internal/task"
 )
@@ -242,4 +243,121 @@ func ListGroups(tasks []task.Task, ix *Index, now int64) []Group {
 		groups = append(groups, g)
 	}
 	return groups
+}
+
+const (
+	// A page holds at most 5 roots AND at most 25 rendered rows, whichever limit
+	// binds first. Roots alone is not enough of a bound: five roots with twenty
+	// children each is 105 lines and 105 inline buttons, which exceeds Telegram's
+	// 4096-unit message cap and its reply_markup limits — and would surface to
+	// the user as a spurious "can't reach seshat" for a purely client-side bug.
+	maxRootsPerPage = 5
+	maxRowsPerPage  = 25
+	// findCeiling bounds a /find result set. Truncation is always reported.
+	findCeiling = 200
+)
+
+// Page is one rendered screen. Index is 0-based and always in [0, Count). Overflow
+// counts rows dropped from a single oversized group, so the renderer can say so
+// out loud rather than truncating silently.
+type Page struct {
+	Rows     []Row
+	Index    int
+	Count    int
+	Overflow int
+}
+
+// pageBreaks computes the group index at which each page starts.
+func pageBreaks(groups []Group) []int {
+	if len(groups) == 0 {
+		return nil
+	}
+	breaks := []int{0}
+	roots, rows := 0, 0
+	for i, g := range groups {
+		// A group larger than a whole page always takes a page to itself; it is
+		// truncated at render time rather than split.
+		oversized := len(g) > maxRowsPerPage
+		fits := roots+1 <= maxRootsPerPage && rows+len(g) <= maxRowsPerPage
+		if i > 0 && (!fits || oversized) {
+			breaks = append(breaks, i)
+			roots, rows = 0, 0
+		}
+		roots++
+		rows += len(g)
+		if oversized {
+			// force the next group onto a new page
+			roots, rows = maxRootsPerPage, maxRowsPerPage
+		}
+	}
+	return breaks
+}
+
+func Paginate(groups []Group, page int) Page {
+	breaks := pageBreaks(groups)
+	if len(breaks) == 0 {
+		return Page{}
+	}
+	// Clamp: a recorded page index can outlive the set it referred to — mark the
+	// only task on the last page done and that page no longer exists.
+	if page < 0 {
+		page = 0
+	}
+	if page >= len(breaks) {
+		page = len(breaks) - 1
+	}
+	start := breaks[page]
+	end := len(groups)
+	if page+1 < len(breaks) {
+		end = breaks[page+1]
+	}
+
+	var rows []Row
+	overflow := 0
+	for _, g := range groups[start:end] {
+		if len(rows)+len(g) > maxRowsPerPage {
+			room := maxRowsPerPage - len(rows)
+			rows = append(rows, g[:room]...)
+			overflow += len(g) - room
+			continue
+		}
+		rows = append(rows, g...)
+	}
+	return Page{Rows: rows, Index: page, Count: len(breaks), Overflow: overflow}
+}
+
+// FindGroups matches needle case-insensitively as a substring of the TITLE of an
+// open task. Results are flat — a match's parent may not itself match, so there
+// is no tree to draw — but each row carries its parent's title as context.
+// Returns the groups (capped at findCeiling) and the number dropped.
+func FindGroups(tasks []task.Task, ix *Index, needle string) ([]Group, int) {
+	n := strings.ToLower(strings.TrimSpace(needle))
+	if n == "" {
+		return nil, 0
+	}
+	var matches []task.Task
+	for _, t := range tasks {
+		if !IsOpen(t) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(t.Content.Title), n) {
+			matches = append(matches, t)
+		}
+	}
+	RankRoots(matches, ix, 0) // reuse the total order so results are stable
+
+	overflow := 0
+	if len(matches) > findCeiling {
+		overflow = len(matches) - findCeiling
+		matches = matches[:findCeiling]
+	}
+	groups := make([]Group, 0, len(matches))
+	for _, m := range matches {
+		row := Row{Task: m, Depth: 0}
+		if p, ok := ix.ParentOf(m.ID); ok {
+			row.ParentTitle = p.Content.Title
+		}
+		groups = append(groups, Group{row})
+	}
+	return groups, overflow
 }

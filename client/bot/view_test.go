@@ -294,3 +294,183 @@ func TestListGroupsEmptyInput(t *testing.T) {
 		t.Errorf("want no groups, got %v", groupIDs(got))
 	}
 }
+
+func chainOf(prefix string, n int) []task.Task {
+	// one root with n-1 children
+	kids := make([]string, 0, n-1)
+	for i := 1; i < n; i++ {
+		kids = append(kids, prefix+"-kid"+string(rune('a'+i)))
+	}
+	out := []task.Task{mk(prefix, withChildren(kids...))}
+	for _, k := range kids {
+		out = append(out, mk(k))
+	}
+	return out
+}
+
+func TestPaginateCapsAtFiveRoots(t *testing.T) {
+	var tasks []task.Task
+	for i := 0; i < 12; i++ {
+		tasks = append(tasks, mk(string(rune('a'+i))))
+	}
+	ix := BuildIndex(tasks)
+	groups := ListGroups(tasks, ix, 0)
+
+	p := Paginate(groups, 0)
+	if len(p.Rows) != 5 {
+		t.Errorf("page 0 rows = %d, want 5", len(p.Rows))
+	}
+	if p.Count != 3 {
+		t.Errorf("page count = %d, want 3 (12 roots / 5)", p.Count)
+	}
+	last := Paginate(groups, 2)
+	if len(last.Rows) != 2 {
+		t.Errorf("last page rows = %d, want 2", len(last.Rows))
+	}
+}
+
+func TestPaginateNeverSplitsAGroup(t *testing.T) {
+	// Four single roots then one root with four children: the fifth group would
+	// take the page over 5 roots, so it starts a new page whole.
+	var tasks []task.Task
+	for i := 0; i < 5; i++ {
+		tasks = append(tasks, mk(string(rune('a'+i)), withCreated(int64(i))))
+	}
+	// created_at 9 sorts this root last, so it cannot fit on page 0 alongside the
+	// five singles and must move to page 1 whole, children and all.
+	chain := chainOf("z", 4)
+	chain[0].Meta.CreatedAt = 9
+	tasks = append(tasks, chain...)
+	ix := BuildIndex(tasks)
+	groups := ListGroups(tasks, ix, 0)
+
+	if got := Paginate(groups, 0).Count; got != 2 {
+		t.Fatalf("page count = %d, want 2 — the sixth root must start a new page", got)
+	}
+	total := 0
+	for i := 0; i < Paginate(groups, 0).Count; i++ {
+		p := Paginate(groups, i)
+		total += len(p.Rows)
+		// no page may contain a partial group: a row at depth>0 must be preceded
+		// on the same page by its depth-0 ancestor
+		for j, r := range p.Rows {
+			if r.Depth > 0 && j == 0 {
+				t.Errorf("page %d starts mid-group with %s", i, r.Task.ID)
+			}
+		}
+	}
+	if total != 9 {
+		t.Errorf("total rows across pages = %d, want 9 (5 singles + a root with 3 children)", total)
+	}
+}
+
+func TestPaginateCapsAtTwentyFiveRows(t *testing.T) {
+	// Two roots of 20 rows each: 40 rows, under the 5-root cap but over the row
+	// cap, so they must land on separate pages.
+	tasks := append(chainOf("a", 20), chainOf("b", 20)...)
+	ix := BuildIndex(tasks)
+	groups := ListGroups(tasks, ix, 0)
+	p := Paginate(groups, 0)
+	if len(p.Rows) != 20 {
+		t.Errorf("page 0 rows = %d, want 20 (the second root does not fit)", len(p.Rows))
+	}
+	if p.Count != 2 {
+		t.Errorf("page count = %d, want 2", p.Count)
+	}
+}
+
+func TestPaginateTruncatesAnOversizedSingleGroup(t *testing.T) {
+	tasks := chainOf("big", 40) // one root, 39 children
+	ix := BuildIndex(tasks)
+	groups := ListGroups(tasks, ix, 0)
+	p := Paginate(groups, 0)
+	if len(p.Rows) != maxRowsPerPage {
+		t.Errorf("rows = %d, want %d", len(p.Rows), maxRowsPerPage)
+	}
+	if p.Overflow != 40-maxRowsPerPage {
+		t.Errorf("Overflow = %d, want %d — truncation must be reported, never silent", p.Overflow, 40-maxRowsPerPage)
+	}
+	if p.Count != 1 {
+		t.Errorf("an oversized group takes exactly one page, got Count = %d", p.Count)
+	}
+}
+
+func TestPaginateClampsOutOfRangePages(t *testing.T) {
+	tasks := []task.Task{mk("a"), mk("b")}
+	ix := BuildIndex(tasks)
+	groups := ListGroups(tasks, ix, 0)
+	for _, req := range []int{-5, -1, 1, 99} {
+		p := Paginate(groups, req)
+		if p.Index != 0 {
+			t.Errorf("Paginate(page=%d).Index = %d, want 0 (clamped)", req, p.Index)
+		}
+	}
+}
+
+func TestPaginateEmpty(t *testing.T) {
+	p := Paginate(nil, 0)
+	if len(p.Rows) != 0 || p.Count != 0 || p.Index != 0 {
+		t.Errorf("empty paginate = %+v", p)
+	}
+}
+
+func TestFindMatchesTitleSubstringCaseInsensitively(t *testing.T) {
+	tasks := []task.Task{
+		mk("a"), mk("b"), mk("c"),
+	}
+	tasks[0].Content.Title = "Call the Dentist"
+	tasks[1].Content.Title = "buy dental floss"
+	tasks[2].Content.Title = "unrelated"
+	ix := BuildIndex(tasks)
+
+	groups, overflow := FindGroups(tasks, ix, "DENT")
+	if overflow != 0 {
+		t.Errorf("overflow = %d, want 0", overflow)
+	}
+	got := groupIDs(groups)
+	if len(got) != 2 {
+		t.Fatalf("matches = %v, want two", got)
+	}
+	for _, g := range groups {
+		if len(g) != 1 || g[0].Depth != 0 {
+			t.Errorf("find rows are flat and single, got %+v", g)
+		}
+	}
+}
+
+func TestFindSkipsClosedTasksAndSetsParentTitle(t *testing.T) {
+	tasks := []task.Task{
+		mk("parent", withChildren("kid")),
+		mk("kid"),
+		mk("old", withStatus(task.StatusDone)),
+	}
+	tasks[0].Content.Title = "Japan trip"
+	tasks[1].Content.Title = "book flights"
+	tasks[2].Content.Title = "book hotel"
+	ix := BuildIndex(tasks)
+
+	groups, _ := FindGroups(tasks, ix, "book")
+	if len(groups) != 1 {
+		t.Fatalf("want only the open match, got %v", groupIDs(groups))
+	}
+	if groups[0][0].ParentTitle != "Japan trip" {
+		t.Errorf("ParentTitle = %q, want %q", groups[0][0].ParentTitle, "Japan trip")
+	}
+}
+
+func TestFindReportsOverflowAboveCeiling(t *testing.T) {
+	var tasks []task.Task
+	for i := 0; i < findCeiling+7; i++ {
+		tk := mk(string(rune('a'+i%26)) + string(rune('a'+i/26)))
+		tk.Content.Title = "match me"
+		tasks = append(tasks, tk)
+	}
+	ix := BuildIndex(tasks)
+	groups, overflow := FindGroups(tasks, ix, "match")
+	if len(groups) != findCeiling {
+		t.Errorf("groups = %d, want %d", len(groups), findCeiling)
+	}
+	if overflow != 7 {
+		t.Errorf("overflow = %d, want 7", overflow)
+	}
+}
