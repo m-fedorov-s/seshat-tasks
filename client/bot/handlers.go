@@ -25,6 +25,18 @@ type Sender interface {
 	DeleteMessage(ctx context.Context, chatID, messageID int64) error
 }
 
+// msgTaskGone is shown whenever a task turns out to be absent from the freshly
+// fetched state — deleted from another client while this bot was showing (or
+// about to act on) it. One wording, used at every call site, including
+// DoDelete's 404 path, which used to diverge ("That task was already gone.").
+const msgTaskGone = "That task no longer exists — it may have been deleted elsewhere."
+
+// msgInternalError is shown for the bot's own bugs — an unhandled action kind,
+// an unknown due keyword, or a panic recovered in main.go's dispatch — so the
+// server is never blamed for a client-side defect. Used from both this file and
+// main.go; both are package main.
+const msgInternalError = "Something went wrong on my side — try again."
+
 type Bot struct {
 	cfg *Config
 	api *Client
@@ -139,7 +151,7 @@ func userMessage(err error) string {
 		case http.StatusTooManyRequests:
 			return "seshat is rate-limiting — try again in a moment."
 		case http.StatusNotFound:
-			return "That task no longer exists — it may have been deleted elsewhere."
+			return msgTaskGone
 		case http.StatusConflict:
 			return "That task changed underneath me — reopen it."
 		default:
@@ -162,7 +174,7 @@ var errInternal = errors.New("internal bot error")
 
 func (b *Bot) failInternal(ctx context.Context, chatID int64, err error) error {
 	log.Printf("internal error: %v", err)
-	_, sendErr := b.s.Send(ctx, chatID, "Something went wrong on my side — try again.", nil)
+	_, sendErr := b.s.Send(ctx, chatID, msgInternalError, nil)
 	return sendErr
 }
 
@@ -222,7 +234,7 @@ func (b *Bot) ShowList(ctx context.Context, chatID, editMsgID int64, token, quer
 	if query == "" {
 		groups = ListGroups(tasks, ix, now)
 	} else {
-		groups, overflow = FindGroups(tasks, ix, query)
+		groups, overflow = FindGroups(tasks, ix, query, now)
 	}
 	// Paginate clamps: a recorded page can outlive the set it referred to.
 	p := Paginate(groups, page)
@@ -242,8 +254,7 @@ func (b *Bot) OpenCard(ctx context.Context, chatID, editMsgID int64, token, task
 	if !ok {
 		// Deleted from another client while this card was open. Say so; do not
 		// pretend the button was merely stale.
-		return b.deliver(ctx, chatID, editMsgID,
-			"That task no longer exists — it may have been deleted elsewhere.", nil)
+		return b.deliver(ctx, chatID, editMsgID, msgTaskGone, nil)
 	}
 	return b.deliver(ctx, chatID, editMsgID,
 		CardText(t, ix, b.now(), b.cfg.OffsetMinutes()), CardKeyboard(t, o))
@@ -314,8 +325,7 @@ func (b *Bot) originOf(a Action) Origin {
 // afterMutation reports a failure or re-renders the card.
 func (b *Bot) afterMutation(ctx context.Context, chatID, editMsgID int64, token string, a Action, err error) error {
 	if errors.Is(err, errTaskGone) {
-		return b.deliver(ctx, chatID, editMsgID,
-			"That task no longer exists — it may have been deleted elsewhere.", nil)
+		return b.deliver(ctx, chatID, editMsgID, msgTaskGone, nil)
 	}
 	if err != nil {
 		return b.fail(ctx, chatID, err)
@@ -362,8 +372,7 @@ func (b *Bot) Done(ctx context.Context, chatID, editMsgID int64, token string, a
 		c.Status = task.StatusDone
 	})
 	if errors.Is(err, errTaskGone) {
-		return b.deliver(ctx, chatID, editMsgID,
-			"That task no longer exists — it may have been deleted elsewhere.", nil)
+		return b.deliver(ctx, chatID, editMsgID, msgTaskGone, nil)
 	}
 	if err != nil {
 		return b.fail(ctx, chatID, err)
@@ -379,8 +388,7 @@ func (b *Bot) ConfirmDelete(ctx context.Context, chatID, editMsgID int64, token 
 	ix := BuildIndex(tasks)
 	t, ok := ix.Get(a.TaskID)
 	if !ok {
-		return b.deliver(ctx, chatID, editMsgID,
-			"That task no longer exists — it may have been deleted elsewhere.", nil)
+		return b.deliver(ctx, chatID, editMsgID, msgTaskGone, nil)
 	}
 	return b.deliver(ctx, chatID, editMsgID,
 		DeleteConfirmText(t), DeleteConfirmKeyboard(a.TaskID, b.originOf(a)))
@@ -390,7 +398,7 @@ func (b *Bot) DoDelete(ctx context.Context, chatID, editMsgID int64, token strin
 	if err := b.api.Delete(ctx, token, a.TaskID); err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
-			return b.deliver(ctx, chatID, editMsgID, "That task was already gone.", nil)
+			return b.deliver(ctx, chatID, editMsgID, msgTaskGone, nil)
 		}
 		return b.fail(ctx, chatID, err)
 	}
@@ -442,7 +450,7 @@ func (b *Bot) PromptField(ctx context.Context, chatID int64, token string, a Act
 	ix := BuildIndex(tasks)
 	t, found := ix.Get(a.TaskID)
 	if !found {
-		_, err := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		_, err := b.s.Send(ctx, chatID, msgTaskGone, nil)
 		return err
 	}
 	if a.Arg == "tags" && len(t.Content.Tags) > 0 {
@@ -460,15 +468,18 @@ func (b *Bot) PromptField(ctx context.Context, chatID int64, token string, a Act
 	return b.reg.PutPrompt(pinned, msgID)
 }
 
-// HandleReply processes a reply to a ForceReply prompt.
+// HandleReply processes a reply that targets one of the bot's own messages —
+// either a live ForceReply prompt, or (after a restart wiped the in-memory
+// registry, or an ordinary reply to a card) one that no longer resolves to a
+// prompt record. In the latter case it captures rather than discards: losing
+// typed words is worse than creating a task the user can delete from the card
+// we are about to show them. See dispatch's routing in main.go, which sends any
+// reply to a bot message here regardless of whether the prompt is still live.
 func (b *Bot) HandleReply(ctx context.Context, chatID, promptMsgID, replyMsgID int64, token, text string) error {
 	a, ok := b.reg.GetByPrompt(promptMsgID)
 	if !ok {
-		// The prompt is gone — a restart, or LRU eviction. Capture rather than
-		// discard: losing typed words is worse than creating a task the user can
-		// delete from the card we are about to show them.
 		return b.Capture(ctx, chatID, token, text,
-			"That edit prompt expired, so I added this as a new task instead.")
+			"I couldn't match that to an open edit prompt, so I added it as a new task instead.")
 	}
 	value := strings.TrimSpace(text)
 	if a.Arg == "title" && value == "" {
@@ -485,7 +496,7 @@ func (b *Bot) HandleReply(ctx context.Context, chatID, promptMsgID, replyMsgID i
 
 	_, err := b.applyEdit(ctx, token, a.TaskID, a.ExpectedVersion, patch)
 	if errors.Is(err, errTaskGone) {
-		_, sErr := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		_, sErr := b.s.Send(ctx, chatID, msgTaskGone, nil)
 		return sErr
 	}
 	var ae *APIError
@@ -509,7 +520,7 @@ func (b *Bot) showConflict(ctx context.Context, chatID int64, token string, a Ac
 	ix := BuildIndex(tasks)
 	t, ok := ix.Get(a.TaskID)
 	if !ok {
-		_, sErr := b.s.Send(ctx, chatID, "That task no longer exists — it may have been deleted elsewhere.", nil)
+		_, sErr := b.s.Send(ctx, chatID, msgTaskGone, nil)
 		return sErr
 	}
 	var theirs string
@@ -526,9 +537,11 @@ func (b *Bot) showConflict(ctx context.Context, chatID int64, token string, a Ac
 		"<b>Yours:</b>\n" + EscapeHTML(typed)
 
 	o := b.originOf(a)
+	overwrite := o.act(KindOverwrite, a.TaskID, a.Arg)
+	overwrite.Text = typed // carries the user's typed value across the button tap
 	kb := [][]Button{{
-		{"Overwrite", Action{Kind: KindOverwrite, TaskID: a.TaskID, Arg: a.Arg, Text: typed, Page: o.Page, Query: o.Query}},
-		{"Keep theirs", Action{Kind: KindKeepTheirs, TaskID: a.TaskID, Page: o.Page, Query: o.Query}},
+		{"Overwrite", overwrite},
+		{"Keep theirs", o.act(KindKeepTheirs, a.TaskID, "")},
 	}}
 	_, err = b.s.Send(ctx, chatID, text, kb)
 	return err
@@ -593,13 +606,31 @@ func (b *Bot) HandleCallback(ctx context.Context, chatID, msgID int64, callbackI
 	}
 }
 
-// IsPrompt reports whether messageID is an outstanding ForceReply prompt. Task 16
-// uses it to decide whether a reply is an edit or just an ordinary message that
-// happens to quote the bot — replying to a CARD must fall through to capture, not
-// produce "that edit prompt expired".
+// IsPrompt reports whether messageID is an outstanding ForceReply prompt. It is
+// NOT used to gate reply-vs-capture dispatch — see shouldRouteReplyToHandler —
+// because a reply to a CARD also targets a bot message and must reach
+// HandleReply too, which has its own (registry-backed) live-vs-expired check.
+// IsPrompt stays for callers that need to know specifically whether a live
+// prompt still exists.
 func (b *Bot) IsPrompt(messageID int64) bool {
 	_, ok := b.reg.GetByPrompt(messageID)
 	return ok
+}
+
+// shouldRouteReplyToHandler decides whether an incoming reply should be routed
+// to HandleReply rather than treated as a bare Capture. replyFromID is the
+// telegram user id of whoever sent the message being replied to (0 if there is
+// no reply, or its sender could not be resolved); botID is this bot's own
+// telegram id.
+//
+// The condition is "does this reply target one of the BOT's OWN messages" —
+// not "is there a live prompt for it". A reply to a bot message with no live
+// prompt record (registry cleared by a restart, or the message being replied to
+// is a card rather than a prompt) still routes here, so HandleReply's own
+// registry check can decide live-edit vs. expired-capture (see spec §6.4/§9).
+// Only a reply to something the bot did NOT send falls through to Capture.
+func shouldRouteReplyToHandler(replyFromID, botID int64) bool {
+	return replyFromID != 0 && replyFromID == botID
 }
 
 // showPicker swaps the keyboard on the card in place, keeping the card's text.
@@ -611,8 +642,7 @@ func (b *Bot) showPicker(ctx context.Context, chatID, msgID int64, token string,
 	ix := BuildIndex(tasks)
 	t, ok := ix.Get(a.TaskID)
 	if !ok {
-		return b.deliver(ctx, chatID, msgID,
-			"That task no longer exists — it may have been deleted elsewhere.", nil)
+		return b.deliver(ctx, chatID, msgID, msgTaskGone, nil)
 	}
 	return b.deliver(ctx, chatID, msgID, CardText(t, ix, b.now(), b.cfg.OffsetMinutes()), kb)
 }

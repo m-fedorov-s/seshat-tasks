@@ -440,7 +440,7 @@ func TestFindMatchesTitleSubstringCaseInsensitively(t *testing.T) {
 	tasks[2].Content.Title = "unrelated"
 	ix := BuildIndex(tasks)
 
-	groups, overflow := FindGroups(tasks, ix, "DENT")
+	groups, overflow := FindGroups(tasks, ix, "DENT", 0)
 	if overflow != 0 {
 		t.Errorf("overflow = %d, want 0", overflow)
 	}
@@ -466,12 +466,36 @@ func TestFindSkipsClosedTasksAndSetsParentTitle(t *testing.T) {
 	tasks[2].Content.Title = "book hotel"
 	ix := BuildIndex(tasks)
 
-	groups, _ := FindGroups(tasks, ix, "book")
+	groups, _ := FindGroups(tasks, ix, "book", 0)
 	if len(groups) != 1 {
 		t.Fatalf("want only the open match, got %v", groupIDs(groups))
 	}
 	if groups[0][0].ParentTitle != "Japan trip" {
 		t.Errorf("ParentTitle = %q, want %q", groups[0][0].ParentTitle, "Japan trip")
+	}
+}
+
+// With now == 0 (the old call site), dueFactor and ageFactor are always zero,
+// so results order by priority alone. A none-priority task due in a few hours
+// must outrank a low-priority task with no due date once the real now is
+// threaded through — matching /list's full-urgency ordering.
+func TestFindOrdersByFullUrgencyNotPriorityAlone(t *testing.T) {
+	now := int64(10 * testWeek)
+	dueSoon := now + testDay/2 // due in 12h
+	tasks := []task.Task{
+		mk("soon", withPriority(task.PriorityNone), withDue(dueSoon), withCreated(now)),
+		mk("low", withPriority(task.PriorityLow), withCreated(now)),
+	}
+	tasks[0].Content.Title = "match soon"
+	tasks[1].Content.Title = "match low"
+	ix := BuildIndex(tasks)
+
+	groups, _ := FindGroups(tasks, ix, "match", now)
+	if len(groups) != 2 {
+		t.Fatalf("want 2 matches, got %v", groupIDs(groups))
+	}
+	if groups[0][0].Task.ID != "soon" {
+		t.Errorf("order = %v, want the soon-due task ranked first (full urgency, not priority alone)", groupIDs(groups))
 	}
 }
 
@@ -483,7 +507,7 @@ func TestFindReportsOverflowAboveCeiling(t *testing.T) {
 		tasks = append(tasks, tk)
 	}
 	ix := BuildIndex(tasks)
-	groups, overflow := FindGroups(tasks, ix, "match")
+	groups, overflow := FindGroups(tasks, ix, "match", 0)
 	if len(groups) != findCeiling {
 		t.Errorf("groups = %d, want %d", len(groups), findCeiling)
 	}

@@ -125,6 +125,17 @@ func senderID(u *models.Update) (userID int64, chatID int64, chatType string, ok
 	return 0, 0, "", false
 }
 
+// replyTargetSender resolves the telegram user id of whoever sent the message a
+// reply targets, or 0 if there is no reply or its sender cannot be resolved.
+// Feeds shouldRouteReplyToHandler, which decides whether that target is the bot
+// itself — never a naked dereference, for the same reason senderID is not.
+func replyTargetSender(u *models.Update) int64 {
+	if u == nil || u.Message == nil || u.Message.ReplyToMessage == nil || u.Message.ReplyToMessage.From == nil {
+		return 0
+	}
+	return u.Message.ReplyToMessage.From.ID
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to bot config (default $SESHAT_BOT_CONFIG or ~/.config/seshat/bot.json)")
 	flag.Parse()
@@ -145,6 +156,11 @@ func main() {
 	api := NewClient(cfg.ServerURL)
 
 	var b *Bot
+	// botID is set once, right after bot.New below, before Start begins
+	// dispatching updates on their own goroutines — so every read of it from
+	// dispatch is safely happens-after that single write. Bot.ID() parses the
+	// numeric id straight out of the token; it needs no API call.
+	var botID int64
 	sender := &tgSender{reg: reg}
 
 	// recoverMW is installed OUTERMOST. The allowlist below is the code most
@@ -193,7 +209,7 @@ func main() {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC handling update for %d: %v", userID, r)
-				_, _ = sender.Send(ctx, chatID, "Something went wrong on my side — try again.", nil)
+				_, _ = sender.Send(ctx, chatID, msgInternalError, nil)
 			}
 		}()
 		var err error
@@ -231,7 +247,7 @@ func main() {
 					_, err = sender.Send(ctx, chatID,
 						"Unknown command. Try /list, /find, /start, or /help.", nil)
 				}
-			} else if u.Message.ReplyToMessage != nil && b.IsPrompt(int64(u.Message.ReplyToMessage.ID)) {
+			} else if u.Message.ReplyToMessage != nil && shouldRouteReplyToHandler(replyTargetSender(u), botID) {
 				err = b.HandleReply(ctx, chatID, int64(u.Message.ReplyToMessage.ID), int64(u.Message.ID), token, text)
 			} else {
 				// Unconditional: a bare message is ALWAYS a new task.
@@ -254,6 +270,7 @@ func main() {
 		log.Fatal(err)
 	}
 	sender.b = tb
+	botID = tb.ID()
 	b = NewBot(cfg, api, reg, sender, func() int64 { return time.Now().Unix() })
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

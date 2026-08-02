@@ -723,7 +723,7 @@ func TestHandleReplyOnExpiredPromptCapturesInstead(t *testing.T) {
 	if added.Content.Title != "some words" {
 		t.Errorf("expired prompt should capture the text, got %+v", added.Content)
 	}
-	if !strings.Contains(strings.ToLower(textOf(f.sent)), "expired") {
+	if !strings.Contains(strings.ToLower(textOf(f.sent)), "edit prompt") {
 		t.Errorf("the user must be told why this became a task:\n%s", textOf(f.sent))
 	}
 }
@@ -809,6 +809,50 @@ func TestResolveConflictKeepTheirsDiscardsTheEdit(t *testing.T) {
 	}
 	if u.updateCalls != 0 {
 		t.Error("Keep theirs must not write anything")
+	}
+}
+
+// showConflict is the only place in the bot that builds an Action literal
+// instead of going through Origin.act, and it used to drop HasList on both
+// buttons. Overwriting a conflicted title then came back with no Back button,
+// even though the edit started from a listing. This follows the conflict all
+// the way from a HasList-true prompt, through the buttons showConflict
+// renders, to the card ResolveConflict re-renders after Overwrite is tapped.
+func TestConflictButtonsPreserveHasList(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}, conflictOn: 1}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	b.reg.PutPrompt(Action{Kind: KindPromptField, TaskID: "T", Arg: "title",
+		ExpectedVersion: 2, HasList: true, Page: 2, Query: "foo"}, 900)
+	if err := b.HandleReply(context.Background(), 42, 900, 901, "sekrit", "mine"); err != nil {
+		t.Fatal(err)
+	}
+
+	var overwrite Action
+	found := false
+	for _, m := range append(append([]sentMsg{}, f.sent...), f.edited...) {
+		for _, row := range m.KB {
+			for _, btn := range row {
+				if btn.Action.Kind == KindOverwrite {
+					overwrite, found = btn.Action, true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no Overwrite button was rendered")
+	}
+	if !overwrite.HasList || overwrite.Page != 2 || overwrite.Query != "foo" {
+		t.Errorf("Overwrite button lost its origin: %+v", overwrite)
+	}
+
+	if err := b.ResolveConflict(context.Background(), 42, 55, "sekrit", overwrite); err != nil {
+		t.Fatal(err)
+	}
+	last := f.edited[len(f.edited)-1]
+	if !kindsIn(last.KB)[KindBack] {
+		t.Error("after Overwrite, the re-rendered card must still offer a Back button")
 	}
 }
 
@@ -965,10 +1009,72 @@ func TestIsPromptDistinguishesPromptsFromOtherMessages(t *testing.T) {
 	if !b.IsPrompt(700) {
 		t.Error("a registered prompt must be recognised")
 	}
-	// Replying to a card, not a prompt: this must fall through to capture rather
-	// than claiming an edit prompt expired.
+	// IsPrompt itself still distinguishes "live prompt" from "not" — it just no
+	// longer gates whether a reply reaches HandleReply (see
+	// shouldRouteReplyToHandler and TestReplyToBotMessageWithNoLivePromptRoutesToCaptureWithNote).
 	if b.IsPrompt(701) {
 		t.Error("an unrelated message id must not look like a prompt")
+	}
+}
+
+func TestShouldRouteReplyToHandler(t *testing.T) {
+	cases := []struct {
+		name        string
+		replyFromID int64
+		botID       int64
+		want        bool
+	}{
+		{"reply to the bot's own message", 999, 999, true},
+		{"reply to a different user's message", 123, 999, false},
+		{"no reply, or its sender could not be resolved", 0, 999, false},
+	}
+	for _, c := range cases {
+		if got := shouldRouteReplyToHandler(c.replyFromID, c.botID); got != c.want {
+			t.Errorf("%s: shouldRouteReplyToHandler(%d, %d) = %v, want %v",
+				c.name, c.replyFromID, c.botID, got, c.want)
+		}
+	}
+}
+
+// This is the regression FIX 1 closes: before it, main.go's dispatch gated
+// HandleReply on IsPrompt — the SAME registry lookup HandleReply itself makes —
+// so a restart that wiped the registry made HandleReply's expired-prompt branch
+// unreachable from production code: the user got a silent duplicate task with
+// no explanation. TestHandleReplyOnExpiredPromptCapturesInstead covers
+// HandleReply in isolation; this proves the ROUTING decision that feeds it in
+// production also says "yes, call HandleReply" for exactly this case — wiring
+// the two halves of the fix together, since dispatch itself closes over
+// *bot.Bot and cannot be exercised directly here.
+func TestReplyToBotMessageWithNoLivePromptRoutesToCaptureWithNote(t *testing.T) {
+	const botID = 12345
+	replyFromID := int64(botID) // the message being replied to was sent BY the bot
+	if !shouldRouteReplyToHandler(replyFromID, botID) {
+		t.Fatal("a reply targeting the bot's own message must route to HandleReply")
+	}
+
+	var added task.AddRequest
+	b, f, done := botWithServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tasks/add" {
+			json.NewDecoder(r.Body).Decode(&added)
+			json.NewEncoder(w).Encode(map[string]any{"state_version": 1,
+				"task": task.Task{ID: "NEW", Content: added.Content, Meta: task.Meta{Version: 1}}})
+			return
+		}
+		t.Errorf("unexpected path %s", r.URL.Path)
+	})
+	defer done()
+
+	// No prompt record for this message id — never one (a reply to a card) or
+	// lost (a restart); HandleReply must not tell the difference, and both
+	// capture with the same explanatory note.
+	if err := b.HandleReply(context.Background(), 42, 777, 778, "sekrit", "buy milk"); err != nil {
+		t.Fatal(err)
+	}
+	if added.Content.Title != "buy milk" {
+		t.Errorf("expected a capture carrying the replied text, got %+v", added.Content)
+	}
+	if !strings.Contains(strings.ToLower(textOf(f.sent)), "couldn't match that to an open edit prompt") {
+		t.Errorf("expected the softened explanatory note, got:\n%s", textOf(f.sent))
 	}
 }
 

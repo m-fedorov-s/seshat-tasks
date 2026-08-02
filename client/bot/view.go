@@ -331,7 +331,7 @@ func Paginate(groups []Group, page int) Page {
 // open task. Results are flat — a match's parent may not itself match, so there
 // is no tree to draw — but each row carries its parent's title as context.
 // Returns the groups (capped at findCeiling) and the number dropped.
-func FindGroups(tasks []task.Task, ix *Index, needle string) ([]Group, int) {
+func FindGroups(tasks []task.Task, ix *Index, needle string, now int64) ([]Group, int) {
 	n := strings.ToLower(strings.TrimSpace(needle))
 	if n == "" {
 		return nil, 0
@@ -345,7 +345,9 @@ func FindGroups(tasks []task.Task, ix *Index, needle string) ([]Group, int) {
 			matches = append(matches, t)
 		}
 	}
-	RankRoots(matches, ix, 0) // reuse the total order so results are stable
+	// Reuse the total order so results are stable, and rank on the REAL now so
+	// /find orders by full urgency like /list does — not priority alone.
+	RankRoots(matches, ix, now)
 
 	overflow := 0
 	if len(matches) > findCeiling {
