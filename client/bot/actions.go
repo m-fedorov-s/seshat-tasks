@@ -21,23 +21,23 @@ const actionPrefix = "a:"
 type ActionKind uint8
 
 const (
-	KindNoop ActionKind = iota // the inert page counter
-	KindPage                   // navigate to Page of Query ("" = /list)
-	KindOpenTask               // render the card for TaskID
-	KindBack                   // return to Page of Query
-	KindPickStatus             // open the status picker
-	KindPickPriority           // open the priority picker
-	KindPickDue                // open the due picker
-	KindSetStatus              // commit Arg as the status
-	KindSetPriority            // commit Arg as the priority
-	KindSetDue                 // commit Arg ("today"/"tomorrow"/"+3d"/"+1w"/"clear") as due_at
-	KindDone                   // shortcut for status=done, then back to the list
-	KindPromptField            // a ForceReply prompt is outstanding for Arg ("title"/"description"/"tags")
-	KindClearTags              // clear every tag on TaskID
-	KindConfirmDelete          // show the delete confirmation
-	KindDoDelete               // actually delete TaskID
-	KindOverwrite              // resolve a free-text 409 by writing Text anyway
-	KindKeepTheirs             // resolve a free-text 409 by discarding Text
+	KindNoop          ActionKind = iota // the inert page counter
+	KindPage                            // navigate to Page of Query ("" = /list)
+	KindOpenTask                        // render the card for TaskID
+	KindBack                            // return to Page of Query
+	KindPickStatus                      // open the status picker
+	KindPickPriority                    // open the priority picker
+	KindPickDue                         // open the due picker
+	KindSetStatus                       // commit Arg as the status
+	KindSetPriority                     // commit Arg as the priority
+	KindSetDue                          // commit Arg ("today"/"tomorrow"/"+3d"/"+1w"/"clear") as due_at
+	KindDone                            // shortcut for status=done, then back to the list
+	KindPromptField                     // a ForceReply prompt is outstanding for Arg ("title"/"description"/"tags")
+	KindClearTags                       // clear every tag on TaskID
+	KindConfirmDelete                   // show the delete confirmation
+	KindDoDelete                        // actually delete TaskID
+	KindOverwrite                       // resolve a free-text 409 by writing Text anyway
+	KindKeepTheirs                      // resolve a free-text 409 by discarding Text
 )
 
 // Note: there is deliberately no KindUndo. The spec's §6.4 "[Undo]" affordance on

@@ -9,11 +9,11 @@ import (
 
 func TestEscapeHTML(t *testing.T) {
 	cases := map[string]string{
-		"plain":         "plain",
-		"budget < 500":  "budget &lt; 500",
-		"a & b":         "a &amp; b",
-		"<b>bold</b>":   "&lt;b&gt;bold&lt;/b&gt;",
-		`say "hi"`:      "say &quot;hi&quot;",
+		"plain":          "plain",
+		"budget < 500":   "budget &lt; 500",
+		"a & b":          "a &amp; b",
+		"<b>bold</b>":    "&lt;b&gt;bold&lt;/b&gt;",
+		`say "hi"`:       "say &quot;hi&quot;",
 		"fix auth_token": "fix auth_token", // underscores are safe in HTML mode
 	}
 	for in, want := range cases {
