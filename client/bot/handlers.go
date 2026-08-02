@@ -71,6 +71,47 @@ func (b *Bot) HandleStart(ctx context.Context, chatID int64) error {
 	return err
 }
 
+// validCommands is the fixed set of command tokens this bot recognises. Only an
+// EXACT, whole-token match against this set may route to a command — see
+// ParseCommand.
+var validCommands = map[string]bool{
+	"start": true,
+	"help":  true,
+	"list":  true,
+	"find":  true,
+}
+
+// ParseCommand splits a message into a command name and its argument. It returns
+// ok=false when the text is not a command, in which case the caller must treat it
+// as a capture.
+//
+// Matching is on the WHOLE first token, never a prefix: "/listen to the podcast"
+// is a task titled "/listen to the podcast", not the /list command. Telegram's
+// "/list@botname" addressing form is accepted and the @suffix stripped. A token
+// that is slash-shaped but not one of validCommands (a typo, or ordinary text
+// that merely starts with "/") is also not a command — ok=false — so it falls
+// through to capture like anything else the user typed.
+func ParseCommand(text string) (cmd, arg string, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", "", false
+	}
+	token := strings.Fields(trimmed)[0]
+	if len(token) < 2 || token[0] != '/' {
+		return "", "", false
+	}
+	name := token[1:]
+	if at := strings.IndexByte(name, '@'); at >= 0 {
+		name = name[:at]
+	}
+	name = strings.ToLower(name)
+	if !validCommands[name] {
+		return "", "", false
+	}
+	arg = strings.TrimSpace(strings.TrimPrefix(trimmed, token))
+	return name, arg, true
+}
+
 // ParseCapture splits a captured message into a title and a description at the
 // FIRST newline. No inline metadata syntax (!high, @fri): a newline is
 // unambiguous in a way sigils are not, and priority and dates are one tap away in

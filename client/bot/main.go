@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -207,23 +206,34 @@ func main() {
 			err = b.HandleCallback(ctx, chatID, msgID, u.CallbackQuery.ID, token, u.CallbackQuery.Data)
 		case u.Message != nil:
 			text := u.Message.Text
-			switch {
-			case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/help"):
-				err = b.HandleStart(ctx, chatID)
-			case strings.HasPrefix(text, "/list"):
-				err = b.ShowList(ctx, chatID, 0, token, "", 0)
-			case strings.HasPrefix(text, "/find"):
-				// Fields(text)[0] is the whole command token, so this handles both
-				// "/find dentist" and "/find@seshatbot dentist".
-				needle := strings.TrimSpace(strings.TrimPrefix(text, strings.Fields(text)[0]))
-				if needle == "" {
-					_, err = sender.Send(ctx, chatID, "Usage: <code>/find some words</code>", nil)
-					break
+			// ParseCommand matches on the WHOLE first token, never a prefix — see
+			// client/bot/handlers.go. A message merely starting with a slash-shaped
+			// word that is not one of the bot's real commands (e.g. "/listen to the
+			// podcast") is not a command at all, and falls through below like any
+			// other text: a bare message is ALWAYS a new task.
+			if cmd, arg, ok := ParseCommand(text); ok {
+				switch cmd {
+				case "start", "help":
+					err = b.HandleStart(ctx, chatID)
+				case "list":
+					err = b.ShowList(ctx, chatID, 0, token, "", 0)
+				case "find":
+					if arg == "" {
+						_, err = sender.Send(ctx, chatID, "Usage: <code>/find some words</code>", nil)
+					} else {
+						err = b.ShowList(ctx, chatID, 0, token, arg, 0)
+					}
+				default:
+					// Reachable only if ParseCommand's validCommands ever outgrows
+					// this switch. A mistyped command (e.g. "/lst") is a typo, not a
+					// thought worth saving — it must not be silently swallowed into
+					// Capture, so this fails loud instead.
+					_, err = sender.Send(ctx, chatID,
+						"Unknown command. Try /list, /find, /start, or /help.", nil)
 				}
-				err = b.ShowList(ctx, chatID, 0, token, needle, 0)
-			case u.Message.ReplyToMessage != nil && b.IsPrompt(int64(u.Message.ReplyToMessage.ID)):
+			} else if u.Message.ReplyToMessage != nil && b.IsPrompt(int64(u.Message.ReplyToMessage.ID)) {
 				err = b.HandleReply(ctx, chatID, int64(u.Message.ReplyToMessage.ID), int64(u.Message.ID), token, text)
-			default:
+			} else {
 				// Unconditional: a bare message is ALWAYS a new task.
 				err = b.Capture(ctx, chatID, token, text, "")
 			}

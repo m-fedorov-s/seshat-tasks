@@ -124,6 +124,47 @@ func TestHandleStartExplainsCaptureFirst(t *testing.T) {
 	}
 }
 
+// TestParseCommand covers the finding from Task 16's review: HasPrefix matching
+// let a captured task titled "/listen to the podcast" silently trigger /list.
+// Matching must be on the WHOLE first token against the bot's actual command
+// set, never a prefix.
+func TestParseCommand(t *testing.T) {
+	cases := []struct {
+		in  string
+		cmd string
+		arg string
+		ok  bool
+	}{
+		{"/list", "list", "", true},
+		{"/list  ", "list", "", true},
+		{"/find dentist", "find", "dentist", true},
+		{"/find  the   dentist ", "find", "the   dentist", true},
+		{"/list@seshatbot", "list", "", true},
+		{"/find@seshatbot dentist", "find", "dentist", true},
+		{"/listen to the podcast", "", "", false},
+		{"/", "", "", false},
+		{"", "", "", false},
+		{"   ", "", "", false},
+		{"hello", "", "", false},
+		{"not /list", "", "", false},
+		{"/LIST", "list", "", true},
+		{"/Find@SeshatBot dentist", "find", "dentist", true},
+	}
+	for _, c := range cases {
+		cmd, arg, ok := ParseCommand(c.in)
+		if ok != c.ok {
+			t.Errorf("ParseCommand(%q) ok = %v, want %v", c.in, ok, c.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if cmd != c.cmd || arg != c.arg {
+			t.Errorf("ParseCommand(%q) = (%q, %q), want (%q, %q)", c.in, cmd, arg, c.cmd, c.arg)
+		}
+	}
+}
+
 func TestParseCaptureSplitsOnFirstNewline(t *testing.T) {
 	cases := []struct {
 		in    string
