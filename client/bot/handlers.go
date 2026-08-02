@@ -207,3 +207,151 @@ func (b *Bot) OpenCard(ctx context.Context, chatID, editMsgID int64, token, task
 	return b.deliver(ctx, chatID, editMsgID,
 		CardText(t, ix, b.now(), b.cfg.OffsetMinutes()), CardKeyboard(t, o))
 }
+
+// errTaskGone means the task was absent from the freshly fetched state — deleted
+// from another client while a card was open.
+var errTaskGone = errors.New("task no longer exists")
+
+// applyEdit is the read-modify-write cycle. /api/tasks/update replaces content
+// wholesale and takes an expected_version, so we must fetch, mutate a copy, and
+// send the whole content block back.
+//
+// pinnedVersion == 0  -> picker regime: use the freshly fetched version and retry
+//
+//	once on 409. Safe because the change is one discrete
+//	value the user picked moments ago.
+//
+// pinnedVersion != 0  -> free-text regime: use the pinned version and do NOT
+//
+//	retry. See Task 14 and spec §8.
+func (b *Bot) applyEdit(ctx context.Context, token, taskID string, pinnedVersion uint64, patch func(*task.Content)) (task.Task, error) {
+	attempt := func() (task.Task, error) {
+		tasks, err := b.api.Get(ctx, token)
+		if err != nil {
+			return task.Task{}, err
+		}
+		ix := BuildIndex(tasks)
+		t, ok := ix.Get(taskID)
+		if !ok {
+			return task.Task{}, errTaskGone
+		}
+		content := t.Content
+		patch(&content)
+		version := t.Meta.Version
+		if pinnedVersion != 0 {
+			version = pinnedVersion
+		}
+		updated, err := b.api.Update(ctx, token, []task.UpdateOp{{
+			ID: taskID, Content: content, ExpectedVersion: version,
+		}})
+		if err != nil {
+			return task.Task{}, err
+		}
+		if len(updated) == 0 {
+			return task.Task{}, errTaskGone
+		}
+		return updated[0], nil
+	}
+
+	t, err := attempt()
+	if err == nil || pinnedVersion != 0 {
+		return t, err
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusConflict {
+		return attempt() // one retry against fresh state
+	}
+	return t, err
+}
+
+func (b *Bot) originOf(a Action) Origin {
+	// Read HasList off the action rather than assuming true: a card reached by
+	// capture must not sprout a Back button after its first field edit.
+	return Origin{HasList: a.HasList, Page: a.Page, Query: a.Query}
+}
+
+// afterMutation reports a failure or re-renders the card.
+func (b *Bot) afterMutation(ctx context.Context, chatID, editMsgID int64, token string, a Action, err error) error {
+	if errors.Is(err, errTaskGone) {
+		return b.deliver(ctx, chatID, editMsgID,
+			"That task no longer exists — it may have been deleted elsewhere.", nil)
+	}
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	return b.OpenCard(ctx, chatID, editMsgID, token, a.TaskID, b.originOf(a))
+}
+
+// SetField commits one picker choice.
+func (b *Bot) SetField(ctx context.Context, chatID, editMsgID int64, token string, a Action) error {
+	var patch func(*task.Content)
+	switch a.Kind {
+	case KindSetStatus:
+		s := task.Status(a.Arg)
+		if !s.Valid() {
+			return b.fail(ctx, chatID, &APIError{Status: 400, Msg: "unknown status"})
+		}
+		patch = func(c *task.Content) { c.Status = s }
+	case KindSetPriority:
+		p := task.Priority(a.Arg)
+		if !p.Valid() {
+			return b.fail(ctx, chatID, &APIError{Status: 400, Msg: "unknown priority"})
+		}
+		patch = func(c *task.Content) { c.Priority = p }
+	case KindSetDue:
+		due, err := DueFromKeyword(a.Arg, b.now(), b.cfg.OffsetMinutes())
+		if err != nil {
+			return b.failInternal(ctx, chatID, err)
+		}
+		patch = func(c *task.Content) { c.DueAt = due }
+	case KindClearTags:
+		patch = func(c *task.Content) { c.Tags = []string{} }
+	default:
+		return b.failInternal(ctx, chatID, errors.New("unhandled field action"))
+	}
+	_, err := b.applyEdit(ctx, token, a.TaskID, 0, patch)
+	return b.afterMutation(ctx, chatID, editMsgID, token, a, err)
+}
+
+// Done marks the task done and returns to the originating list rather than
+// re-rendering a card for a task that has just left the open set — which would
+// leave a Back button pointing into a listing the task is no longer in.
+func (b *Bot) Done(ctx context.Context, chatID, editMsgID int64, token string, a Action) error {
+	_, err := b.applyEdit(ctx, token, a.TaskID, 0, func(c *task.Content) {
+		c.Status = task.StatusDone
+	})
+	if errors.Is(err, errTaskGone) {
+		return b.deliver(ctx, chatID, editMsgID,
+			"That task no longer exists — it may have been deleted elsewhere.", nil)
+	}
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	return b.ShowList(ctx, chatID, editMsgID, token, a.Query, a.Page)
+}
+
+func (b *Bot) ConfirmDelete(ctx context.Context, chatID, editMsgID int64, token string, a Action) error {
+	tasks, err := b.api.Get(ctx, token)
+	if err != nil {
+		return b.fail(ctx, chatID, err)
+	}
+	ix := BuildIndex(tasks)
+	t, ok := ix.Get(a.TaskID)
+	if !ok {
+		return b.deliver(ctx, chatID, editMsgID,
+			"That task no longer exists — it may have been deleted elsewhere.", nil)
+	}
+	return b.deliver(ctx, chatID, editMsgID,
+		DeleteConfirmText(t), DeleteConfirmKeyboard(a.TaskID, b.originOf(a)))
+}
+
+func (b *Bot) DoDelete(ctx context.Context, chatID, editMsgID int64, token string, a Action) error {
+	if err := b.api.Delete(ctx, token, a.TaskID); err != nil {
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+			return b.deliver(ctx, chatID, editMsgID, "That task was already gone.", nil)
+		}
+		return b.fail(ctx, chatID, err)
+	}
+	return b.ShowList(ctx, chatID, editMsgID, token, a.Query, a.Page)
+}

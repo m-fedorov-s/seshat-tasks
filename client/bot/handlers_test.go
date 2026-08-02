@@ -379,3 +379,208 @@ func textOf(ms []sentMsg) string {
 	}
 	return strings.Join(out, " ")
 }
+
+// updateRecorder serves a GET and an UPDATE, optionally failing the first update
+// with a 409 to exercise the retry policy.
+type updateRecorder struct {
+	tasks       []task.Task
+	updates     [][]task.UpdateOp
+	conflictOn  int // 1-based update call to answer with 409; 0 = never
+	updateCalls int
+	deleted     string
+}
+
+func (u *updateRecorder) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tasks/get":
+			json.NewEncoder(w).Encode(map[string]any{"state_version": 1, "tasks": u.tasks})
+		case "/api/tasks/update":
+			var body struct {
+				Updates []task.UpdateOp `json:"updates"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			u.updateCalls++
+			u.updates = append(u.updates, body.Updates)
+			if u.conflictOn == u.updateCalls {
+				w.WriteHeader(http.StatusConflict)
+				w.Write([]byte(`{"conflicts":[{"id":"T"}]}`))
+				return
+			}
+			out := task.Task{ID: body.Updates[0].ID, Content: body.Updates[0].Content,
+				Meta: task.Meta{Version: body.Updates[0].ExpectedVersion + 1}}
+			// keep the fixture in step so a retry sees the new version
+			for i := range u.tasks {
+				if u.tasks[i].ID == out.ID {
+					u.tasks[i] = out
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"state_version": 2, "tasks": []task.Task{out}})
+		case "/api/tasks/delete":
+			var body struct {
+				ID string `json:"id"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			u.deleted = body.ID
+			json.NewEncoder(w).Encode(map[string]any{"state_version": 3, "deleted": body.ID})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}
+}
+
+func targetTask() task.Task {
+	t := mk("T")
+	t.Content.Title = "target"
+	t.Meta.Version = 4
+	return t
+}
+
+func TestSetPrioritySendsFetchedVersion(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindSetPriority, TaskID: "T", Arg: "high", Page: 0}
+	if err := b.SetField(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if len(u.updates) != 1 {
+		t.Fatalf("update calls = %d, want 1", len(u.updates))
+	}
+	op := u.updates[0][0]
+	if op.ExpectedVersion != 4 {
+		t.Errorf("expected_version = %d, want the freshly fetched 4", op.ExpectedVersion)
+	}
+	if op.Content.Priority != task.PriorityHigh {
+		t.Errorf("priority = %q, want high", op.Content.Priority)
+	}
+	if op.Content.Title != "target" {
+		t.Error("update must replace content wholesale, preserving untouched fields")
+	}
+}
+
+func TestSetStatusRetriesOnceOnConflict(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}, conflictOn: 1}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindSetStatus, TaskID: "T", Arg: "in_progress"}
+	if err := b.SetField(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 2 {
+		t.Errorf("update calls = %d, want 2 (one conflict, one retry)", u.updateCalls)
+	}
+	if len(f.edited) == 0 {
+		t.Error("a successful retry should still render the card")
+	}
+}
+
+func TestSetDueResolvesKeywordToEndOfLocalDay(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindSetDue, TaskID: "T", Arg: "today"}
+	if err := b.SetField(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	got := u.updates[0][0].Content.DueAt
+	want, _ := DueFromKeyword("today", 0, 0)
+	if got == nil || *got != *want {
+		t.Errorf("due_at = %v, want %v (23:59:59 local, per edit.zig:61-66)", got, want)
+	}
+}
+
+func TestSetDueClearRemovesTheDate(t *testing.T) {
+	seed := targetTask()
+	due := int64(999)
+	seed.Content.DueAt = &due
+	u := &updateRecorder{tasks: []task.Task{seed}}
+	b, _, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindSetDue, TaskID: "T", Arg: "clear"}
+	if err := b.SetField(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.updates[0][0].Content.DueAt != nil {
+		t.Error("clear must null due_at")
+	}
+}
+
+// Done is the most-used action; after it the task leaves the open list, so
+// re-rendering its card would leave a Back pointing into a set it has left.
+func TestDoneReturnsToTheList(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindDone, TaskID: "T", Page: 0}
+	if err := b.Done(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.updates[0][0].Content.Status != task.StatusDone {
+		t.Errorf("status = %q, want done", u.updates[0][0].Content.Status)
+	}
+	if len(f.edited) == 0 {
+		t.Fatal("expected the list to be re-rendered in place")
+	}
+	last := f.edited[len(f.edited)-1].Text
+	if strings.Contains(last, "priority  ") {
+		t.Errorf("Done re-rendered a card instead of returning to the list:\n%s", last)
+	}
+}
+
+func TestConfirmDeleteWarnsAboutOrphanedChildren(t *testing.T) {
+	parent := targetTask()
+	parent.Content.ChildIDs = []string{"k1", "k2"}
+	u := &updateRecorder{tasks: []task.Task{parent, mk("k1"), mk("k2")}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindConfirmDelete, TaskID: "T"}
+	if err := b.ConfirmDelete(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.ToLower(f.edited[0].Text)
+	if !strings.Contains(body, "2") || !strings.Contains(body, "top-level") {
+		t.Errorf("delete confirm must state that children are promoted:\n%s", f.edited[0].Text)
+	}
+}
+
+func TestDoDeleteRemovesAndReturnsToTheList(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{targetTask()}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindDoDelete, TaskID: "T", Page: 0}
+	if err := b.DoDelete(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.deleted != "T" {
+		t.Errorf("deleted = %q, want T", u.deleted)
+	}
+	if len(f.edited) == 0 {
+		t.Error("expected the list to be re-rendered after deletion")
+	}
+}
+
+func TestSetFieldReportsAVanishedTask(t *testing.T) {
+	u := &updateRecorder{tasks: []task.Task{mk("OTHER")}}
+	b, f, done := botWithServer(t, u.handler(t))
+	defer done()
+
+	a := Action{Kind: KindSetPriority, TaskID: "GONE", Arg: "high"}
+	if err := b.SetField(context.Background(), 42, 55, "sekrit", a); err != nil {
+		t.Fatal(err)
+	}
+	if u.updateCalls != 0 {
+		t.Error("a task absent from the fetched set must not be POSTed")
+	}
+	joined := strings.ToLower(textOf(f.sent) + " " + textOf(f.edited))
+	if !strings.Contains(joined, "no longer exists") {
+		t.Errorf("expected a 'no longer exists' reply, got %q", joined)
+	}
+}
