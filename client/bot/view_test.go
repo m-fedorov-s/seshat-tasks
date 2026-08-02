@@ -347,16 +347,33 @@ func TestPaginateNeverSplitsAGroup(t *testing.T) {
 	if got := Paginate(groups, 0).Count; got != 2 {
 		t.Fatalf("page count = %d, want 2 — the sixth root must start a new page", got)
 	}
+
+	// Walk `groups` alongside the pages: each page's rows must be exactly the
+	// concatenation of some run of WHOLE groups, picked up where the previous
+	// page left off — never a partial group — with the single documented
+	// exception of a lone oversized group, truncated and reported via Overflow.
+	gi := 0
 	total := 0
 	for i := 0; i < Paginate(groups, 0).Count; i++ {
 		p := Paginate(groups, i)
 		total += len(p.Rows)
-		// no page may contain a partial group: a row at depth>0 must be preceded
-		// on the same page by its depth-0 ancestor
-		for j, r := range p.Rows {
-			if r.Depth > 0 && j == 0 {
-				t.Errorf("page %d starts mid-group with %s", i, r.Task.ID)
+
+		var want Group
+		consumed := 0
+		for consumed < len(p.Rows) && gi < len(groups) {
+			want = append(want, groups[gi]...)
+			consumed += len(groups[gi])
+			gi++
+		}
+		if p.Overflow > 0 {
+			if p.Overflow >= len(want) {
+				t.Fatalf("page %d: overflow %d can't exceed the %d rows it was drawn from", i, p.Overflow, len(want))
 			}
+			want = want[:len(want)-p.Overflow]
+		}
+		if !reflect.DeepEqual(Group(p.Rows), want) {
+			t.Errorf("page %d rows = %v, want whole groups %v — a group must not be split across pages",
+				i, groupIDs([]Group{Group(p.Rows)}), groupIDs([]Group{want}))
 		}
 	}
 	if total != 9 {
