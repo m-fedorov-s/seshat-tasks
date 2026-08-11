@@ -1,0 +1,6 @@
+{
+  "id": "01JUNKNOWN0000000000000000",
+  "content": { "title": "future", "status": "todo", "priority": "none", "child_ids": [], "tags": [], "color": "blue" },
+  "meta": { "created_at": 1718100000, "updated_at": 1718100000, "version": 1 },
+  "extension": { "anything": true }
+}
