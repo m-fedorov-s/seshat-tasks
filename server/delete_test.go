@@ -1,11 +1,15 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"seshat/internal/task"
+)
 
 func TestDeleteDetachesFromParent(t *testing.T) {
 	st := newTestStore(t)
-	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
-	child, _, _ := st.Add(AddRequest{Content: validContent("child"), ParentID: &parent.ID})
+	parent, _, _ := st.Add(task.AddRequest{Content: validContent("parent")})
+	child, _, _ := st.Add(task.AddRequest{Content: validContent("child"), ParentID: &parent.ID})
 
 	sv, err := st.Delete(child.ID)
 	if err != nil {
@@ -28,8 +32,8 @@ func TestDeleteDetachesFromParent(t *testing.T) {
 
 func TestDeletePromotesChildrenToRoots(t *testing.T) {
 	st := newTestStore(t)
-	parent, _, _ := st.Add(AddRequest{Content: validContent("parent")})
-	child, _, _ := st.Add(AddRequest{Content: validContent("child"), ParentID: &parent.ID})
+	parent, _, _ := st.Add(task.AddRequest{Content: validContent("parent")})
+	child, _, _ := st.Add(task.AddRequest{Content: validContent("child"), ParentID: &parent.ID})
 
 	if _, err := st.Delete(parent.ID); err != nil {
 		t.Fatal(err)

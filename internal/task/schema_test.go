@@ -1,4 +1,4 @@
-package main
+package task
 
 import (
 	"encoding/json"
@@ -10,7 +10,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
 
-const schemaDir = "../schema"
+const schemaDir = "../../schema"
 
 // fixtures that are valid against the JSON Schema (excludes unknown-enum, which
 // intentionally violates the enum to exercise the client fallback).

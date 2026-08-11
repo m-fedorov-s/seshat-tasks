@@ -9,16 +9,21 @@ truth; clients fetch task data from it.
 make server-test              # Go server tests
 make schema-test              # shared Task-contract tests (Go + Zig halves)
 make client-integration-test  # spawns a real server + client through a pipe
+make bot-test                 # Go Telegram bot client tests
 cd client/zig && zig build test   # Zig client unit tests
 
 make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
 ```
 
-All four test targets must pass before any commit.
+All five test targets must pass before any commit.
 
 ## Layout
 
+- The Go module root is the repo root (`go.mod` at top level) — it is not `server/`. Wire types
+  shared by the server and the Go bot (`Task`, `Content`, `Meta`, `Status`, `Priority`,
+  `AddRequest`, `UpdateOp`) live in `internal/task/`. `State` and `CurrentDataFormatVersion` stay
+  in `server/` — they are the server's own on-disk concerns, not part of the wire contract.
 - `server/` — Go HTTP server (`package main`, split across `task.go` / `store.go` / `validate.go`
   / `handlers.go` / `main.go`). Stores tasks in memory, persisted to an atomic-rewrite JSON file,
   with a global `state_version`. Auth via a shared `secret` sent in the `Authorization` header.
@@ -32,6 +37,16 @@ All four test targets must pass before any commit.
 - `schema/` — the shared `Task` contract: `task.schema.json`, `SCHEMA.md`, golden `fixtures/`.
   Enforced across server + client by `make schema-test`.
 - `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
+- `client/bot/` — a Go Telegram bot client (`package main`), long-polling via
+  `github.com/go-telegram/bot`, over the same server API. A pure core (`view.go` select/rank,
+  `render.go` layout) is exercised without any Telegram fake; an I/O shell (`handlers.go`,
+  `seshat.go`) does the fetch/mutate/render orchestration; an LRU `Registry` (`actions.go`) maps
+  opaque callback tokens (and outstanding ForceReply prompts) back to `Action`s; `main.go` is the
+  only place Telegram's own types are touched. Any message becomes a task (capture); `/list` and
+  `/find` browse the same ranked forest as the CLI; editing is per-field through a card's inline
+  keyboard, with free-text fields (title/description/tags) taken over a ForceReply reply and
+  pinned-version optimistic concurrency. See `client/bot/README.md` for config, BotFather
+  settings, and deployment.
 - `client/fish/` — **placeholder README only**; the standalone fish client was retired and the
   shell integration (completions/prompt) is not built yet. See `plans/roadmap.md` → Stage 3.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
@@ -71,6 +86,27 @@ The Zig client:
    with polling deferred. See `client/zig/CLAUDE.md` for the full keymap.
 5. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
    server's error message on failure.
+
+The Telegram bot (`client/bot/`):
+1. Reads config (bot token, server URL, `utc_offset`, and a `telegram_id → seshat token` map)
+   from JSON (`SESHAT_BOT_CONFIG` or `~/.config/seshat/bot.json`). Refuses to start on an empty
+   token, an empty user map, or a bad offset; warns on a group/world-readable file.
+2. **Any non-command message becomes a task** — first line is the title, everything after the
+   first newline is the description. This rule is unconditional; it is why field edits arrive
+   through Telegram's `ForceReply` rather than "the next message you send is the value".
+3. `/list` renders open tasks as a page of **5 roots** (never splitting a root from its subtree,
+   also capped at 25 rows), ranked by subtree urgency; `/find <text>` searches titles. Both render
+   through one paged renderer, with per-page numbered buttons.
+4. Tapping a number opens a card; its inline keyboard edits status, priority, due, title,
+   description and tags, and deletes. **Selection keeps a closed parent that still has open
+   children** — the same rule as `view.zig`'s `select`, so marking a parent done never hides a
+   live subtask.
+5. **Two concurrency regimes** (`handlers.go` → `applyEdit`): picker fields re-fetch and retry
+   once on a 409; free-text fields pin `meta.version` when the prompt is sent, never auto-retry,
+   and surface a conflict as `[Overwrite]`/`[Keep theirs]` so a typed value is never lost.
+6. Interaction state is an in-memory LRU registry (`actions.go`) mapping opaque button tokens to
+   actions. Every action carries the full task ULID, so a tap on a scrolled-back message acts on
+   *that* message's task. A restart expires every rendered button — by design.
 
 ## Conventions
 

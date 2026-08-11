@@ -9,6 +9,8 @@ import (
 	"strconv"
 
 	"golang.org/x/time/rate"
+
+	"seshat/internal/task"
 )
 
 // defaultRateLimit is the requests-per-second ceiling when config omits one.
@@ -133,7 +135,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	tasks := make([]Task, 0, len(snap.Tasks))
+	tasks := make([]task.Task, 0, len(snap.Tasks))
 	for _, t := range snap.Tasks {
 		tasks = append(tasks, t)
 	}
@@ -141,22 +143,22 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
-	var req AddRequest
+	var req task.AddRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, decodeErr(err))
 		return
 	}
-	task, sv, err := s.store.Add(req)
+	tk, sv, err := s.store.Add(req)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"state_version": sv, "task": task})
+	writeJSON(w, http.StatusOK, map[string]any{"state_version": sv, "task": tk})
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Updates []UpdateOp `json:"updates"`
+		Updates []task.UpdateOp `json:"updates"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, decodeErr(err))

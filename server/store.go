@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+
+	"seshat/internal/task"
 )
 
 // ErrNotFound is returned when a referenced task id does not exist (HTTP 404).
@@ -21,7 +23,7 @@ type ValidationError struct{ Msg string }
 func (e *ValidationError) Error() string { return e.Msg }
 
 // ConflictError reports an optimistic-concurrency version mismatch (HTTP 409).
-type ConflictError struct{ Conflicts []Task }
+type ConflictError struct{ Conflicts []task.Task }
 
 func (e *ConflictError) Error() string { return "version conflict" }
 
@@ -59,7 +61,7 @@ func (st *Store) load() error {
 		st.state = State{
 			DataFormatVersion: CurrentDataFormatVersion,
 			StateVersion:      0,
-			Tasks:             map[string]Task{},
+			Tasks:             map[string]task.Task{},
 		}
 		st.rebuildIndex()
 		return st.saveState(st.state)
@@ -72,7 +74,7 @@ func (st *Store) load() error {
 		return err
 	}
 	if s.Tasks == nil {
-		s.Tasks = map[string]Task{}
+		s.Tasks = map[string]task.Task{}
 	}
 	// Absent (or 0) means a file written before the field existed; v1 is the only
 	// shape that has ever existed, so adopt it and stamp on the next write.
@@ -144,7 +146,7 @@ func (st *Store) Snapshot() State {
 // do not introduce in-place mutation through a cloned pointer or it will corrupt
 // the live state.
 func cloneState(s State) State {
-	ts := make(map[string]Task, len(s.Tasks))
+	ts := make(map[string]task.Task, len(s.Tasks))
 	for k, v := range s.Tasks {
 		// Clone into a non-nil base so empty slices stay non-nil and serialize as
 		// JSON `[]` (not `null`), matching the stored state and the schema contract.
@@ -159,13 +161,7 @@ func cloneState(s State) State {
 	}
 }
 
-type AddRequest struct {
-	Content  Content `json:"content"`
-	ParentID *string `json:"parent_id"`
-	Position *int    `json:"position"`
-}
-
-func validateContent(c Content) error {
+func validateContent(c task.Content) error {
 	if len(c.Title) == 0 || onlySpace(c.Title) {
 		return &ValidationError{"title must be non-empty"}
 	}
@@ -188,7 +184,7 @@ func onlySpace(s string) bool {
 }
 
 // applyCompletion sets/clears completed_at on a status transition (§2.6).
-func applyCompletion(m Meta, old, next Status, now int64) Meta {
+func applyCompletion(m task.Meta, old, next task.Status, now int64) task.Meta {
 	if !old.Terminal() && next.Terminal() {
 		m.CompletedAt = &now
 	} else if old.Terminal() && !next.Terminal() {
@@ -214,12 +210,12 @@ func insertAt(s []string, i int, v string) []string {
 	return s
 }
 
-func (st *Store) Add(req AddRequest) (Task, uint64, error) {
+func (st *Store) Add(req task.AddRequest) (task.Task, uint64, error) {
 	if err := validateContent(req.Content); err != nil {
-		return Task{}, 0, err
+		return task.Task{}, 0, err
 	}
 	if len(req.Content.ChildIDs) > 0 {
-		return Task{}, 0, &ValidationError{"child_ids must be empty on add"}
+		return task.Task{}, 0, &ValidationError{"child_ids must be empty on add"}
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -231,8 +227,8 @@ func (st *Store) Add(req AddRequest) (Task, uint64, error) {
 		c.Tags = []string{}
 	}
 	id := st.newID()
-	t := Task{ID: id, Content: c, Meta: Meta{CreatedAt: now, UpdatedAt: now, Version: 1}}
-	t.Meta = applyCompletion(t.Meta, StatusTodo, c.Status, now)
+	t := task.Task{ID: id, Content: c, Meta: task.Meta{CreatedAt: now, UpdatedAt: now, Version: 1}}
+	t.Meta = applyCompletion(t.Meta, task.StatusTodo, c.Status, now)
 
 	cand := cloneState(st.state)
 	cand.Tasks[id] = t
@@ -240,7 +236,7 @@ func (st *Store) Add(req AddRequest) (Task, uint64, error) {
 	if req.ParentID != nil {
 		p, ok := cand.Tasks[*req.ParentID]
 		if !ok {
-			return Task{}, 0, ErrNotFound
+			return task.Task{}, 0, ErrNotFound
 		}
 		pos := len(p.Content.ChildIDs)
 		if req.Position != nil {
@@ -253,24 +249,18 @@ func (st *Store) Add(req AddRequest) (Task, uint64, error) {
 	}
 
 	if err := validateState(cand); err != nil {
-		return Task{}, 0, err
+		return task.Task{}, 0, err
 	}
 	cand.StateVersion++
 	if err := st.saveState(cand); err != nil {
-		return Task{}, 0, err
+		return task.Task{}, 0, err
 	}
 	st.state = cand
 	st.rebuildIndex()
 	return st.state.Tasks[id], st.state.StateVersion, nil
 }
 
-type UpdateOp struct {
-	ID              string  `json:"id"`
-	Content         Content `json:"content"`
-	ExpectedVersion uint64  `json:"expected_version"`
-}
-
-func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
+func (st *Store) Update(ops []task.UpdateOp) ([]task.Task, uint64, error) {
 	seen := map[string]struct{}{}
 	for _, op := range ops {
 		if err := validateContent(op.Content); err != nil {
@@ -291,7 +281,7 @@ func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
 		}
 	}
 	// conflicts (collect all, then reject)
-	var conflicts []Task
+	var conflicts []task.Task
 	for _, op := range ops {
 		cur := st.state.Tasks[op.ID]
 		if cur.Meta.Version != op.ExpectedVersion {
@@ -329,7 +319,7 @@ func (st *Store) Update(ops []UpdateOp) ([]Task, uint64, error) {
 	}
 	st.state = cand
 	st.rebuildIndex()
-	out := make([]Task, 0, len(ops))
+	out := make([]task.Task, 0, len(ops))
 	for _, op := range ops {
 		out = append(out, st.state.Tasks[op.ID])
 	}

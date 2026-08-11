@@ -27,6 +27,7 @@ sdd_archive/
 
 # Go build binary
 /server/seshat
+/client/bot/seshat-bot
 
 # Claude local settings
 .claude/settings.local.json

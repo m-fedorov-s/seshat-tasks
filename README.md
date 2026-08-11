@@ -115,8 +115,10 @@ is tagged `ops`, rather than erasing it.
 | | |
 | --- | --- |
 | `server/` | Go HTTP server. In-memory, persisted to an atomic-rewrite JSON file. Auth is a shared secret in the `Authorization` header. Per-task versions give optimistic concurrency. |
-| `schema/` | The `Task` contract shared by both halves — JSON Schema, prose, and golden fixtures. |
-| `client/zig/` | The client (Zig 0.16). CLI plus TUI; see [`client/zig/CLAUDE.md`](client/zig/CLAUDE.md). |
+| `internal/task/` | The `Task` contract as Go types (`Task`, `Content`, `Meta`, `Status`, `Priority`, `AddRequest`, `UpdateOp`), shared by the server and the Go bot below. |
+| `schema/` | The `Task` contract shared across languages — JSON Schema, prose, and golden fixtures. |
+| `client/zig/` | The canonical client (Zig 0.16). CLI plus TUI; see [`client/zig/CLAUDE.md`](client/zig/CLAUDE.md). |
+| `client/bot/` | A Go Telegram bot: capture a task from any message, browse with `/list`/`/find`, edit per-field through inline keyboards. Long-polling, no inbound port. See [`client/bot/README.md`](client/bot/README.md). |
 | `test/` | Integration tests that need a real server and client. |
 | `dev/` | A throwaway local environment. |
 
@@ -130,14 +132,16 @@ while the libvaxis shell only paints what they decide.
 make server-test              # Go server
 make schema-test              # the shared Task contract, both halves
 make client-integration-test  # a real server and client through a pipe
+make bot-test                 # the Telegram bot client
 cd client/zig && zig build test
 ```
 
-All four must pass before a commit. Note that `zig build test` does **not** typecheck the CLI
+All five must pass before a commit. Note that `zig build test` does **not** typecheck the CLI
 entry point — run `zig build` as well.
 
 ## Status
 
-The server, the CLI and the TUI work. Not built yet: client-side caching and offline use, shell
-completions, multi-user, end-to-end encryption, and background refresh. Hierarchy is read-only
-in the TUI — you can see and edit a forest, but not restructure one.
+The server, the CLI and the TUI work, and a Telegram bot client (`client/bot/`) can capture,
+browse and edit tasks. Not built yet: client-side caching and offline use, shell completions,
+multi-user, end-to-end encryption, and background refresh. Hierarchy is read-only in the TUI and
+the bot — you can see and edit a forest, but not restructure one.
