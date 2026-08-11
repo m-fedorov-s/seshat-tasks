@@ -87,6 +87,27 @@ The Zig client:
 5. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
    server's error message on failure.
 
+The Telegram bot (`client/bot/`):
+1. Reads config (bot token, server URL, `utc_offset`, and a `telegram_id → seshat token` map)
+   from JSON (`SESHAT_BOT_CONFIG` or `~/.config/seshat/bot.json`). Refuses to start on an empty
+   token, an empty user map, or a bad offset; warns on a group/world-readable file.
+2. **Any non-command message becomes a task** — first line is the title, everything after the
+   first newline is the description. This rule is unconditional; it is why field edits arrive
+   through Telegram's `ForceReply` rather than "the next message you send is the value".
+3. `/list` renders open tasks as a page of **5 roots** (never splitting a root from its subtree,
+   also capped at 25 rows), ranked by subtree urgency; `/find <text>` searches titles. Both render
+   through one paged renderer, with per-page numbered buttons.
+4. Tapping a number opens a card; its inline keyboard edits status, priority, due, title,
+   description and tags, and deletes. **Selection keeps a closed parent that still has open
+   children** — the same rule as `view.zig`'s `select`, so marking a parent done never hides a
+   live subtask.
+5. **Two concurrency regimes** (`handlers.go` → `applyEdit`): picker fields re-fetch and retry
+   once on a 409; free-text fields pin `meta.version` when the prompt is sent, never auto-retry,
+   and surface a conflict as `[Overwrite]`/`[Keep theirs]` so a typed value is never lost.
+6. Interaction state is an in-memory LRU registry (`actions.go`) mapping opaque button tokens to
+   actions. Every action carries the full task ULID, so a tap on a scrolled-back message acts on
+   *that* message's task. A restart expires every rendered button — by design.
+
 ## Conventions
 
 - The server is authoritative; clients must not assume local state is canonical.
