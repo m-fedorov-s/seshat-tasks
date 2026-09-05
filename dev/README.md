@@ -51,5 +51,8 @@ cat -v out.txt   # reveal the raw ANSI escape bytes
 Stop the server, `rm dev/seshat-dev.db`, start it again and re-seed. Do not delete
 `dev/seshat-dev-data.json` — that is the pre-Stage-2 dataset, and it can be loaded into a
 running dev server with `go run ./test/seed -token devsecret dev/seshat-dev-data.json`.
+This is Plan-A-only: the token above is the `bootstrapSingle` user, and once Plan B lands and
+switches auth to minted per-user tokens, `rm dev/seshat-dev.db` and start over — do not migrate
+the real dataset into a Plan A file, and wait for `users/add` to exist before doing so for real.
 
 Also available as `make dev-server` and `make dev-seed`.

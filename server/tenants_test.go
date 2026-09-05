@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -74,6 +75,34 @@ func TestOpenFreshFileCreatesBucketsAndVersion(t *testing.T) {
 	}
 }
 
+func TestOpenWarnsOnPermissiveDataFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants on a permissive file: got %v, want success", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+
+	if got := buf.String(); !strings.Contains(got, "WARNING") || !strings.Contains(got, path) {
+		t.Fatalf("log output = %q, want a WARNING mentioning %s", got, path)
+	}
+}
+
 func TestOpenRefusesMissingFormatVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.db")
 	tn, err := OpenTenants(path, defaultRateLimit)
@@ -103,6 +132,107 @@ func TestOpenRefusesMissingFormatVersion(t *testing.T) {
 	tn2 := reopenRaw(t, path)
 	if err := tn2.Close(); err != nil {
 		t.Fatalf("tn2.Close: %v", err)
+	}
+}
+
+func TestOpenRefusesShortFormatVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketMeta)).Put([]byte(keyFormatVersion), []byte{1, 2, 3, 4})
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "format_version") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning format_version", err)
+	}
+}
+
+func TestOpenRefusesShortUsersKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	tok, _, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	h := tokenHash(tok)
+	rec, err := json.Marshal(User{ID: UserID{1}})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		users := tx.Bucket([]byte(bucketUsers))
+		if err := users.Delete(h[:]); err != nil {
+			return err
+		}
+		return users.Put(h[:5], rec)
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning corrupt", err)
+	}
+}
+
+func TestOpenRefusesShortDataKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	_, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte(bucketData))
+		v := data.Get(id[:])
+		vCopy := append([]byte(nil), v...)
+		// Leave the real 16-byte entry in place — deleting it would make loadUsers
+		// fail on "user has no data" before it ever reaches the data.ForEach length
+		// check this test targets. Add a second, malformed-length key alongside it.
+		return data.Put(id[:5], vCopy)
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning corrupt", err)
 	}
 }
 
@@ -308,6 +438,49 @@ func TestDeleteRemovesRecordAndData(t *testing.T) {
 	}
 	if got := tn.List(); len(got) != 0 {
 		t.Fatalf("List after Delete = %v, want empty", got)
+	}
+}
+
+func TestDeleteLeavesOtherTenantsIntact(t *testing.T) {
+	tn := openTestTenants(t)
+	tokA, idA, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	tokB, idB, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+	a, ok := tn.Authenticate(tokA)
+	if !ok {
+		t.Fatal("Authenticate A: not ok")
+	}
+	b, ok := tn.Authenticate(tokB)
+	if !ok {
+		t.Fatal("Authenticate B: not ok")
+	}
+	if _, _, err := a.store.Add(task.AddRequest{Content: validContent("a-task")}); err != nil {
+		t.Fatalf("A Add: %v", err)
+	}
+	if _, _, err := b.store.Add(task.AddRequest{Content: validContent("b-task")}); err != nil {
+		t.Fatalf("B Add: %v", err)
+	}
+
+	if err := tn.Delete(idA); err != nil {
+		t.Fatalf("Delete A: %v", err)
+	}
+
+	if _, ok := tn.Authenticate(tokB); !ok {
+		t.Fatal("B no longer authenticates after Delete(A)")
+	}
+	assertOnlyTask(t, b.store, "b-task")
+	if err := tn.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(bucketData)).Get(idB[:]) == nil {
+			t.Fatal("B's data blob was removed by Delete(A)")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
 	}
 }
 

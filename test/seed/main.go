@@ -85,6 +85,10 @@ func main() {
 
 	var visit func(old string, parent *string)
 	visit = func(old string, parent *string) {
+		if _, dup := newID[old]; dup {
+			die("cycle at %s", old)
+		}
+
 		t, ok := data.Tasks[old]
 		if !ok {
 			die("child %s not in file", old)
@@ -138,6 +142,10 @@ func main() {
 
 	for _, r := range roots {
 		visit(r, nil)
+	}
+
+	if len(newID) != len(data.Tasks) {
+		die("seeded %d of %d tasks — unreachable tasks (cycle?)", len(newID), len(data.Tasks))
 	}
 
 	fmt.Fprintf(os.Stderr, "seeded %d tasks\n", len(newID))

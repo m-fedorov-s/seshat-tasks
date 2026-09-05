@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -157,6 +158,16 @@ func OpenTenants(path string, rps int) (*Tenants, error) {
 	if err := t.init(); err != nil {
 		db.Close()      // the ONE close for every init-time failure: a leaked handle
 		return nil, err // keeps the flock and poisons the path for later opens
+	}
+
+	// bolt.Open's mode argument only applies on creation: an existing file that is
+	// (or becomes) group/world-readable is silently accepted, unlike the old JSON
+	// writer, which recreated the file 0600 on every save. This file now holds
+	// every tenant's tasks, so warn (do not refuse, do not chmod) the same way
+	// warnIfPermissive does for the config file.
+	if info, err := os.Stat(path); err == nil && tooPermissive(info.Mode()) {
+		log.Printf("WARNING: data file %s has mode %#o and holds every user's tasks; run: chmod 600 %s",
+			path, info.Mode().Perm(), path)
 	}
 
 	return t, nil

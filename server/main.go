@@ -114,6 +114,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.DataFile == "" {
+		// Plan A only: Plan B changes this default to seshat.db (spec §7).
 		cfg.DataFile = "seshat-data.json"
 	}
 	if cfg.Bind == "" {
@@ -139,6 +140,7 @@ func main() {
 	}
 	// No defer tenants.Close(): every exit below is log.Fatal -> os.Exit, which
 	// skips defers anyway. bbolt commits are durable, so nothing acknowledged is lost.
+	// Transient: Plan B replaces this with Authenticate-per-request; see bootstrapSingle.
 	store, err := tenants.bootstrapSingle()
 	if err != nil {
 		log.Fatalf("bootstrap: %v", err)
