@@ -33,13 +33,15 @@ awk 'BEGIN {
     }
   }
   printf "\n  }\n}\n"
-}' > "$tmp/data.json"
+}' > "$tmp/fixture.json"
 
+# rate_limit raised so 2000 adds are never throttled (10 r/s would take 200 s).
 cat > "$tmp/server.yaml" <<EOF
 secret: $secret
 bind: 127.0.0.1
 port: $port
-data_file: $tmp/data.json
+data_file: $tmp/seshat.db
+rate_limit: 5000
 EOF
 # Otherwise warnIfPermissive fires on every run and clutters server.log.
 chmod 600 "$tmp/server.yaml"
@@ -48,8 +50,9 @@ cat > "$tmp/client.json" <<EOF
 {"url": "http://127.0.0.1:$port", "secret": "$secret", "utc_offset": "+03:00"}
 EOF
 
-echo "building server + client..."
+echo "building server + seeder + client..."
 (cd "$root/server" && go build -o "$tmp/seshat-server" .)
+(cd "$root" && go build -o "$tmp/seshat-seed" ./test/seed)
 (cd "$root/client/zig" && zig build)
 
 "$tmp/seshat-server" -config "$tmp/server.yaml" >"$tmp/server.log" 2>&1 &
@@ -72,6 +75,10 @@ if [ "$ready" -ne 1 ]; then
   cat "$tmp/server.log"
   exit 1
 fi
+
+echo "seeding fixture through the API..."
+"$tmp/seshat-seed" -url "http://127.0.0.1:$port" -token "$secret" "$tmp/fixture.json" \
+  || { echo "FAIL: seeding"; cat "$tmp/server.log"; exit 1; }
 
 # Guard against the fixture silently shrinking below the pipe buffer over time (e.g. a
 # future edit trims the task count). If the unpiped output doesn't comfortably exceed the

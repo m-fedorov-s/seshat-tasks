@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	bolt "go.etcd.io/bbolt"
 
 	"seshat/internal/task"
 )
@@ -32,20 +31,37 @@ type TooLargeError struct{}
 
 func (e *TooLargeError) Error() string { return "request body too large" }
 
+// ErrUserDeleted reports a write against a user whose data blob is gone — the
+// registry's Delete ran while a request still held this Store. The request fails;
+// the user is never resurrected.
+var ErrUserDeleted = errors.New("user deleted")
+
+// userBlob is the on-disk value of data[id]. data_format_version is per FILE (it
+// lives in the meta bucket), so it is deliberately not a field here.
+type userBlob struct {
+	StateVersion uint64               `json:"state_version"`
+	Tasks        map[string]task.Task `json:"tasks"`
+}
+
 type Store struct {
 	mu     sync.RWMutex
 	state  State
 	parent map[string]string // childID -> parentID; absent => root
-	path   string
+	db     *bolt.DB
+	id     UserID
 	now    func() int64
 	newID  func() string
 }
 
 func defaultNewID() string { return ulid.Make().String() }
 
-func NewStore(path string) (*Store, error) {
+// newStore loads one user's blob out of the shared bbolt file. It must never be
+// called from inside a bbolt transaction: load opens its own View, and bbolt
+// deadlocks on a nested transaction.
+func newStore(db *bolt.DB, id UserID) (*Store, error) {
 	st := &Store{
-		path:  path,
+		db:    db,
+		id:    id,
 		now:   func() int64 { return time.Now().Unix() },
 		newID: defaultNewID,
 	}
@@ -56,70 +72,51 @@ func NewStore(path string) (*Store, error) {
 }
 
 func (st *Store) load() error {
-	b, err := os.ReadFile(st.path)
-	if errors.Is(err, os.ErrNotExist) {
-		st.state = State{
-			DataFormatVersion: CurrentDataFormatVersion,
-			StateVersion:      0,
-			Tasks:             map[string]task.Task{},
+	var blob userBlob
+	err := st.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket([]byte(bucketData)).Get(st.id[:])
+		if raw == nil {
+			return fmt.Errorf("no data for user %s", st.id)
 		}
-		st.rebuildIndex()
-		return st.saveState(st.state)
-	}
+		// Unmarshalled INSIDE the transaction: raw is only valid for its lifetime.
+		return json.Unmarshal(raw, &blob)
+	})
 	if err != nil {
 		return err
 	}
-	var s State
-	if err := json.Unmarshal(b, &s); err != nil {
+	if blob.Tasks == nil {
+		blob.Tasks = map[string]task.Task{}
+	}
+	st.state = State{
+		// Hardcoded rather than read back: OpenTenants already refused anything
+		// above the current version and there is no v0. If a v2 ever exists, this
+		// is the line that must learn to carry the file's actual value.
+		DataFormatVersion: CurrentDataFormatVersion,
+		StateVersion:      blob.StateVersion,
+		Tasks:             blob.Tasks,
+	}
+	if err := validateState(st.state); err != nil {
 		return err
 	}
-	if s.Tasks == nil {
-		s.Tasks = map[string]task.Task{}
-	}
-	// Absent (or 0) means a file written before the field existed; v1 is the only
-	// shape that has ever existed, so adopt it and stamp on the next write.
-	if s.DataFormatVersion == 0 {
-		s.DataFormatVersion = 1
-	}
-	if s.DataFormatVersion > CurrentDataFormatVersion {
-		return fmt.Errorf(
-			"data file %s has data_format_version %d, but this binary supports at most %d — upgrade seshat",
-			st.path, s.DataFormatVersion, CurrentDataFormatVersion)
-	}
-	if err := validateState(s); err != nil {
-		return err
-	}
-	st.state = s
 	st.rebuildIndex()
 	return nil
 }
 
-// saveState writes the given state atomically: temp file -> fsync -> rename.
-// Callers persist a candidate state BEFORE committing it to st.state, so a save
-// failure leaves the in-memory state untouched (no memory/disk divergence).
+// saveState persists the candidate state into this user's blob. Callers persist a
+// candidate BEFORE committing it to st.state, so a save failure leaves the
+// in-memory state untouched (no memory/disk divergence).
 func (st *Store) saveState(s State) error {
-	b, err := json.MarshalIndent(s, "", "  ")
+	b, err := json.Marshal(userBlob{StateVersion: s.StateVersion, Tasks: s.Tasks})
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".seshat-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once renamed
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, st.path)
+	return st.db.Update(func(tx *bolt.Tx) error {
+		data := tx.Bucket([]byte(bucketData))
+		if data.Get(st.id[:]) == nil {
+			return ErrUserDeleted
+		}
+		return data.Put(st.id[:], b)
+	})
 }
 
 func (st *Store) rebuildIndex() {

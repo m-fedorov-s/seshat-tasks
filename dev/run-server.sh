@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build and run the seshat dev server in the foreground (Ctrl-C to stop).
-# Data is stored in dev/seshat-dev-data.json (gitignored).
+# Data is stored in dev/seshat-dev.db (gitignored).
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 (cd server && go build -o seshat .)

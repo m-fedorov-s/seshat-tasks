@@ -1,13 +1,22 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
+	"sort"
 	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
+
+	"seshat/internal/task"
 )
 
 // Bucket names and the meta key holding the on-disk format generation. One bbolt
@@ -26,8 +35,81 @@ const (
 // hangs forever.
 const openTimeout = 1 * time.Second
 
-// UserID keys the data bucket. Bare for now; Task 3 adds hex text encoding and helpers.
+// UserID keys the data bucket. Rendered and parsed as 32 lowercase hex chars.
 type UserID [16]byte
+
+// String renders the id as 32 lowercase hex characters.
+func (id UserID) String() string { return hex.EncodeToString(id[:]) }
+
+// IsZero reports the all-zero id, which is never minted and therefore doubles as
+// the corruption sentinel for a user record.
+func (id UserID) IsZero() bool { return id == UserID{} }
+
+func (id UserID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
+
+func (id *UserID) UnmarshalText(b []byte) error {
+	v, err := parseUserID(string(b))
+	if err != nil {
+		return err
+	}
+	*id = v
+	return nil
+}
+
+// parseUserID decodes the 32-hex-char form written by String.
+func parseUserID(s string) (UserID, error) {
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		return UserID{}, fmt.Errorf("malformed user id %q: %w", s, err)
+	}
+	if len(raw) != 16 {
+		return UserID{}, fmt.Errorf("malformed user id %q: want 16 bytes, got %d", s, len(raw))
+	}
+	var id UserID
+	copy(id[:], raw)
+	return id, nil
+}
+
+// User is the value stored under a token hash in the users bucket.
+//
+// Every field must have a safe zero value: adding one later must load old records
+// unchanged (spec §4.1). Unknown fields in a stored record are ignored on read
+// (encoding/json default) — that is the forward-compatibility half.
+type User struct {
+	ID UserID `json:"id"`
+}
+
+// ErrUserNotFound wraps the task-domain sentinel on purpose, so a handler mapping
+// ErrNotFound to 404 covers it unchanged. The text here is for logs and tests.
+var ErrUserNotFound = fmt.Errorf("user not found: %w", ErrNotFound)
+
+// tokenHash is what the users bucket is keyed by: the raw token never touches disk.
+func tokenHash(token string) [32]byte { return sha256.Sum256([]byte(token)) }
+
+// newLimiter builds a per-tenant limiter with the same numbers NewServer uses.
+func newLimiter(rps int) *rate.Limiter { return rate.NewLimiter(rate.Limit(rps), 2*rps) }
+
+// mintToken returns 32 random bytes as 64 hex characters.
+func mintToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("mint token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// mintID returns a random non-zero UserID (zero is the corruption sentinel).
+func mintID() (UserID, error) {
+	for {
+		var id UserID
+		if _, err := rand.Read(id[:]); err != nil {
+			return UserID{}, fmt.Errorf("mint user id: %w", err)
+		}
+		if !id.IsZero() {
+			return id, nil
+		}
+	}
+}
 
 // tenant is one registered user as held in memory. Declared in full now; Task 3
 // populates it.
@@ -39,6 +121,16 @@ type tenant struct {
 }
 
 // Tenants owns the single bbolt file backing every user's tasks.
+//
+// Lock order: the only two orders are Tenants.mu -> bbolt (Create, Delete) and
+// Store.mu -> bbolt (saveState). Nothing takes Tenants.mu inside a bbolt
+// transaction or inside a Store method, and load/rebuildIndex run before a Store
+// is published — so there is no cycle.
+//
+// Known cost, not a bug: Create/Delete hold the write lock across a bbolt commit
+// (two fdatasync), and Go's RWMutex blocks new readers while a writer waits, so a
+// user create stalls in-flight Authenticate calls for the length of one commit.
+// Acceptable at this scale.
 type Tenants struct {
 	db     *bolt.DB
 	rps    int
@@ -71,9 +163,9 @@ func OpenTenants(path string, rps int) (*Tenants, error) {
 }
 
 // init creates the bucket layout on a fresh file and validates it on an existing
-// one. Task 3 appends a call to load every registered user at the end.
+// one, then loads every registered user into memory.
 func (t *Tenants) init() error {
-	return t.db.Update(func(tx *bolt.Tx) error {
+	if err := t.db.Update(func(tx *bolt.Tx) error {
 		meta := tx.Bucket([]byte(bucketMeta))
 		if meta == nil {
 			// Fresh file. bbolt's Open has already written its own pages, so
@@ -114,7 +206,184 @@ func (t *Tenants) init() error {
 			return err
 		}
 		return nil
+	}); err != nil {
+		return err
+	}
+	return t.loadUsers()
+}
+
+// loadUsers rebuilds the in-memory registry from the file, refusing any shape the
+// code could not have written. Called once, from init, before Tenants is published.
+func (t *Tenants) loadUsers() error {
+	seen := map[UserID]bool{}
+	err := t.db.View(func(tx *bolt.Tx) error {
+		users := tx.Bucket([]byte(bucketUsers))
+		data := tx.Bucket([]byte(bucketData))
+		if err := users.ForEach(func(k, v []byte) error {
+			if len(k) != 32 {
+				return fmt.Errorf("data file %s is corrupt: users key of length %d", t.db.Path(), len(k))
+			}
+			var u User
+			if err := json.Unmarshal(v, &u); err != nil || u.ID.IsZero() {
+				return fmt.Errorf("data file %s is corrupt: bad user record", t.db.Path())
+			}
+			if seen[u.ID] {
+				return fmt.Errorf("data file %s is corrupt: two users share id %s", t.db.Path(), u.ID)
+			}
+			if data.Get(u.ID[:]) == nil {
+				return fmt.Errorf("data file %s is corrupt: user %s has no data", t.db.Path(), u.ID)
+			}
+			tn := &tenant{id: u.ID, limiter: newLimiter(t.rps)}
+			copy(tn.hash[:], k) // COPY: k is only valid for the tx's lifetime
+			t.byHash[tn.hash] = tn
+			t.byID[u.ID] = tn
+			seen[u.ID] = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		return data.ForEach(func(k, _ []byte) error {
+			if len(k) != 16 {
+				return fmt.Errorf("data file %s is corrupt: data key of length %d", t.db.Path(), len(k))
+			}
+			var id UserID
+			copy(id[:], k)
+			if !seen[id] {
+				return fmt.Errorf("data file %s is corrupt: data for unknown user %s", t.db.Path(), id)
+			}
+			return nil
+		})
 	})
+	if err != nil {
+		return err
+	}
+	// OUTSIDE the View: newStore opens its own View, and bbolt deadlocks on a
+	// nested transaction. Keep every store opened outside any transaction.
+	//
+	// Eager rather than lazy: a corrupt blob fails boot loudly instead of 500ing
+	// one user much later (spec §4.4).
+	for id, tn := range t.byID {
+		st, err := newStore(t.db, id)
+		if err != nil {
+			return fmt.Errorf("user %s: %w", id, err)
+		}
+		tn.store = st
+	}
+	return nil
+}
+
+// Create registers a new user and returns its freshly minted token, which is the
+// only time the token exists in plaintext.
+func (t *Tenants) Create() (string, UserID, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tok, err := mintToken()
+	if err != nil {
+		return "", UserID{}, err
+	}
+	id, err := mintID()
+	if err != nil {
+		return "", UserID{}, err
+	}
+	h := tokenHash(tok)
+	empty, err := json.Marshal(userBlob{StateVersion: 0, Tasks: map[string]task.Task{}})
+	if err != nil {
+		return "", UserID{}, err
+	}
+	rec, err := json.Marshal(User{ID: id})
+	if err != nil {
+		return "", UserID{}, err
+	}
+
+	// One transaction for both entries: a crash between them would leave a
+	// users-record-without-data that loadUsers refuses. Nothing is registered in
+	// memory unless the transaction committed.
+	if err := t.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket([]byte(bucketUsers)).Put(h[:], rec); err != nil {
+			return err
+		}
+		return tx.Bucket([]byte(bucketData)).Put(id[:], empty)
+	}); err != nil {
+		return "", UserID{}, err
+	}
+
+	st, err := newStore(t.db, id) // cannot fail on the blob just written
+	if err != nil {
+		return "", UserID{}, err
+	}
+	tn := &tenant{id: id, hash: h, store: st, limiter: newLimiter(t.rps)}
+	t.byHash[h] = tn
+	t.byID[id] = tn
+	return tok, id, nil
+}
+
+// Authenticate resolves a plaintext token to its tenant.
+func (t *Tenants) Authenticate(token string) (*tenant, bool) {
+	h := tokenHash(token)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	tn, ok := t.byHash[h]
+	return tn, ok
+}
+
+// Delete removes a user's record and data.
+func (t *Tenants) Delete(id UserID) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tn, ok := t.byID[id]
+	if !ok {
+		return ErrUserNotFound
+	}
+	if err := t.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket([]byte(bucketUsers)).Delete(tn.hash[:]); err != nil {
+			return err
+		}
+		return tx.Bucket([]byte(bucketData)).Delete(id[:])
+	}); err != nil {
+		return err
+	}
+	delete(t.byHash, tn.hash)
+	delete(t.byID, id)
+	// The Store may still be referenced by an in-flight request; its next saveState
+	// sees data[id] == nil and returns ErrUserDeleted. That one request is allowed
+	// to fail (spec §4.4). The limiter dies with the tenant.
+	return nil
+}
+
+// List returns every registered user id, sorted byte-wise.
+func (t *Tenants) List() []UserID {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]UserID, 0, len(t.byID))
+	for id := range t.byID {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return bytes.Compare(ids[i][:], ids[j][:]) < 0 })
+	return ids
+}
+
+// bootstrapSingle is PLAN A ONLY: it lets the unchanged single-secret HTTP layer
+// run on top of the multi-user store. Plan B replaces it with Authenticate-per-
+// request plus an admin API, and deletes this function. Single-threaded at
+// startup, so reading byID after List() is safe.
+func (t *Tenants) bootstrapSingle() (*Store, error) {
+	ids := t.List()
+	switch len(ids) {
+	case 0:
+		_, id, err := t.Create()
+		if err != nil {
+			return nil, err
+		}
+		// The token is deliberately not logged; nothing consumes it yet.
+		log.Printf("bootstrap: created single user %s", id)
+		return t.byID[id].store, nil
+	case 1:
+		return t.byID[ids[0]].store, nil
+	default:
+		return nil, fmt.Errorf("data file has %d users; Plan A runs single-user", len(ids))
+	}
 }
 
 // Close releases the underlying bbolt file and its flock.

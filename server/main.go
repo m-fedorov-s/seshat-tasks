@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -127,9 +129,19 @@ func main() {
 	}
 	cfg.RateLimit = rateLimit
 
-	store, err := NewStore(cfg.DataFile)
+	tenants, err := OpenTenants(cfg.DataFile, cfg.RateLimit)
+	if errors.Is(err, bolt.ErrInvalid) {
+		log.Fatalf("%s is not a bbolt file — Stage 2 changed the storage format; "+
+			"load your tasks into a fresh file with test/seed", cfg.DataFile)
+	}
 	if err != nil {
-		log.Fatalf("load store: %v", err)
+		log.Fatalf("open data file: %v", err)
+	}
+	// No defer tenants.Close(): every exit below is log.Fatal -> os.Exit, which
+	// skips defers anyway. bbolt commits are durable, so nothing acknowledged is lost.
+	store, err := tenants.bootstrapSingle()
+	if err != nil {
+		log.Fatalf("bootstrap: %v", err)
 	}
 	srv := NewServer(store, cfg.Secret, cfg.RateLimit)
 

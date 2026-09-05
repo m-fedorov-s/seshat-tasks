@@ -2,7 +2,7 @@
 
 Throwaway configs + scripts to run the seshat **server + client** locally and eyeball the
 `show` rendering. The dev secret is `devsecret` and the server listens on `localhost:8799`.
-(The generated data file `dev/seshat-dev-data.json` is gitignored.)
+(The generated data file `dev/seshat-dev.db` is gitignored.)
 
 ## One-time prerequisites
 - Go (for the server), Zig 0.16 (for the client), and `jq` (for the seed script).
@@ -48,8 +48,8 @@ cat -v out.txt   # reveal the raw ANSI escape bytes
 - `../test/broken-pipe.sh` — integration test: piped output must exit 0 (`make client-integration-test`).
 
 ## Reset
-```sh
-rm -f dev/seshat-dev-data.json dev/.seshat-*.tmp   # wipe dev data, then re-seed
-```
+Stop the server, `rm dev/seshat-dev.db`, start it again and re-seed. Do not delete
+`dev/seshat-dev-data.json` — that is the pre-Stage-2 dataset, and it can be loaded into a
+running dev server with `go run ./test/seed -token devsecret dev/seshat-dev-data.json`.
 
 Also available as `make dev-server` and `make dev-seed`.

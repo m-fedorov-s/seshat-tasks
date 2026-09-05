@@ -3,4 +3,5 @@
 secret: devsecret
 bind: 127.0.0.1
 port: 8799
-data_file: dev/seshat-dev-data.json
+data_file: dev/seshat-dev.db
+rate_limit: 100     # the dev dataset is 19 adds; the default 10 r/s (burst 20) leaves one request to spare

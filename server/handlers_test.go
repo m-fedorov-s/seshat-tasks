@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,10 +14,7 @@ import (
 
 func newTestServer(t *testing.T) (*Server, *Store) {
 	t.Helper()
-	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := newTestStore(t)
 	return NewServer(st, "s3cr3t", defaultRateLimit), st
 }
 
@@ -200,10 +196,7 @@ func TestNewServerLimiterConfiguration(t *testing.T) {
 // The threshold is configurable, so verify the value is actually plumbed through
 // rather than hardcoded.
 func TestNewServerHonoursConfiguredRate(t *testing.T) {
-	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := newTestStore(t)
 	srv := NewServer(st, "s3cr3t", 50)
 	if got := srv.limiter.Limit(); got != 50 {
 		t.Errorf("limiter rate = %v, want 50", got)

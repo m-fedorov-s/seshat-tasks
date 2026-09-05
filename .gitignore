@@ -8,6 +8,7 @@ server/seshat-data.json
 seshat-data.json
 .seshat-*.tmp
 dev/seshat-dev-data.json
+dev/seshat-dev.db
 dev/.seshat-*.tmp
 
 # Local config (contains the shared secret)

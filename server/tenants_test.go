@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"seshat/internal/task"
 )
 
 // openTestTenants opens a Tenants over a fresh temp file, registering a cleanup
@@ -142,5 +148,611 @@ func TestSecondOpenOfSamePathTimesOut(t *testing.T) {
 	// sides. The point is that the Timeout option is set at all.
 	if elapsed < 500*time.Millisecond || elapsed > 5*time.Second {
 		t.Fatalf("second open took %v; want the 1s Timeout option to bound it", elapsed)
+	}
+}
+
+func TestUserIDHexRoundTrip(t *testing.T) {
+	id := UserID{0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	const want = "deadbeef000000000000000000000001"
+	if got := id.String(); got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+
+	b, err := json.Marshal(User{ID: id})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if got := string(b); got != `{"id":"`+want+`"}` {
+		t.Fatalf("Marshal = %s", got)
+	}
+	var u User
+	if err := json.Unmarshal(b, &u); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if u.ID != id {
+		t.Fatalf("round trip = %s, want %s", u.ID, id)
+	}
+
+	if _, err := parseUserID("zz"); err == nil {
+		t.Fatal("parseUserID(\"zz\"): want an error, got nil")
+	}
+	if _, err := parseUserID(strings.Repeat("a", 31)); err == nil {
+		t.Fatal("parseUserID(odd length): want an error, got nil")
+	}
+	if _, err := parseUserID(strings.Repeat("a", 30)); err == nil {
+		t.Fatal("parseUserID(15 bytes): want an error, got nil")
+	}
+
+	if !(UserID{}).IsZero() {
+		t.Fatal("zero UserID must report IsZero")
+	}
+	if id.IsZero() {
+		t.Fatal("non-zero UserID must not report IsZero")
+	}
+}
+
+func TestCreateThenAuthenticate(t *testing.T) {
+	tn := openTestTenants(t)
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(tok) != 64 {
+		t.Fatalf("token length = %d, want 64", len(tok))
+	}
+	if strings.Trim(tok, "0123456789abcdef") != "" {
+		t.Fatalf("token %q is not lowercase hex", tok)
+	}
+	if id.IsZero() {
+		t.Fatal("Create returned a zero id")
+	}
+
+	tenant, ok := tn.Authenticate(tok)
+	if !ok {
+		t.Fatal("Authenticate(tok): not ok")
+	}
+	if tenant.id != id {
+		t.Fatalf("tenant.id = %s, want %s", tenant.id, id)
+	}
+	if tenant.store == nil || tenant.limiter == nil {
+		t.Fatalf("tenant not fully populated: %+v", tenant)
+	}
+	if got := tenant.store.Snapshot().StateVersion; got != 0 {
+		t.Fatalf("fresh store state_version = %d, want 0", got)
+	}
+}
+
+func TestAuthenticateRejects(t *testing.T) {
+	tn := openTestTenants(t)
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, bad := range []string{"", "wrong", tok + "0"} {
+		if _, ok := tn.Authenticate(bad); ok {
+			t.Fatalf("Authenticate(%q): want !ok", bad)
+		}
+	}
+	if err := tn.Delete(id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := tn.Authenticate(tok); ok {
+		t.Fatal("Authenticate after Delete: want !ok")
+	}
+}
+
+func TestCreateWritesUserAndDataEntries(t *testing.T) {
+	tn := openTestTenants(t)
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	h := tokenHash(tok)
+	if err := tn.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket([]byte(bucketUsers)).Get(h[:])
+		if raw == nil {
+			t.Fatal("no users record for the minted token hash")
+		}
+		var u User
+		if err := json.Unmarshal(raw, &u); err != nil {
+			t.Fatalf("user record is not JSON: %v", err)
+		}
+		if u.ID != id {
+			t.Fatalf("record id = %s, want %s", u.ID, id)
+		}
+		if tx.Bucket([]byte(bucketData)).Get(id[:]) == nil {
+			t.Fatal("no data blob for the new user")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+func TestDeleteRemovesRecordAndData(t *testing.T) {
+	tn := openTestTenants(t)
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	h := tokenHash(tok)
+	tenant, ok := tn.Authenticate(tok)
+	if !ok {
+		t.Fatal("Authenticate: not ok")
+	}
+	if _, _, err := tenant.store.Add(task.AddRequest{Content: validContent("x")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if err := tn.Delete(id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := tn.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(bucketUsers)).Get(h[:]) != nil {
+			t.Fatal("users record survived Delete")
+		}
+		if tx.Bucket([]byte(bucketData)).Get(id[:]) != nil {
+			t.Fatal("data blob survived Delete")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	err = tn.Delete(id)
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("second Delete: got %v, want ErrUserNotFound", err)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second Delete: %v must wrap ErrNotFound so writeErr maps it to 404", err)
+	}
+	if got := tn.List(); len(got) != 0 {
+		t.Fatalf("List after Delete = %v, want empty", got)
+	}
+}
+
+func TestListIsSorted(t *testing.T) {
+	tn := openTestTenants(t)
+	want := map[UserID]bool{}
+	for i := 0; i < 5; i++ {
+		_, id, err := tn.Create()
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		want[id] = true
+	}
+
+	got := tn.List()
+	if len(got) != 5 {
+		t.Fatalf("List returned %d ids, want 5", len(got))
+	}
+	if !sort.SliceIsSorted(got, func(i, j int) bool { return bytes.Compare(got[i][:], got[j][:]) < 0 }) {
+		t.Fatalf("List is not sorted: %v", got)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Fatalf("List returned unknown id %s", id)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatalf("List omitted %d ids", len(want))
+	}
+}
+
+func TestTwoUsersHaveIndependentBlobs(t *testing.T) {
+	tn := openTestTenants(t)
+	tokA, _, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	tokB, _, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+	a, _ := tn.Authenticate(tokA)
+	b, _ := tn.Authenticate(tokB)
+
+	if _, _, err := a.store.Add(task.AddRequest{Content: validContent("only-a")}); err != nil {
+		t.Fatalf("A Add: %v", err)
+	}
+	snapB := b.store.Snapshot()
+	if len(snapB.Tasks) != 0 || snapB.StateVersion != 0 {
+		t.Fatalf("A's write leaked into B: %+v", snapB)
+	}
+	if _, _, err := b.store.Add(task.AddRequest{Content: validContent("only-b")}); err != nil {
+		t.Fatalf("B Add: %v", err)
+	}
+	if got := a.store.Snapshot().StateVersion; got != 1 {
+		t.Fatalf("B's write leaked into A: A state_version = %d, want 1", got)
+	}
+
+	path := tn.db.Path()
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+
+	a2, ok := tn2.Authenticate(tokA)
+	if !ok {
+		t.Fatal("A does not authenticate after reopen")
+	}
+	b2, ok := tn2.Authenticate(tokB)
+	if !ok {
+		t.Fatal("B does not authenticate after reopen")
+	}
+	assertOnlyTask(t, a2.store, "only-a")
+	assertOnlyTask(t, b2.store, "only-b")
+}
+
+// assertOnlyTask fails unless st holds exactly one task, with the given title.
+func assertOnlyTask(t *testing.T, st *Store, title string) {
+	t.Helper()
+	snap := st.Snapshot()
+	if len(snap.Tasks) != 1 {
+		t.Fatalf("want exactly 1 task, got %d", len(snap.Tasks))
+	}
+	for _, tk := range snap.Tasks {
+		if tk.Content.Title != title {
+			t.Fatalf("task title = %q, want %q", tk.Content.Title, title)
+		}
+	}
+}
+
+func TestPersistenceRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seshat.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	st := tn.byID[id].store
+	var n int
+	st.now = func() int64 { return 1000 }
+	st.newID = func() string { n++; return "id" + string(rune('0'+n)) }
+
+	parent, _, err := st.Add(task.AddRequest{Content: validContent("p")})
+	if err != nil {
+		t.Fatalf("Add parent: %v", err)
+	}
+	if _, _, err := st.Add(task.AddRequest{Content: validContent("c"), ParentID: &parent.ID}); err != nil {
+		t.Fatalf("Add child: %v", err)
+	}
+	done := validContent("p")
+	done.Status = task.StatusDone
+	done.ChildIDs = st.Snapshot().Tasks[parent.ID].Content.ChildIDs
+	if _, _, err := st.Update([]task.UpdateOp{{ID: parent.ID, ExpectedVersion: 2, Content: done}}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	want := st.Snapshot()
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+	tenant2, ok := tn2.Authenticate(tok)
+	if !ok {
+		t.Fatal("token does not authenticate after reopen")
+	}
+	if got := tenant2.store.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip lost state:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestOpenRefusesUserWithoutData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	_, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketData)).Delete(id[:])
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning corrupt", err)
+	}
+
+	// The failed open must have released the flock.
+	db2 := reopenRaw(t, path)
+	if err := db2.Close(); err != nil {
+		t.Fatalf("db2.Close: %v", err)
+	}
+}
+
+func TestOpenRefusesDataWithoutUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	tok, _, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	h := tokenHash(tok)
+
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketUsers)).Delete(h[:])
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning corrupt", err)
+	}
+}
+
+func TestOpenRefusesMalformedUserRecord(t *testing.T) {
+	for _, bad := range []string{
+		`not json`,
+		`{"id":"00000000000000000000000000000000"}`, // zero id is the corruption sentinel
+		`{"id":"zz"}`,
+	} {
+		t.Run(bad, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "x.db")
+			tn, err := OpenTenants(path, defaultRateLimit)
+			if err != nil {
+				t.Fatalf("OpenTenants: %v", err)
+			}
+			tok, _, err := tn.Create()
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if err := tn.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			h := tokenHash(tok)
+			db := reopenRaw(t, path)
+			if err := db.Update(func(tx *bolt.Tx) error {
+				return tx.Bucket([]byte(bucketUsers)).Put(h[:], []byte(bad))
+			}); err != nil {
+				t.Fatalf("corrupting update: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("db.Close: %v", err)
+			}
+
+			if _, err := OpenTenants(path, defaultRateLimit); err == nil {
+				t.Fatalf("OpenTenants accepted a malformed user record %q", bad)
+			}
+		})
+	}
+}
+
+func TestOpenRefusesTwoUsersSharingAnID(t *testing.T) {
+	// The code never writes this shape; it is corruption.
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	_, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rec, err := json.Marshal(User{ID: id})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	other := tokenHash("other")
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketUsers)).Put(other[:], rec)
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning corrupt", err)
+	}
+}
+
+func TestUserRecordWithUnknownFieldLoads(t *testing.T) {
+	// Forward compatibility (spec §4.1): an unknown field must not fail the load.
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	h := tokenHash(tok)
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketUsers)).Put(h[:], []byte(`{"id":"`+id.String()+`","quota":123}`))
+	}); err != nil {
+		t.Fatalf("rewriting record: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+	if _, ok := tn2.Authenticate(tok); !ok {
+		t.Fatal("a record with an unknown field must still authenticate")
+	}
+}
+
+func TestConcurrentCreatesAreDistinct(t *testing.T) {
+	// Under -race this also observes the byHash/byID writes under Tenants.mu.
+	tn := openTestTenants(t)
+	const n = 32
+	type made struct {
+		tok string
+		id  UserID
+	}
+	ch := make(chan made, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			tok, id, err := tn.Create()
+			if err != nil {
+				errs <- err
+				return
+			}
+			ch <- made{tok, id}
+		}()
+	}
+
+	toks := map[string]bool{}
+	ids := map[UserID]bool{}
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			t.Fatalf("Create: %v", err)
+		case m := <-ch:
+			if toks[m.tok] {
+				t.Fatalf("duplicate token %s", m.tok)
+			}
+			if ids[m.id] {
+				t.Fatalf("duplicate id %s", m.id)
+			}
+			toks[m.tok] = true
+			ids[m.id] = true
+		}
+	}
+	for tok := range toks {
+		if _, ok := tn.Authenticate(tok); !ok {
+			t.Fatalf("token %s does not authenticate", tok)
+		}
+	}
+	if got := len(tn.List()); got != n {
+		t.Fatalf("List returned %d ids, want %d", got, n)
+	}
+}
+
+func TestDeleteRacingWritesNeverPanics(t *testing.T) {
+	// A deadlock/panic smoke test, not a data-race test: the two goroutines share
+	// no unguarded memory. What it pins is that Tenants.mu and Store.mu are never
+	// nested, so a Delete during a burst of writes cannot deadlock.
+	tn := openTestTenants(t)
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tenant, ok := tn.Authenticate(tok)
+	if !ok {
+		t.Fatal("Authenticate: not ok")
+	}
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			if i == 1 {
+				close(started) // Delete only after a real Add has committed
+			}
+			// ErrUserDeleted is expected once Delete lands; a panic is not.
+			tenant.store.Add(task.AddRequest{Content: validContent("x")})
+		}
+	}()
+
+	<-started
+	if err := tn.Delete(id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	<-done
+}
+
+func TestBootstrapSingleCreatesThenReuses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	st1, err := tn.bootstrapSingle()
+	if err != nil {
+		t.Fatalf("bootstrapSingle: %v", err)
+	}
+	if got := len(tn.List()); got != 1 {
+		t.Fatalf("after bootstrap List has %d users, want 1", got)
+	}
+	if _, _, err := st1.Add(task.AddRequest{Content: validContent("kept")}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+	st2, err := tn2.bootstrapSingle()
+	if err != nil {
+		t.Fatalf("second bootstrapSingle: %v", err)
+	}
+	if got := len(tn2.List()); got != 1 {
+		t.Fatalf("second bootstrap created a user: List has %d, want 1", got)
+	}
+	assertOnlyTask(t, st2, "kept")
+}
+
+func TestBootstrapSingleRefusesTwoUsers(t *testing.T) {
+	tn := openTestTenants(t)
+	if _, _, err := tn.Create(); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, _, err := tn.Create(); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := tn.bootstrapSingle(); err == nil {
+		t.Fatal("bootstrapSingle accepted a two-user file")
 	}
 }
