@@ -201,6 +201,13 @@ func (t *Tenants) init() error {
 			return fmt.Errorf("data file %s: meta bucket has no format_version (corrupt)", t.db.Path())
 		}
 		v := fromBE64(raw)
+		if v == 0 {
+			// A real file, written by init above, always writes CurrentDataFormatVersion
+			// (>= 1) on first creation. A stored 0 cannot have come from this code path
+			// — it is corruption (a zeroed/truncated write), not a legitimate old
+			// generation, so it must not be treated as "no format check needed".
+			return fmt.Errorf("data file %s: format_version 0 (corrupt)", t.db.Path())
+		}
 		if v > CurrentDataFormatVersion {
 			return fmt.Errorf(
 				"data file %s has data_format_version %d, but this binary supports at most %d — upgrade seshat",

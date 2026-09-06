@@ -14,7 +14,7 @@ command -v jq >/dev/null || { echo "this script needs 'jq'"; exit 1; }
 if [ -f "$root/dev/.user-id" ]; then
   curl -sS -H "Authorization: $ADMIN" -d "{\"id\":\"$(cat "$root/dev/.user-id")\"}" "$URL/api/admin/users/delete" >/dev/null || true   # 404 on a reset db is fine
 fi
-created=$(curl -fsS -H "Authorization: $ADMIN" "$URL/api/admin/users/add")
+created=$(curl -fsS -X POST -H "Authorization: $ADMIN" "$URL/api/admin/users/add")
 TOKEN=$(jq -r .token <<<"$created"); jq -r .id <<<"$created" > "$root/dev/.user-id"
 printf '{\n  "url": "%s",\n  "secret": "%s"\n}\n' "$URL" "$TOKEN" > "$root/dev/client.json"
 echo "dev user $(cat "$root/dev/.user-id") created; token written to dev/client.json"

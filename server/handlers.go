@@ -102,6 +102,7 @@ func (s *Server) tenantBranch() http.Handler {
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	if v != nil {
 		json.NewEncoder(w).Encode(v)
@@ -149,6 +150,7 @@ func handleGet(w http.ResponseWriter, r *http.Request, st *Store) {
 	// Per RFC 9110 a 304 must also carry the ETag, so set it before branching.
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}

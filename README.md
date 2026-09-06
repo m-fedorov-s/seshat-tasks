@@ -39,8 +39,10 @@ cd client/zig && zig build && cd ../..     # needs Zig 0.16
 admin_token: <at least 32 characters — openssl rand -hex 32>
 bind: 127.0.0.1        # default; only change if you know you want to
 port: 8799
-data_file: ~/.local/share/seshat/seshat.db
+data_file: /var/lib/seshat/seshat.db
 ```
+
+(the directory must exist; `~` is not expanded)
 
 **3. Configure the client** (`~/.config/seshat/config.json`, or point `SESHAT_CONFIG` at one):
 
@@ -71,7 +73,7 @@ With the server running, create a user:
 > **Users and the admin API.** The server knows a user as a token; there are no usernames.
 > Create one:
 > ```sh
-> curl -sS -H "Authorization: $ADMIN_TOKEN" http://127.0.0.1:8799/api/admin/users/add
+> curl -sS -X POST -H "Authorization: $ADMIN_TOKEN" http://127.0.0.1:8799/api/admin/users/add
 > ```
 > Hand the returned `token` to the user (it goes into their client config as `secret`) and
 > forget it — the server stores only a hash, and **a lost token is lost data**: there is no

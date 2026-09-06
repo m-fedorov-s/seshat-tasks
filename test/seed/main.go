@@ -34,9 +34,66 @@ type addResponse struct {
 	Task         task.Task `json:"task"`
 }
 
+// retryDelay/maxRetries bound how long postAdd waits out a 429 before giving up:
+// a fixed 150ms backoff, up to 200 attempts (~30s). The default rate_limit (10
+// req/s, burst 20) means any seed of more than 20 tasks trips the limiter at
+// least once; retrying the SAME add keeps the tool idempotent instead of dying
+// with a half-seeded account.
+const (
+	retryDelay = 150 * time.Millisecond
+	maxRetries = 200
+)
+
 func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// postAdd posts one add request to url+"/api/tasks/add", retrying the SAME
+// request on a 429 with a fixed backoff. Any other non-200 status is returned
+// immediately as an error. Prints nothing itself, on a retry or otherwise, so
+// the tool's stdout/stderr stay pristine except for die's final message.
+func postAdd(client *http.Client, url, token string, req task.AddRequest) (task.Task, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("marshal: %w", err)
+	}
+
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequest(http.MethodPost, url+"/api/tasks/add", bytes.NewReader(body))
+		if err != nil {
+			return task.Task{}, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Authorization", token)
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return task.Task{}, fmt.Errorf("do request: %w", err)
+		}
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if attempt >= maxRetries {
+				return task.Task{}, fmt.Errorf("still rate limited after %d attempts: %s", attempt+1, string(respBody))
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return task.Task{}, fmt.Errorf("%d %s", resp.StatusCode, string(respBody))
+		}
+		if readErr != nil {
+			return task.Task{}, fmt.Errorf("read response: %w", readErr)
+		}
+
+		var decoded addResponse
+		if err := json.Unmarshal(respBody, &decoded); err != nil {
+			return task.Task{}, fmt.Errorf("decode response: %w", err)
+		}
+		return decoded.Task, nil
+	}
 }
 
 func main() {
@@ -104,36 +161,11 @@ func main() {
 		}
 		// No Position: appending preserves the child_ids order from the legacy file.
 
-		body, err := json.Marshal(req)
-		if err != nil {
-			die("marshal %s: %v", old, err)
-		}
-
-		httpReq, err := http.NewRequest(http.MethodPost, *url+"/api/tasks/add", bytes.NewReader(body))
-		if err != nil {
-			die("build request for %s: %v", old, err)
-		}
-		httpReq.Header.Set("Authorization", *token)
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(httpReq)
+		tk, err := postAdd(client, *url, *token, req)
 		if err != nil {
 			die("add %s: %v", old, err)
 		}
-		respBody, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			die("add %s: %d %s", old, resp.StatusCode, string(respBody))
-		}
-		if readErr != nil {
-			die("read response for %s: %v", old, readErr)
-		}
-
-		var decoded addResponse
-		if err := json.Unmarshal(respBody, &decoded); err != nil {
-			die("decode response for %s: %v", old, err)
-		}
-		newID[old] = decoded.Task.ID
+		newID[old] = tk.ID
 
 		for _, c := range t.Content.ChildIDs {
 			visit(c, &old)

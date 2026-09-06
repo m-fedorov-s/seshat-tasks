@@ -262,6 +262,35 @@ func TestOpenRefusesNewerFormatVersion(t *testing.T) {
 	}
 }
 
+// TestOpenRefusesZeroFormatVersion pins F5: format_version 0 is never written by
+// this code (init always writes CurrentDataFormatVersion, >= 1), so a stored 0 is
+// corruption — not a legitimate "no version check needed" sentinel.
+func TestOpenRefusesZeroFormatVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db := reopenRaw(t, path)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketMeta)).Put([]byte(keyFormatVersion), be64(0))
+	}); err != nil {
+		t.Fatalf("corrupting update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	_, err = OpenTenants(path, defaultRateLimit)
+	if err == nil || !strings.Contains(err.Error(), "format_version") {
+		t.Fatalf("OpenTenants: got err %v, want one mentioning format_version", err)
+	}
+}
+
 func TestSecondOpenOfSamePathTimesOut(t *testing.T) {
 	// Costs ~1s on every run of the package. Deliberate: it is the only test that
 	// pins the Timeout option, and without that option a second open blocks forever.

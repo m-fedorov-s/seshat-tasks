@@ -39,9 +39,10 @@ func (s *Server) adminRateLimit(next http.Handler) http.Handler {
 // adminBranch mirrors tenantBranch: auth -> limiter -> route table, no ServeMux,
 // and a JSON 404 that is only reachable once the admin token has checked out.
 //
-// The method is not enforced, matching the task routes: the tests reach these with
-// GET and test/broken-pipe.sh probes readiness with curl. The spec's tables say
-// POST; nothing depends on it.
+// The method IS enforced here (spec's tables say POST), but only after auth and
+// the route lookup: a GET with no credential must still read as "access denied",
+// not "method not allowed" — the latter would confirm the path exists to an
+// unauthenticated caller.
 func (s *Server) adminBranch() http.Handler {
 	routes := map[string]http.HandlerFunc{
 		"/api/admin/users/add":    s.handleUserAdd,
@@ -52,6 +53,11 @@ func (s *Server) adminBranch() http.Handler {
 		h, ok := routes[r.URL.EscapedPath()] // exactly as sent, like the task branch
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		h(w, r)

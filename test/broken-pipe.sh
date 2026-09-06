@@ -57,7 +57,7 @@ pid=$!
 ready=0
 for _ in $(seq 1 50); do
   # The task path needs a user token we do not have yet, so probe the admin branch.
-  if curl -sf -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/list" -o /dev/null; then
+  if curl -sf -X POST -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/list" -o /dev/null; then
     ready=1
     break
   fi
@@ -77,7 +77,7 @@ echo "creating the integration user..."
 # Two steps, so a curl transport failure (set -e) and an empty/odd body both reach a
 # message. sed rather than jq: the script's stated prerequisites are curl, awk and seq
 # (dev/README.md); jq is only required by dev/seed.sh.
-resp=$(curl -fsS -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/add") \
+resp=$(curl -fsS -X POST -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/add") \
   || { echo "FAIL: users/add"; cat "$tmp/server.log"; exit 1; }
 token=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')
 [ -n "$token" ] || { echo "FAIL: users/add returned no token: $resp"; cat "$tmp/server.log"; exit 1; }

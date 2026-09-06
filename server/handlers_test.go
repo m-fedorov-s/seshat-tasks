@@ -100,28 +100,30 @@ func TestAuthMatrix(t *testing.T) {
 	defer log.SetOutput(prev)
 
 	cases := []struct {
-		name, path, token string
-		want              int
+		name, method, path, token string
+		want                      int
 	}{
-		{"user ok", "/api/tasks/get", alice.token, http.StatusOK},
-		{"user wrong", "/api/tasks/get", "wrong", http.StatusForbidden},
-		{"user empty", "/api/tasks/get", "", http.StatusForbidden},
-		{"user token minus a byte", "/api/tasks/get", alice.token[:len(alice.token)-1], http.StatusForbidden},
-		{"user token plus a byte", "/api/tasks/get", alice.token + "0", http.StatusForbidden},
-		{"admin token on task path", "/api/tasks/get", testAdminToken, http.StatusForbidden},
-		{"unknown task path, token", "/api/tasks/nope", alice.token, http.StatusNotFound},
-		{"unknown task path, none", "/api/tasks/nope", "", http.StatusForbidden},
-		{"root path, none", "/", "", http.StatusForbidden},
-		{"admin ok", "/api/admin/users/list", testAdminToken, http.StatusOK},
-		{"admin empty", "/api/admin/users/list", "", http.StatusForbidden},
-		{"admin minus a byte", "/api/admin/users/list", testAdminToken[:len(testAdminToken)-1], http.StatusForbidden},
-		{"admin plus a byte", "/api/admin/users/list", testAdminToken + "0", http.StatusForbidden},
-		{"user token on admin path", "/api/admin/users/list", alice.token, http.StatusForbidden},
-		{"unknown admin path, token", "/api/admin/nope", testAdminToken, http.StatusNotFound},
-		{"unknown admin path, none", "/api/admin/nope", "", http.StatusForbidden},
+		{"user ok", "GET", "/api/tasks/get", alice.token, http.StatusOK},
+		{"user wrong", "GET", "/api/tasks/get", "wrong", http.StatusForbidden},
+		{"user empty", "GET", "/api/tasks/get", "", http.StatusForbidden},
+		{"user token minus a byte", "GET", "/api/tasks/get", alice.token[:len(alice.token)-1], http.StatusForbidden},
+		{"user token plus a byte", "GET", "/api/tasks/get", alice.token + "0", http.StatusForbidden},
+		{"admin token on task path", "GET", "/api/tasks/get", testAdminToken, http.StatusForbidden},
+		{"unknown task path, token", "GET", "/api/tasks/nope", alice.token, http.StatusNotFound},
+		{"unknown task path, none", "GET", "/api/tasks/nope", "", http.StatusForbidden},
+		{"root path, none", "GET", "/", "", http.StatusForbidden},
+		// admin routes are POST-only (F2); the 403 rows below reach the auth check
+		// before the method check, so they stay GET and must still be 403.
+		{"admin ok", "POST", "/api/admin/users/list", testAdminToken, http.StatusOK},
+		{"admin empty", "GET", "/api/admin/users/list", "", http.StatusForbidden},
+		{"admin minus a byte", "GET", "/api/admin/users/list", testAdminToken[:len(testAdminToken)-1], http.StatusForbidden},
+		{"admin plus a byte", "GET", "/api/admin/users/list", testAdminToken + "0", http.StatusForbidden},
+		{"user token on admin path", "GET", "/api/admin/users/list", alice.token, http.StatusForbidden},
+		{"unknown admin path, token", "GET", "/api/admin/nope", testAdminToken, http.StatusNotFound},
+		{"unknown admin path, none", "GET", "/api/admin/nope", "", http.StatusForbidden},
 	}
 	for _, c := range cases {
-		rr := do(t, srv, "GET", c.path, c.token, "", nil)
+		rr := do(t, srv, c.method, c.path, c.token, "", nil)
 		if rr.Code != c.want {
 			t.Errorf("%s: %s with %q: got %d, want %d (%s)", c.name, c.path, c.token, rr.Code, c.want, rr.Body.String())
 			continue
@@ -170,6 +172,9 @@ func TestAdminAddListDelete(t *testing.T) {
 	rr := do(t, srv, "POST", "/api/admin/users/add", testAdminToken, "", nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("users/add: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf(`users/add Cache-Control = %q, want "no-store"`, got)
 	}
 	var added struct {
 		ID    string `json:"id"`
@@ -247,6 +252,29 @@ func isHex(s string) bool {
 	return s != "" && strings.Trim(s, "0123456789abcdef") == ""
 }
 
+// TestAdminMethodNotAllowed pins F2: an admin route rejects any method but POST,
+// but only AFTER auth — a GET with no credential must still read as 403, not 405,
+// so an unauthenticated caller learns nothing about which paths exist.
+func TestAdminMethodNotAllowed(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	rr := do(t, srv, "GET", "/api/admin/users/add", testAdminToken, "", nil)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET users/add with admin token: expected 405, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != `{"error":"method not allowed"}` {
+		t.Fatalf("405 body = %q", got)
+	}
+	if got := rr.Header().Get("Allow"); got != http.MethodPost {
+		t.Fatalf("405 Allow header = %q, want %q", got, http.MethodPost)
+	}
+
+	rr = do(t, srv, "GET", "/api/admin/users/add", "", "", nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("GET users/add with no credential: expected 403 (auth precedes method check), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestAdminDeleteErrors(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -278,6 +306,9 @@ func TestGetReturnsETag(t *testing.T) {
 	if rr.Header().Get("ETag") != `"0"` {
 		t.Fatalf(`expected ETag "0", got %q`, rr.Header().Get("ETag"))
 	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf(`Cache-Control = %q, want "no-store"`, got)
+	}
 	var resp struct {
 		StateVersion uint64      `json:"state_version"`
 		Tasks        []task.Task `json:"tasks"`
@@ -296,6 +327,9 @@ func TestGetNotModified(t *testing.T) {
 	}
 	if rr.Body.Len() != 0 {
 		t.Fatal("expected empty body on 304")
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf(`304 Cache-Control = %q, want "no-store"`, got)
 	}
 }
 
@@ -405,10 +439,10 @@ func TestAdminRateLimit(t *testing.T) {
 			t.Fatalf("unauthenticated admin request %d: expected 403, got %d", i, rr.Code)
 		}
 	}
-	if rr := do(t, srv, "GET", "/api/admin/users/list", testAdminToken, "", nil); rr.Code != http.StatusOK {
+	if rr := do(t, srv, "POST", "/api/admin/users/list", testAdminToken, "", nil); rr.Code != http.StatusOK {
 		t.Fatalf("admin request after unauthenticated flood: expected 200, got %d", rr.Code)
 	}
-	if rr := do(t, srv, "GET", "/api/admin/users/list", testAdminToken, "", nil); rr.Code != http.StatusTooManyRequests {
+	if rr := do(t, srv, "POST", "/api/admin/users/list", testAdminToken, "", nil); rr.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 once the single admin token is spent, got %d", rr.Code)
 	}
 }
