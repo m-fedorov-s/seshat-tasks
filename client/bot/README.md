@@ -6,7 +6,7 @@ inbound port** and makes only outbound HTTPS calls to `api.telegram.org`.
 ## Config
 
 `$SESHAT_BOT_CONFIG`, or `~/.config/seshat/bot.json`. Mode `0600` — it holds the
-bot token *and* every seshat token.
+bot token *and* every user's seshat token.
 
 ```json
 {
@@ -17,8 +17,14 @@ bot token *and* every seshat token.
 }
 ```
 
-`users` maps a Telegram numeric user id to that user's seshat token. Anyone not
-in this map gets no reply at all. Find your id by messaging `@userinfobot`.
+`users` maps a Telegram numeric user id to that user's seshat token — the value
+returned by the server's `/api/admin/users/add`. Anyone not in this map gets no
+reply at all. Find your id by messaging `@userinfobot`.
+
+**Privacy:** the bot holds the token, and the token is the whole account:
+whoever runs the bot can read every task, and Telegram stores every message in
+cleartext. `/start` says so. The only privacy from the bot operator is a
+separate account used from the CLI only.
 
 ## BotFather settings
 

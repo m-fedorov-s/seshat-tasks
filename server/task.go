@@ -2,11 +2,10 @@ package main
 
 import "seshat/internal/task"
 
-// CurrentDataFormatVersion is the on-disk format generation this binary writes.
-// It versions the CONTENTS of a data file, and is independent of the file LAYOUT
-// (Stage 2's one-file-per-user change is detected from config + filesystem, not
-// from this field). Distinct from State.StateVersion, which is the concurrency
-// counter / ETag.
+// CurrentDataFormatVersion is the on-disk format generation this binary writes. It lives
+// once per data file, in the bbolt `meta` bucket (see tenants.go), and versions the shape
+// of every user's blob. Distinct from State.StateVersion, which is the per-user
+// concurrency counter / ETag.
 const CurrentDataFormatVersion = 1
 
 // State is the whole server state and the on-disk JSON shape.

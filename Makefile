@@ -1,7 +1,7 @@
 .PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test
 
 server-test:
-	go test ./server/... ./internal/...
+	go test -race ./server/... ./internal/...
 
 # Local dev: run the server, and seed it with a realistic dataset (see dev/README.md).
 dev-server:

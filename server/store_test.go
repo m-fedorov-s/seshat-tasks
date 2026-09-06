@@ -1,64 +1,105 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
+
+	bolt "go.etcd.io/bbolt"
 
 	"seshat/internal/task"
 )
 
-// newTestStore returns a store backed by a temp file, with a deterministic
+// putBlob writes data[id] directly, with NO matching users record. loadUsers
+// classifies that shape as corruption on reopen, so use it ONLY in tests that
+// never reopen the file. Anything that reopens must go through tn.Create().
+func putBlob(t *testing.T, tn *Tenants, id UserID, body string) {
+	t.Helper()
+	if err := tn.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketData)).Put(id[:], []byte(body))
+	}); err != nil {
+		t.Fatalf("putBlob: %v", err)
+	}
+}
+
+// newTestStore returns the store of a freshly created user, with a deterministic
 // clock (always returns 1000) and a counter-based id generator.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "data.json")
-	st, err := NewStore(path)
+	tn := openTestTenants(t)
+	_, id, err := tn.Create()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Create: %v", err)
 	}
+	st := tn.byID[id].store
 	var n int
 	st.now = func() int64 { return 1000 }
 	st.newID = func() string { n++; return "id" + string(rune('0'+n)) }
 	return st
 }
 
-func TestNewStoreCreatesFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "data.json")
-	st, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
+func TestNewStoreLoadsEmptyBlob(t *testing.T) {
+	st := newTestStore(t)
+	snap := st.Snapshot()
+	if snap.StateVersion != 0 {
+		t.Fatalf("expected fresh state_version 0, got %d", snap.StateVersion)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected file created: %v", err)
+	if len(snap.Tasks) != 0 {
+		t.Fatalf("expected no tasks, got %d", len(snap.Tasks))
 	}
-	if st.Snapshot().StateVersion != 0 {
-		t.Fatal("expected fresh state_version 0")
-	}
-	if len(st.Snapshot().Tasks) != 0 {
-		t.Fatal("expected no tasks")
+	// Pins the constant against cloneState zeroing it; nothing more.
+	if snap.DataFormatVersion != CurrentDataFormatVersion {
+		t.Fatalf("data_format_version = %d, want %d", snap.DataFormatVersion, CurrentDataFormatVersion)
 	}
 }
 
-func TestLoadRejectsInvalidFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "data.json")
-	// B is double-contained -> invalid
-	os.WriteFile(path, []byte(`{"state_version":1,"tasks":{
+func TestNewStoreRefusesMissingBlob(t *testing.T) {
+	tn := openTestTenants(t)
+	_, err := newStore(tn.db, UserID{9})
+	if err == nil || !strings.Contains(err.Error(), "no data for user") {
+		t.Fatalf("newStore: got err %v, want one mentioning \"no data for user\"", err)
+	}
+}
+
+func TestLoadRejectsInvalidBlob(t *testing.T) {
+	tn := openTestTenants(t)
+	id := UserID{1}
+	// B is double-contained -> single_container violation
+	putBlob(t, tn, id, `{"state_version":1,"tasks":{
 		"A":{"id":"A","content":{"title":"A","status":"todo","priority":"none","child_ids":["B"],"tags":[]},"meta":{}},
 		"C":{"id":"C","content":{"title":"C","status":"todo","priority":"none","child_ids":["B"],"tags":[]},"meta":{}},
 		"B":{"id":"B","content":{"title":"B","status":"todo","priority":"none","child_ids":[],"tags":[]},"meta":{}}
-	}}`), 0o644)
-	if _, err := NewStore(path); err == nil {
+	}}`)
+	if _, err := newStore(tn.db, id); err == nil {
 		t.Fatal("expected load to reject invalid state")
 	}
 }
 
-func TestSnapshot(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "data.json")
-	st, err := NewStore(path)
-	if err != nil {
+func TestSaveStateRefusesWhenBlobGone(t *testing.T) {
+	st := newTestStore(t)
+	if _, _, err := st.Add(task.AddRequest{Content: validContent("a")}); err != nil {
 		t.Fatal(err)
 	}
+	before := st.Snapshot()
+
+	// Simulate Delete(id) having run while this store is still referenced.
+	if err := st.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucketData)).Delete(st.id[:])
+	}); err != nil {
+		t.Fatalf("deleting blob: %v", err)
+	}
+
+	if _, _, err := st.Add(task.AddRequest{Content: validContent("b")}); !errors.Is(err, ErrUserDeleted) {
+		t.Fatalf("Add after delete: got err %v, want ErrUserDeleted", err)
+	}
+	if !reflect.DeepEqual(st.Snapshot(), before) {
+		t.Fatal("a failed persist must leave the in-memory state untouched")
+	}
+}
+
+func TestSnapshot(t *testing.T) {
+	st := newTestStore(t)
 	st.state.Tasks["A"] = task.Task{
 		ID: "A",
 		Content: task.Content{
@@ -205,65 +246,14 @@ func TestAddChildAtPosition(t *testing.T) {
 	}
 }
 
-func writeDataFile(t *testing.T, body string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "data.json")
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func TestNewFileGetsCurrentDataFormatVersion(t *testing.T) {
-	st, err := NewStore(filepath.Join(t.TempDir(), "data.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := st.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
-		t.Fatalf("expected version %d on a fresh store, got %d", CurrentDataFormatVersion, got)
-	}
-}
-
-func TestAbsentDataFormatVersionTreatedAsV1(t *testing.T) {
-	// Files written before this field existed: the only shape that ever existed is v1.
-	path := writeDataFile(t, `{"state_version":3,"tasks":{}}`)
-	st, err := NewStore(path)
-	if err != nil {
-		t.Fatalf("a legacy file must load, got error: %v", err)
-	}
-	if got := st.Snapshot().DataFormatVersion; got != 1 {
-		t.Fatalf("expected legacy file to be treated as v1, got %d", got)
-	}
-}
-
-func TestFutureDataFormatVersionRefusesToLoad(t *testing.T) {
-	// Without this, an older binary silently mangles a newer file.
-	path := writeDataFile(t, `{"data_format_version":2,"state_version":0,"tasks":{}}`)
-	if _, err := NewStore(path); err == nil {
-		t.Fatal("expected NewStore to refuse a future data_format_version, got nil error")
-	}
-}
-
 func TestDataFormatVersionSurvivesAWrite(t *testing.T) {
 	// Guards the cloneState trap: cloneState rebuilds State field-by-field, so a
 	// field it forgets is zeroed on the first mutation.
-	path := filepath.Join(t.TempDir(), "data.json")
-	st, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := st.Add(task.AddRequest{Content: task.Content{Title: "x", Status: task.StatusTodo, Priority: task.PriorityNone}}); err != nil {
+	st := newTestStore(t)
+	if _, _, err := st.Add(task.AddRequest{Content: validContent("x")}); err != nil {
 		t.Fatal(err)
 	}
 	if got := st.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
 		t.Fatalf("in-memory version zeroed by a write: got %d", got)
-	}
-
-	reloaded, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := reloaded.Snapshot().DataFormatVersion; got != CurrentDataFormatVersion {
-		t.Fatalf("on-disk version zeroed by a write: got %d", got)
 	}
 }

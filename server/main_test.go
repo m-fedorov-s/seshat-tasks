@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -26,20 +27,20 @@ func TestTooPermissive(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
+	ok32 := strings.Repeat("a", 32)
 	cases := []struct {
 		name      string
 		cfg       Config
 		wantErr   bool
+		wantMsg   string
 		wantLimit int
 	}{
-		{"empty secret rejected", Config{Secret: "", RateLimit: 0}, true, 0},
-		// Consciously deferred, not a bug: only the exact empty string is rejected.
-		// Pin the current behavior rather than change it.
-		{"whitespace-only secret currently accepted", Config{Secret: "   ", RateLimit: 0}, false, defaultRateLimit},
-		{"valid config accepted", Config{Secret: "s3cr3t", RateLimit: 0}, false, defaultRateLimit},
-		{"rate limit zero defaults", Config{Secret: "s3cr3t", RateLimit: 0}, false, defaultRateLimit},
-		{"positive rate limit passes through", Config{Secret: "s3cr3t", RateLimit: 25}, false, 25},
-		{"negative rate limit rejected", Config{Secret: "s3cr3t", RateLimit: -1}, true, 0},
+		{"missing admin_token", Config{AdminToken: ""}, true, "admin_token required", 0},
+		{"short admin_token", Config{AdminToken: strings.Repeat("a", 31)}, true, "at least 32", 0},
+		{"32-char admin_token ok", Config{AdminToken: ok32}, false, "", defaultRateLimit},
+		{"rate limit zero defaults", Config{AdminToken: ok32, RateLimit: 0}, false, "", defaultRateLimit},
+		{"positive rate limit", Config{AdminToken: ok32, RateLimit: 25}, false, "", 25},
+		{"negative rate limit", Config{AdminToken: ok32, RateLimit: -1}, true, "", 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -47,6 +48,9 @@ func TestValidateConfig(t *testing.T) {
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("validateConfig(%+v) err = nil, want error", c.cfg)
+				}
+				if c.wantMsg != "" && !strings.Contains(err.Error(), c.wantMsg) {
+					t.Fatalf("validateConfig(%+v) err = %q, want substring %q", c.cfg, err.Error(), c.wantMsg)
 				}
 				return
 			}

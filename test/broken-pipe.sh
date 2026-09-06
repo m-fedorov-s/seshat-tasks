@@ -6,7 +6,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 port=8811
-secret=integrationsecret
+admin=integration-admin-token-integration-admin-token     # >= 32 chars
 tmp=$(mktemp -d)
 pid=""
 cleanup() {
@@ -33,23 +33,22 @@ awk 'BEGIN {
     }
   }
   printf "\n  }\n}\n"
-}' > "$tmp/data.json"
+}' > "$tmp/fixture.json"
 
+# rate_limit raised so 2000 adds are never throttled (10 r/s would take 200 s).
 cat > "$tmp/server.yaml" <<EOF
-secret: $secret
+admin_token: $admin
 bind: 127.0.0.1
 port: $port
-data_file: $tmp/data.json
+data_file: $tmp/seshat.db
+rate_limit: 5000
 EOF
 # Otherwise warnIfPermissive fires on every run and clutters server.log.
 chmod 600 "$tmp/server.yaml"
 
-cat > "$tmp/client.json" <<EOF
-{"url": "http://127.0.0.1:$port", "secret": "$secret", "utc_offset": "+03:00"}
-EOF
-
-echo "building server + client..."
+echo "building server + seeder + client..."
 (cd "$root/server" && go build -o "$tmp/seshat-server" .)
+(cd "$root" && go build -o "$tmp/seshat-seed" ./test/seed)
 (cd "$root/client/zig" && zig build)
 
 "$tmp/seshat-server" -config "$tmp/server.yaml" >"$tmp/server.log" 2>&1 &
@@ -57,7 +56,8 @@ pid=$!
 
 ready=0
 for _ in $(seq 1 50); do
-  if curl -sf -H "Authorization: $secret" "http://127.0.0.1:$port/api/tasks/get" -o /dev/null; then
+  # The task path needs a user token we do not have yet, so probe the admin branch.
+  if curl -sf -X POST -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/list" -o /dev/null; then
     ready=1
     break
   fi
@@ -72,6 +72,24 @@ if [ "$ready" -ne 1 ]; then
   cat "$tmp/server.log"
   exit 1
 fi
+
+echo "creating the integration user..."
+# Two steps, so a curl transport failure (set -e) and an empty/odd body both reach a
+# message. sed rather than jq: the script's stated prerequisites are curl, awk and seq
+# (dev/README.md); jq is only required by dev/seed.sh.
+resp=$(curl -fsS -X POST -H "Authorization: $admin" "http://127.0.0.1:$port/api/admin/users/add") \
+  || { echo "FAIL: users/add"; cat "$tmp/server.log"; exit 1; }
+token=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')
+[ -n "$token" ] || { echo "FAIL: users/add returned no token: $resp"; cat "$tmp/server.log"; exit 1; }
+
+# Written only now: the client authenticates as the user, not as the admin.
+cat > "$tmp/client.json" <<EOF
+{"url": "http://127.0.0.1:$port", "secret": "$token", "utc_offset": "+03:00"}
+EOF
+
+echo "seeding fixture through the API..."
+"$tmp/seshat-seed" -url "http://127.0.0.1:$port" -token "$token" "$tmp/fixture.json" \
+  || { echo "FAIL: seeding"; cat "$tmp/server.log"; exit 1; }
 
 # Guard against the fixture silently shrinking below the pipe buffer over time (e.g. a
 # future edit trims the task count). If the unpiped output doesn't comfortably exceed the
