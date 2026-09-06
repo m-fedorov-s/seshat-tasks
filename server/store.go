@@ -71,6 +71,27 @@ func newStore(db *bolt.DB, id UserID) (*Store, error) {
 	return st, nil
 }
 
+// newEmptyStore builds the Store for a user whose blob is known to be the empty
+// state — used by Tenants.Create right after writing that blob, so Create has no
+// read-back that could fail between "committed to disk" and "registered in
+// memory". The result is exactly what newStore+load would produce on a fresh
+// {"state_version":0,"tasks":{}} blob.
+func newEmptyStore(db *bolt.DB, id UserID) *Store {
+	st := &Store{
+		db:    db,
+		id:    id,
+		now:   func() int64 { return time.Now().Unix() },
+		newID: defaultNewID,
+		state: State{
+			DataFormatVersion: CurrentDataFormatVersion,
+			StateVersion:      0,
+			Tasks:             map[string]task.Task{},
+		},
+	}
+	st.rebuildIndex()
+	return st
+}
+
 func (st *Store) load() error {
 	var blob userBlob
 	err := st.db.View(func(tx *bolt.Tx) error {

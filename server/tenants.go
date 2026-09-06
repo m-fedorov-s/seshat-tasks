@@ -289,15 +289,32 @@ func (t *Tenants) Create() (string, UserID, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	tok, err := mintToken()
-	if err != nil {
-		return "", UserID{}, err
+	// Mint until the id/token misses both indexes (a 2^-128 event; the guard is a
+	// few lines). A mint ERROR must return, not spin — we hold t.mu here.
+	var id UserID
+	for {
+		var err error
+		id, err = mintID()
+		if err != nil {
+			return "", UserID{}, err
+		}
+		if _, taken := t.byID[id]; !taken {
+			break
+		}
 	}
-	id, err := mintID()
-	if err != nil {
-		return "", UserID{}, err
+	var tok string
+	var h [32]byte
+	for {
+		var err error
+		tok, err = mintToken()
+		if err != nil {
+			return "", UserID{}, err
+		}
+		h = tokenHash(tok)
+		if _, taken := t.byHash[h]; !taken {
+			break
+		}
 	}
-	h := tokenHash(tok)
 	empty, err := json.Marshal(userBlob{StateVersion: 0, Tasks: map[string]task.Task{}})
 	if err != nil {
 		return "", UserID{}, err
@@ -319,10 +336,7 @@ func (t *Tenants) Create() (string, UserID, error) {
 		return "", UserID{}, err
 	}
 
-	st, err := newStore(t.db, id) // cannot fail on the blob just written
-	if err != nil {
-		return "", UserID{}, err
-	}
+	st := newEmptyStore(t.db, id) // no read-back: the blob just written IS this state
 	tn := &tenant{id: id, hash: h, store: st, limiter: newLimiter(t.rps)}
 	t.byHash[h] = tn
 	t.byID[id] = tn

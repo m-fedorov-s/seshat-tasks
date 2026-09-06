@@ -881,3 +881,86 @@ func TestDeleteRacingWritesNeverPanics(t *testing.T) {
 	}
 	<-done
 }
+
+// TestCreateYieldsAUsableEmptyStoreThatSurvivesReopen is a characterization test
+// (Plan A review, finding 5): Create must not depend on a successful read of the
+// blob it just wrote — a read-back failure left an on-disk user unregistered.
+// That is not observable from outside; what IS observable, and pinned here, is
+// that the store Create hands out is usable and empty, and matches a reload.
+// This passes before and after the refactor to newEmptyStore; it is not a
+// RED->GREEN test.
+func TestCreateYieldsAUsableEmptyStoreThatSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seshat.db")
+	tn, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("OpenTenants: %v", err)
+	}
+	t.Cleanup(func() { tn.Close() }) // belt-and-suspenders: a failed assertion below must not leak the flock
+	tok, id, err := tn.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tenant, ok := tn.Authenticate(tok)
+	if !ok {
+		t.Fatal("Authenticate: not ok")
+	}
+
+	snap := tenant.store.Snapshot()
+	if snap.StateVersion != 0 {
+		t.Fatalf("state_version = %d, want 0", snap.StateVersion)
+	}
+	if len(snap.Tasks) != 0 {
+		t.Fatalf("tasks = %+v, want empty", snap.Tasks)
+	}
+	if snap.DataFormatVersion != CurrentDataFormatVersion {
+		t.Fatalf("data_format_version = %d, want %d", snap.DataFormatVersion, CurrentDataFormatVersion)
+	}
+
+	// Direct equivalence against newStore reading the SAME just-written blob: Snapshot
+	// and cloneState self-heal a nil Tasks map, and parent is only ever read by Delete,
+	// so the assertions above cannot catch newEmptyStore skipping rebuildIndex() or
+	// leaving a field nil. Compare the unexported state directly (package main).
+	ref, err := newStore(tn.db, id)
+	if err != nil {
+		t.Fatalf("newStore on the same blob: %v", err)
+	}
+	if !reflect.DeepEqual(tenant.store.state, ref.state) {
+		t.Fatalf("store.state = %+v, want %+v (from newStore on the same blob)", tenant.store.state, ref.state)
+	}
+	if !reflect.DeepEqual(tenant.store.parent, ref.parent) {
+		t.Fatalf("store.parent = %+v, want %+v (from newStore on the same blob)", tenant.store.parent, ref.parent)
+	}
+	if tenant.store.parent == nil || ref.parent == nil {
+		t.Fatal("parent must be a non-nil empty map on both stores")
+	}
+	if tenant.store.now == nil || tenant.store.newID == nil {
+		t.Fatal("store.now and store.newID must be non-nil")
+	}
+
+	added, _, err := tenant.store.Add(task.AddRequest{Content: validContent("x")})
+	if err != nil {
+		t.Fatalf("Add on the fresh store: %v", err)
+	}
+
+	if err := tn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tn2, err := OpenTenants(path, defaultRateLimit)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { tn2.Close() })
+	tenant2, ok := tn2.Authenticate(tok)
+	if !ok {
+		t.Fatal("token does not authenticate after reopen")
+	}
+	got := tenant2.store.Snapshot()
+	if len(got.Tasks) != 1 {
+		t.Fatalf("reopened store has %d tasks, want 1: %+v", len(got.Tasks), got.Tasks)
+	}
+	reloaded, ok := got.Tasks[added.ID]
+	if !ok || reloaded.Content.Title != "x" {
+		t.Fatalf("reopened store does not have task %q titled \"x\": %+v", added.ID, got.Tasks)
+	}
+}
