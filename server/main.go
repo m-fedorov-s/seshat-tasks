@@ -140,12 +140,9 @@ func main() {
 	}
 	// No defer tenants.Close(): every exit below is log.Fatal -> os.Exit, which
 	// skips defers anyway. bbolt commits are durable, so nothing acknowledged is lost.
-	// Transient: Plan B replaces this with Authenticate-per-request; see bootstrapSingle.
-	store, err := tenants.bootstrapSingle()
-	if err != nil {
-		log.Fatalf("bootstrap: %v", err)
-	}
-	srv := NewServer(store, cfg.Secret, cfg.RateLimit)
+	// Task 3 renames cfg.Secret to cfg.AdminToken; until then the config's `secret` IS
+	// the admin token.
+	srv := NewServer(tenants, cfg.Secret, cfg.RateLimit)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port)
 	// Go's zero-value http.Server has NO deadlines: a connection that opens and

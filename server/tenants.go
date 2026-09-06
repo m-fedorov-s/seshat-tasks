@@ -375,28 +375,6 @@ func (t *Tenants) List() []UserID {
 	return ids
 }
 
-// bootstrapSingle is PLAN A ONLY: it lets the unchanged single-secret HTTP layer
-// run on top of the multi-user store. Plan B replaces it with Authenticate-per-
-// request plus an admin API, and deletes this function. Single-threaded at
-// startup, so reading byID after List() is safe.
-func (t *Tenants) bootstrapSingle() (*Store, error) {
-	ids := t.List()
-	switch len(ids) {
-	case 0:
-		_, id, err := t.Create()
-		if err != nil {
-			return nil, err
-		}
-		// The token is deliberately not logged; nothing consumes it yet.
-		log.Printf("bootstrap: created single user %s", id)
-		return t.byID[id].store, nil
-	case 1:
-		return t.byID[ids[0]].store, nil
-	default:
-		return nil, fmt.Errorf("data file has %d users; Plan A runs single-user", len(ids))
-	}
-}
-
 // Close releases the underlying bbolt file and its flock.
 func (t *Tenants) Close() error {
 	return t.db.Close()
