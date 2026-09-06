@@ -7,5 +7,5 @@ cd "$(dirname "$0")/.."   # repo root
 # The committed copy is mode 0644 (git can't carry 0600); tighten it before the server's
 # own permission warning fires on it. See test/broken-pipe.sh for the same fix.
 chmod 600 dev/server.yaml
-echo "Starting seshat dev server on http://localhost:8799 (secret: devsecret)"
+echo "Starting seshat dev server on http://localhost:8799 (admin token in dev/server.yaml)"
 exec ./server/seshat -config dev/server.yaml

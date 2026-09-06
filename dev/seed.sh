@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Seed a realistic task dataset into the running dev server via the API.
+# Creates (or rotates) the dev user first: the previous dev user recorded in dev/.user-id is
+# deleted, a fresh one is created, and its token is written into dev/client.json.
 # Requires: a running dev server (dev/run-server.sh) and `jq`.
-# Usage: dev/seed.sh        (override URL/SECRET via env if needed)
+# Usage: dev/seed.sh        (override URL / SESHAT_ADMIN_TOKEN via env if needed)
 set -euo pipefail
 URL=${SESHAT_URL:-http://localhost:8799}
-SECRET=${SESHAT_SECRET:-devsecret}
+ADMIN=${SESHAT_ADMIN_TOKEN:-devadmin-devadmin-devadmin-devadmin}
+root=$(cd "$(dirname "$0")/.." && pwd)
 
 command -v jq >/dev/null || { echo "this script needs 'jq'"; exit 1; }
+
+if [ -f "$root/dev/.user-id" ]; then
+  curl -sS -H "Authorization: $ADMIN" -d "{\"id\":\"$(cat "$root/dev/.user-id")\"}" "$URL/api/admin/users/delete" >/dev/null || true   # 404 on a reset db is fine
+fi
+created=$(curl -fsS -H "Authorization: $ADMIN" "$URL/api/admin/users/add")
+TOKEN=$(jq -r .token <<<"$created"); jq -r .id <<<"$created" > "$root/dev/.user-id"
+printf '{\n  "url": "%s",\n  "secret": "%s"\n}\n' "$URL" "$TOKEN" > "$root/dev/client.json"
+echo "dev user $(cat "$root/dev/.user-id") created; token written to dev/client.json"
 
 now=$(date +%s); day=86400
 overdue=$((now - 3*day)); soon=$((now + 2*day)); later=$((now + 6*day)); tomorrow=$((now + day))
@@ -14,7 +25,7 @@ overdue=$((now - 3*day)); soon=$((now + 2*day)); later=$((now + 6*day)); tomorro
 # add <content-json> [parent-id-json] -> prints the new task id
 add() {
   local content="$1" parent="${2:-null}"
-  curl -fsS -H "Authorization: $SECRET" -H "Content-Type: application/json" \
+  curl -fsS -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
     -d "{\"content\":${content},\"parent_id\":${parent}}" \
     "$URL/api/tasks/add" | jq -r '.task.id'
 }

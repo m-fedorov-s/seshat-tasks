@@ -1,6 +1,6 @@
-# Dev server config (throwaway secret — local use only).
+# Dev server config (throwaway admin token — local use only).
 # Run from the repo root: ./server/seshat -config dev/server.yaml
-secret: devsecret
+admin_token: devadmin-devadmin-devadmin-devadmin
 bind: 127.0.0.1
 port: 8799
 data_file: dev/seshat-dev.db

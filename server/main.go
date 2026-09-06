@@ -15,23 +15,31 @@ import (
 )
 
 type Config struct {
-	Secret string `yaml:"secret"`
+	// AdminToken authenticates /api/admin/* only. At least 32 characters: a human does
+	// not type 32 random characters by accident (README: openssl rand -hex 32).
+	AdminToken string `yaml:"admin_token"`
 	// Bind is the listen address. Defaults to loopback: the process sits behind a
 	// TLS-terminating reverse proxy, and listening on all interfaces would let the
 	// proxy be bypassed by hitting the port directly. A field rather than a constant
 	// because deployment environments differ.
-	Bind     string `yaml:"bind"`
-	Port     uint   `yaml:"port"`
+	Bind string `yaml:"bind"`
+	Port uint   `yaml:"port"`
+	// DataFile is a bbolt file; defaults to seshat.db.
 	DataFile string `yaml:"data_file"`
-	// RateLimit is the requests-per-second ceiling. 0 means use defaultRateLimit.
-	// Burst is derived as twice this value (see NewServer).
+	// RateLimit is the requests-per-second ceiling, per user, and for the admin branch.
+	// 0 means use defaultRateLimit. Burst is derived as twice this value (see NewServer).
 	RateLimit int `yaml:"rate_limit"`
 }
 
 const defaultBind = "127.0.0.1"
 
+// minAdminTokenLen is the minimum accepted length for the admin token: a human does not
+// type 32 random characters by accident, so anything shorter is almost certainly a typo
+// or a placeholder left over from copying an example config.
+const minAdminTokenLen = 32
+
 // tooPermissive reports whether a file mode grants any access to group or other.
-// The config holds the shared secret in plaintext.
+// The config holds the admin token in plaintext.
 func tooPermissive(mode os.FileMode) bool { return mode.Perm()&0o077 != 0 }
 
 // warnIfPermissive warns (does not refuse) on a group/world-readable config.
@@ -42,7 +50,7 @@ func warnIfPermissive(path string) {
 		return
 	}
 	if tooPermissive(info.Mode()) {
-		log.Printf("WARNING: config %s has mode %#o and contains the shared secret; run: chmod 600 %s",
+		log.Printf("WARNING: config %s has mode %#o and contains the admin token; run: chmod 600 %s",
 			path, info.Mode().Perm(), path)
 	}
 }
@@ -86,17 +94,14 @@ func resolveRateLimit(configured int) (int, error) {
 // default, returning the resolved requests-per-second ceiling. Pulled out of main as a
 // pure function (same pattern as resolveRateLimit) so it's unit-testable without
 // spinning up a server.
-//
-// Note: a whitespace-only secret (e.g. " ") is currently ACCEPTED — only the exact
-// empty string is rejected. That's a conscious, reviewed gap, not an oversight: pin it
-// with a test rather than "fixing" it here.
 func validateConfig(cfg Config) (int, error) {
-	// An empty secret authenticates every request that omits the Authorization header,
-	// because sha256("") == sha256(""). Refuse to start rather than serve wide open.
-	// This is the one place refusing (rather than warning) is correct: a warning here
-	// would scroll past while the server ran unauthenticated.
-	if cfg.Secret == "" {
-		return 0, fmt.Errorf("empty secret; refusing to start (every request would authenticate)")
+	// An empty token would authenticate an empty Authorization header on the admin
+	// branch (sha256("") == sha256("")). Refuse, don't warn — same reasoning as Stage 0.
+	if cfg.AdminToken == "" {
+		return 0, errors.New(`admin_token required; refusing to start (configs written before Stage 2 used "secret" — see README)`)
+	}
+	if len(cfg.AdminToken) < minAdminTokenLen {
+		return 0, fmt.Errorf("admin_token must be at least %d characters, got %d; refusing to start", minAdminTokenLen, len(cfg.AdminToken))
 	}
 	return resolveRateLimit(cfg.RateLimit)
 }
@@ -114,15 +119,14 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.DataFile == "" {
-		// Plan A only: Plan B changes this default to seshat.db (spec §7).
-		cfg.DataFile = "seshat-data.json"
+		cfg.DataFile = "seshat.db"
 	}
 	if cfg.Bind == "" {
 		cfg.Bind = defaultBind
 	}
-	// Runs before the fatal validation below so an operator with both a bad secret and a
-	// too-permissive config file sees both problems in one pass, not one fix-and-retry
-	// cycle per issue.
+	// Runs before the fatal validation below so an operator with both a bad admin token
+	// and a too-permissive config file sees both problems in one pass, not one
+	// fix-and-retry cycle per issue.
 	warnIfPermissive(*configPath)
 	rateLimit, err := validateConfig(cfg)
 	if err != nil {
@@ -132,17 +136,16 @@ func main() {
 
 	tenants, err := OpenTenants(cfg.DataFile, cfg.RateLimit)
 	if errors.Is(err, bolt.ErrInvalid) {
-		log.Fatalf("%s is not a bbolt file — Stage 2 changed the storage format; "+
-			"load your tasks into a fresh file with test/seed", cfg.DataFile)
+		log.Fatalf("%s is not a bbolt file — Stage 2 changed the storage format. Start with a "+
+			"fresh data_file, create a user with POST /api/admin/users/add, then load your old "+
+			"tasks with: go run ./test/seed -token <that token> <old.json>", cfg.DataFile)
 	}
 	if err != nil {
 		log.Fatalf("open data file: %v", err)
 	}
 	// No defer tenants.Close(): every exit below is log.Fatal -> os.Exit, which
 	// skips defers anyway. bbolt commits are durable, so nothing acknowledged is lost.
-	// Task 3 renames cfg.Secret to cfg.AdminToken; until then the config's `secret` IS
-	// the admin token.
-	srv := NewServer(tenants, cfg.Secret, cfg.RateLimit)
+	srv := NewServer(tenants, cfg.AdminToken, cfg.RateLimit)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port)
 	// Go's zero-value http.Server has NO deadlines: a connection that opens and
@@ -155,7 +158,7 @@ func main() {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	log.Printf("seshat server listening on %s, data=%s, rev=%s", addr, cfg.DataFile, buildRevision())
+	log.Printf("seshat server listening on %s, data=%s, users=%d, rev=%s", addr, cfg.DataFile, len(tenants.List()), buildRevision())
 	if err := hs.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
