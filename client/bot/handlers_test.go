@@ -122,6 +122,12 @@ func TestHandleStartExplainsCaptureFirst(t *testing.T) {
 	if !strings.Contains(body, "task") {
 		t.Errorf("help should lead with 'any message becomes a task':\n%s", f.sent[0].Text)
 	}
+	// The privacy note must state the whole-account exposure, not a per-task one (spec §10.2).
+	for _, want := range []string{"token", "every task", "telegram", "command-line"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("help text is missing privacy-note substring %q:\n%s", want, f.sent[0].Text)
+		}
+	}
 }
 
 // TestParseCommand covers the finding from Task 16's review: HasPrefix matching

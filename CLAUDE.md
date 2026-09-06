@@ -6,7 +6,7 @@ truth; clients fetch task data from it.
 ## Commands
 
 ```sh
-make server-test              # Go server tests
+make server-test              # Go server tests (runs with -race)
 make schema-test              # shared Task-contract tests (Go + Zig halves)
 make client-integration-test  # spawns a real server + client through a pipe
 make bot-test                 # Go Telegram bot client tests
@@ -25,15 +25,24 @@ All five test targets must pass before any commit.
   `AddRequest`, `UpdateOp`) live in `internal/task/`. `State` and `CurrentDataFormatVersion` stay
   in `server/` — they are the server's own on-disk concerns, not part of the wire contract.
 - `server/` — Go HTTP server (`package main`, split across `task.go` / `store.go` / `validate.go`
-  / `handlers.go` / `main.go`). Stores tasks in memory, persisted to an atomic-rewrite JSON file,
-  with a global `state_version`. Auth via a shared `secret` sent in the `Authorization` header.
-  Config (secret, port, data_file, bind, rate_limit) from YAML — `bind` defaults to `127.0.0.1`;
-  `rate_limit` defaults to 10 req/s with burst 2x. Endpoints under `/api/tasks/` (`get`, `add`,
-  `update`, `delete`). Optimistic concurrency via per-task `meta.version`. Requests pass through
-  `MaxBytesHandler → auth → rateLimit → mux`. Two distinct version fields: `state_version`
-  (concurrency counter / ETag, bumped per mutation) and the data file's `data_format_version`
-  (on-disk format generation, currently 1 — the server refuses to start on a higher one). Do not
-  conflate them.
+  / `handlers.go` / `admin.go` / `tenants.go` / `main.go`). Stores each user's tasks in memory,
+  persisted as one JSON blob per user in a single bbolt file (`tenants.go`: `meta`/`users`/`data`
+  buckets; `format_version` per file; `state_version` per user). Auth: per-user opaque tokens in
+  the `Authorization` header, resolved by `Tenants.Authenticate` at one chokepoint
+  (`tenantBranch`) that hands each handler its own `*Store` — `Server` holds no store. A separate
+  `admin_token` (config, ≥32 chars) authenticates only `/api/admin/users/{add,list,delete}`
+  (`admin.go`); deleting a user deletes their data. Config (admin_token, port, data_file, bind,
+  rate_limit) from YAML — `bind` defaults to `127.0.0.1`; `rate_limit` defaults to 10 req/s with
+  burst 2x. Endpoints under `/api/tasks/` (`get`, `add`, `update`, `delete`). Optimistic
+  concurrency via per-task `meta.version`. Requests pass through `MaxBytesHandler → prefix
+  dispatch on the escaped path → {adminAuth → admin limiter → admin route table | Authenticate →
+  per-tenant limiter → task route table}` — no `ServeMux`, no path cleaning or decoding, so every
+  response without a valid credential is a 403. Two distinct version fields: `state_version`
+  (concurrency counter / ETag, bumped per mutation, now per user) and the on-disk `format_version`
+  key in the `meta` bucket (file-wide format generation, currently 1 — the server refuses to
+  start on a higher one; the in-memory `State` struct carries the same number as
+  `DataFormatVersion`/`data_format_version`, but that field is never itself read from or written
+  to a per-user blob). Do not conflate them.
 - `schema/` — the shared `Task` contract: `task.schema.json`, `SCHEMA.md`, golden `fixtures/`.
   Enforced across server + client by `make schema-test`.
 - `client/zig/` — the canonical client (Zig 0.16). See `client/zig/CLAUDE.md`.
@@ -50,6 +59,7 @@ All five test targets must pass before any commit.
 - `client/fish/` — **placeholder README only**; the standalone fish client was retired and the
   shell integration (completions/prompt) is not built yet. See `plans/roadmap.md` → Stage 3.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
+  `test/seed` loads a legacy JSON task file through the API; also the migration tool.
 - `dev/` — local dev environment: a throwaway server/client config + scripts to run the server,
   seed a realistic dataset, and run the client (see `dev/README.md`; `make dev-server`/`dev-seed`).
 - `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans (gitignored).
@@ -111,7 +121,8 @@ The Telegram bot (`client/bot/`):
 ## Conventions
 
 - The server is authoritative; clients must not assume local state is canonical.
-- Auth is a plain shared secret in the `Authorization` header (no Bearer prefix).
+- Auth is a per-user opaque token in the `Authorization` header (no Bearer prefix); the admin
+  token is a separate credential for `/api/admin/*` only.
 - **Never delete an SDD workspace — archive it.** `superpowers:subagent-driven-development` tells
   you to delete `.superpowers/sdd/<plan>/` once a plan's final review is clean. Do not. Move it to
   `sdd_archive/<plan>/` instead. The ledger, task briefs, implementer reports and review write-ups

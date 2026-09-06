@@ -76,7 +76,9 @@ const helpText = `Send me any message and it becomes a task — the first line i
 
 /list — your open tasks, five at a time
 /find &lt;text&gt; — search open task titles
-/help — this message`
+/help — this message
+
+Privacy note: this bot holds your seshat token, and the token gives full access to every task in your account — not just the ones you create here. So whoever runs this bot can read all of your tasks, and Telegram can read every message you send it. If you have tasks nobody else may see, keep them in a separate seshat account that you use only from the command-line client.`
 
 func (b *Bot) HandleStart(ctx context.Context, chatID int64) error {
 	_, err := b.s.Send(ctx, chatID, helpText, nil)

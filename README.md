@@ -33,13 +33,13 @@ cd server && go build -o seshat . && cd ..
 cd client/zig && zig build && cd ../..     # needs Zig 0.16
 ```
 
-**2. Configure the server** (`config.yaml`, gitignored — it holds your secret):
+**2. Configure the server** (`config.yaml`, gitignored — it holds the admin token):
 
 ```yaml
-secret: <a long random string>
+admin_token: <at least 32 characters — openssl rand -hex 32>
 bind: 127.0.0.1        # default; only change if you know you want to
 port: 8799
-data_file: ~/.local/share/seshat/tasks.json
+data_file: ~/.local/share/seshat/seshat.db
 ```
 
 **3. Configure the client** (`~/.config/seshat/config.json`, or point `SESHAT_CONFIG` at one):
@@ -47,10 +47,13 @@ data_file: ~/.local/share/seshat/tasks.json
 ```json
 {
   "url": "http://localhost:8799",
-  "secret": "<the same string>",
+  "secret": "<the token you were given>",
   "utc_offset": "+02:00"
 }
 ```
+
+`secret` is the per-user token — you'll get one from the admin API once the server is running
+— see just below step 4; the field name is unchanged, its meaning is now per user.
 
 `utc_offset` is applied when **parsing and rendering** dates only — everything is stored in UTC.
 It defaults to `+00:00`, and a malformed value is a startup error rather than a silent fallback.
@@ -62,6 +65,25 @@ It defaults to `+00:00`, and a malformed value is a startup error rather than a 
 seshat add "Try seshat" --priority high --due +2d
 seshat tui
 ```
+
+With the server running, create a user:
+
+> **Users and the admin API.** The server knows a user as a token; there are no usernames.
+> Create one:
+> ```sh
+> curl -sS -H "Authorization: $ADMIN_TOKEN" http://127.0.0.1:8799/api/admin/users/add
+> ```
+> Hand the returned `token` to the user (it goes into their client config as `secret`) and
+> forget it — the server stores only a hash, and **a lost token is lost data**: there is no
+> recovery and no rotation; deleting a user (`/api/admin/users/delete` with `{"id": …}`)
+> deletes their tasks. `/api/admin/users/list` shows ids. The admin token can create and
+> delete users, nothing else — but deleting is destructive, so **deny `/api/admin/` at your
+> reverse proxy** unless you want remote administration (the server matches the request path
+> exactly as sent, without decoding, so a rule on the raw target is sufficient), and treat the
+> token like a root password.
+
+Coming from a pre-Stage-2 JSON data file? Start the server on a fresh `data_file`, create a
+user, then `go run ./test/seed -token <token> old.json`.
 
 To poke at it without touching real data, `make dev-server` and `make dev-seed` spin up a
 throwaway server on port 8799 with a realistic dataset — see [`dev/README.md`](dev/README.md).
@@ -114,7 +136,7 @@ is tagged `ops`, rather than erasing it.
 
 | | |
 | --- | --- |
-| `server/` | Go HTTP server. In-memory, persisted to an atomic-rewrite JSON file. Auth is a shared secret in the `Authorization` header. Per-task versions give optimistic concurrency. |
+| `server/` | Go HTTP server. Per-user isolated stores in one bbolt file; per-user tokens in the `Authorization` header; an admin API creates and deletes users. Per-task versions give optimistic concurrency. |
 | `internal/task/` | The `Task` contract as Go types (`Task`, `Content`, `Meta`, `Status`, `Priority`, `AddRequest`, `UpdateOp`), shared by the server and the Go bot below. |
 | `schema/` | The `Task` contract shared across languages — JSON Schema, prose, and golden fixtures. |
 | `client/zig/` | The canonical client (Zig 0.16). CLI plus TUI; see [`client/zig/CLAUDE.md`](client/zig/CLAUDE.md). |
@@ -142,6 +164,7 @@ entry point — run `zig build` as well.
 ## Status
 
 The server, the CLI and the TUI work, and a Telegram bot client (`client/bot/`) can capture,
-browse and edit tasks. Not built yet: client-side caching and offline use, shell completions,
-multi-user, end-to-end encryption, and background refresh. Hierarchy is read-only in the TUI and
-the bot — you can see and edit a forest, but not restructure one.
+browse and edit tasks, and several users can share one server with fully isolated data. Not built
+yet: client-side caching and offline use, shell completions, end-to-end encryption, and
+background refresh. Hierarchy is read-only in the TUI and the bot — you can see and edit a
+forest, but not restructure one.
