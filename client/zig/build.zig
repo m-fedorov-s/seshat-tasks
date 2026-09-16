@@ -1,5 +1,22 @@
 const std = @import("std");
 
+// Each file is its own anonymous module so src/shell.zig can @embedFile it: @embedFile
+// cannot escape a module root, but a module can be rooted anywhere — see
+// https://ziglang.org/learn/build-system/#embed-file
+// REQUIRED INPUT: a missing path is `failed to check cache: '…' file_hash FileNotFound`.
+const shell_files = .{
+    .{ "shell_fish_completions", "../shell/fish/completions/seshat.fish" },
+    .{ "shell_fish_conf_d", "../shell/fish/conf.d/seshat.fish" },
+    .{ "shell_fish_functions", "../shell/fish/functions/seshat-prompt.fish" },
+    .{ "shell_bash_completions", "../shell/bash/seshat.bash" },
+    .{ "shell_zsh_completions", "../shell/zsh/_seshat" },
+};
+
+fn addShellFiles(b: *std.Build, m: *std.Build.Module) void {
+    inline for (shell_files) |f|
+        m.addAnonymousImport(f[0], .{ .root_source_file = b.path(f[1]) });
+}
+
 // DO NOT add an `if (code != 0) return null;` here: runAllowFail writes `out_code` only on
 // the failure path, so reading it reads `undefined` and rejects every good result. A
 // non-zero exit already arrives as error.ExitCodeFailure.
@@ -44,6 +61,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
     exe.root_module.addImport("vaxis", vaxis_mod);
+    addShellFiles(b, exe.root_module);
 
     b.installArtifact(exe);
 
@@ -69,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addOptions("build_options", options);
     unit_tests.root_module.addImport("vaxis", vaxis_mod);
+    addShellFiles(b, unit_tests.root_module);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

@@ -543,6 +543,7 @@ fn usage() void {
 test {
     // Make the pure-module unit tests reachable from `zig build test`
     // (the build test root is this file; see client/zig/CLAUDE.md).
+    _ = @import("shell.zig");
     _ = @import("core/view.zig");
     _ = @import("core/args.zig");
     _ = @import("core/display.zig");
