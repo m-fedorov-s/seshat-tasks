@@ -10,6 +10,7 @@ const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
 const filterspec = @import("core/filterspec.zig");
 const app = @import("tui/app.zig");
+const shell = @import("shell.zig");
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -67,6 +68,12 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
+    // Before the config load, like --version: the installer has no config file, maybe no $HOME.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "completions"))
+        return runCompletions(&out, args[2..]);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "init"))
+        return runInit(&out, args[2..]);
+
     const home = init.environ_map.get("HOME") orelse return error.HomeNotFound;
     const config_path = init.environ_map.get("SESHAT_CONFIG") orelse
         try std.fs.path.join(allocator, &.{ home, ".config", "seshat", "config.json" });
@@ -122,6 +129,43 @@ fn run(init: std.process.Init) !void {
         usage();
         return error.Reported;
     }
+}
+
+fn runCompletions(out: *std.Io.File.Writer, argv: []const []const u8) !void {
+    if (argv.len != 1) {
+        std.debug.print("Usage: seshat completions <fish|bash|zsh>\n", .{});
+        return error.Reported;
+    }
+    // Annotated because each @embedFile has its own `*const [N:0]u8` type.
+    const blob: []const u8 = if (std.mem.eql(u8, argv[0], "fish"))
+        shell.fish_completions
+    else if (std.mem.eql(u8, argv[0], "bash"))
+        shell.bash_completions
+    else if (std.mem.eql(u8, argv[0], "zsh"))
+        shell.zsh_completions
+    else {
+        std.debug.print("unknown shell \"{s}\" (want fish, bash or zsh)\n", .{argv[0]});
+        return error.Reported;
+    };
+    out.interface.writeAll(blob) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
+}
+
+// ORDER IS LOAD-BEARING: conf.d's `status is-interactive; or exit` guard aborts sourcing at
+// that point, so the function definitions must precede it. This makes
+// `seshat init fish > ~/.config/fish/conf.d/seshat.fish` a complete single-file install.
+fn runInit(out: *std.Io.File.Writer, argv: []const []const u8) !void {
+    if (argv.len != 1) {
+        std.debug.print("Usage: seshat init fish\n", .{});
+        return error.Reported;
+    }
+    if (!std.mem.eql(u8, argv[0], "fish")) {
+        std.debug.print("seshat init: only \"fish\" is supported (got \"{s}\")\n", .{argv[0]});
+        return error.Reported;
+    }
+    out.interface.writeAll(shell.fish_functions) catch |err| return stdoutErr(err);
+    out.interface.writeAll(shell.fish_conf_d) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
 }
 
 const show_specs = [_]argparse.OptionSpec{
@@ -535,6 +579,8 @@ fn usage() void {
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
         \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
+        \\  completions <shell>   Print shell completions (fish|bash|zsh)
+        \\  init fish             Print the fish prompt-hook file to stdout
         \\  --version         Print the client version and exit
         \\
     , .{});

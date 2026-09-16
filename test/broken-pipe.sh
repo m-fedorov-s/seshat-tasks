@@ -154,3 +154,74 @@ if [[ "$detailed_out" == *"due 2026-08-02"* ]]; then
   exit 1
 fi
 echo "PASS: --detailed renders due_at in the configured local (+03:00) offset"
+
+# --- Stage 3 (b): `completions` and `init` -------------------------------------------
+# Dispatched before the config load, so they must work with no config and no $HOME —
+# which is how the installer calls them.
+
+for sh_name in fish bash zsh; do
+  set +e
+  out=$(env -u HOME SESHAT_CONFIG=/nonexistent/seshat.json "$bin" completions "$sh_name" 2>"$tmp/comp.err")
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { echo "FAIL: 'completions $sh_name' exited $code, expected 0"; cat "$tmp/comp.err"; exit 1; }
+  [ -n "$out" ] || { echo "FAIL: 'completions $sh_name' printed nothing"; exit 1; }
+done
+echo "PASS: completions fish|bash|zsh print to stdout with no config"
+
+set +e
+"$bin" completions tcsh >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'completions tcsh' exited $code, expected 1"; exit 1; }
+grep -q 'unknown shell "tcsh"' "$tmp/comp.err" \
+  || { echo "FAIL: 'completions tcsh' did not name the shell:"; cat "$tmp/comp.err"; exit 1; }
+
+set +e
+"$bin" completions >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: bare 'completions' exited $code, expected 1"; exit 1; }
+grep -q 'Usage: seshat completions' "$tmp/comp.err" \
+  || { echo "FAIL: bare 'completions' printed no usage line"; exit 1; }
+
+set +e
+"$bin" completions fish bash >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'completions fish bash' exited $code, expected 1"; exit 1; }
+echo "PASS: completions rejects an unknown shell, no argument, and two arguments"
+
+set +e
+init_out=$(env -u HOME SESHAT_CONFIG=/nonexistent/seshat.json "$bin" init fish 2>"$tmp/comp.err"); code=$?
+set -e
+[ "$code" -eq 0 ] || { echo "FAIL: 'init fish' exited $code, expected 0"; cat "$tmp/comp.err"; exit 1; }
+[ -n "$init_out" ] || { echo "FAIL: 'init fish' printed nothing"; exit 1; }
+# Order is load-bearing: the function definitions must precede conf.d's
+# `status is-interactive; or exit` guard, which aborts sourcing at that point.
+func_line=$(printf '%s\n' "$init_out" | grep -n 'function seshat-prompt' | sed -n '1s/:.*//p')
+guard_line=$(printf '%s\n' "$init_out" | grep -n 'status is-interactive' | sed -n '1s/:.*//p')
+[ -n "$func_line" ] && [ -n "$guard_line" ] && [ "$func_line" -lt "$guard_line" ] \
+  || { echo "FAIL: 'init fish' must emit the functions file BEFORE conf.d (func=$func_line guard=$guard_line)"; exit 1; }
+
+set +e
+"$bin" init bash >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'init bash' exited $code, expected 1"; exit 1; }
+grep -q 'only "fish" is supported' "$tmp/comp.err" \
+  || { echo "FAIL: 'init bash' printed the wrong message:"; cat "$tmp/comp.err"; exit 1; }
+
+set +e
+"$bin" init >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: bare 'init' exited $code, expected 1"; exit 1; }
+grep -q 'Usage: seshat init fish' "$tmp/comp.err" \
+  || { echo "FAIL: bare 'init' printed no usage line"; exit 1; }
+echo "PASS: init fish emits functions before conf.d; init bash and bare init exit 1"
+
+# Exit status only. The blob is under a kilobyte, so it fits the pipe buffer whole and
+# EPIPE is unreachable here — the real broken-pipe coverage is the `show` assertion above,
+# which is guarded by min_bytes for exactly this reason.
+set +e
+"$bin" completions fish 2>"$tmp/comp.err" | head -1 >/dev/null
+code=${PIPESTATUS[0]}
+set -e
+[ "$code" -eq 0 ] || { echo "FAIL: 'completions fish | head -1' exited $code, expected 0"; exit 1; }
+echo "PASS: completions exits 0 when stdout is a pipe"
