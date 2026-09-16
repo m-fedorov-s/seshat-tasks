@@ -676,21 +676,26 @@ const src_files = [_]struct { name: []const u8, text: []const u8 }{
 };
 
 // The deadline is only non-bypassable if requestInner is the sole place an HTTP client is
-// constructed. The needle is split so this file's own source does not match it.
+// constructed. Both needles are split (never written whole in a comment) so this file's own
+// source does not match them. Two needles because the plain struct-literal form and the
+// decl-literal form (a type annotation assigned `.{ ... }`) are both idiomatic Zig 0.16;
+// neither needle alone catches both constructions.
 test "every HTTP call site is deadlined" {
-    const needle = "std.http" ++ ".Client{";
+    const needles = [_][]const u8{ "std.http" ++ ".Client{", ": std.http" ++ ".Client" };
     const client_src = @embedFile("api/client.zig");
     const inner = std.mem.indexOf(u8, client_src, "fn requestInner(").?;
     const after = std.mem.indexOf(u8, client_src, "fn request(").?;
     try std.testing.expect(inner < after);
 
     for (src_files) |f| {
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, f.text, i, needle)) |at| : (i = at + needle.len) {
-            const ok = std.mem.eql(u8, f.name, "api/client.zig") and at > inner and at < after;
-            if (!ok) {
-                std.debug.print("un-deadlined HTTP client in {s} at byte {d}\n", .{ f.name, at });
-                return error.HttpCallSiteBypassesDeadline;
+        for (needles) |needle| {
+            var i: usize = 0;
+            while (std.mem.indexOfPos(u8, f.text, i, needle)) |at| : (i = at + needle.len) {
+                const ok = std.mem.eql(u8, f.name, "api/client.zig") and at > inner and at < after;
+                if (!ok) {
+                    std.debug.print("un-deadlined HTTP client in {s} at byte {d}\n", .{ f.name, at });
+                    return error.HttpCallSiteBypassesDeadline;
+                }
             }
         }
     }

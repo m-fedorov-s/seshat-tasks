@@ -748,3 +748,26 @@ test "timeout_ms = 0 disables the deadline" {
     const tasks = try client.fetchTasks(a);
     try std.testing.expectEqual(@as(usize, 0), tasks.len);
 }
+
+// An error that happens BEFORE the deadline's own error can apply must still reach the
+// caller as itself, not get swallowed or relabelled DeadlineExceeded. Binding then
+// immediately closing the listener guarantees the port is refused, not merely unanswered.
+test "a refused connection propagates through the deadline as ConnectionRefused" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var l = try testListen(io, 19000);
+    l.server.deinit(io); // closed immediately: the port is refused, not merely silent
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{l.port});
+    const cfg = Config{ .url = url, .secret = "t", .timeout_ms = 10_000 };
+    var client = Client.init(io, a, &cfg);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.ConnectionRefused, client.fetchTasks(a));
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+    // Well under the 10s timeout_ms: the refusal is immediate, not deadline-timed.
+    try std.testing.expect(elapsed < std.time.ns_per_s);
+}
