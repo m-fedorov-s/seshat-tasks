@@ -563,3 +563,9 @@ test {
     // `refAllDecls` block is what typechecks the event loop at all.
     _ = @import("tui/app.zig");
 }
+
+// A floor only: build_options is baked before this runs, so test/broken-pipe.sh is the
+// check that can see a broken fallback.
+test "build_options.version is non-empty" {
+    try std.testing.expect(build_options.version.len > 0);
+}

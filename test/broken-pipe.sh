@@ -51,6 +51,15 @@ echo "building server + seeder + client..."
 (cd "$root" && go build -o "$tmp/seshat-seed" ./test/seed)
 (cd "$root/client/zig" && zig build)
 
+bin="$root/client/zig/zig-out/bin/seshat"
+
+# The only check that can catch build.zig's gitDescribe reading an uninitialised `code`
+# (spec F1): a unit test sees build_options after it has already been baked.
+v=$("$bin" --version)
+[ -n "$v" ] || { echo "FAIL: --version printed nothing"; exit 1; }
+[ "$v" != "seshat dev" ] || { echo "FAIL: --version is '$v' — the git describe fallback is broken"; exit 1; }
+echo "PASS: --version is '$v' (git describe, not the dev fallback)"
+
 "$tmp/seshat-server" -config "$tmp/server.yaml" >"$tmp/server.log" 2>&1 &
 pid=$!
 
