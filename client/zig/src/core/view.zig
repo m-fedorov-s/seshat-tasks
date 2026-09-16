@@ -595,6 +595,7 @@ pub const Limited = struct {
 /// spends a `[missing: …]` line on them. `count_children` mirrors what the renderer will
 /// print, not what the filter selected: false for `--flat` and `--json`. Whole roots only,
 /// so no orphaned `├─` can be printed; a first root larger than `max_rows` goes out anyway.
+/// Asserts `max_rows >= 1`.
 pub fn limitRows(toplevel: []const Task, count_children: bool, max_rows: usize) Limited {
     std.debug.assert(max_rows >= 1);
 

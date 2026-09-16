@@ -34,7 +34,7 @@ fn gitDescribe(b: *std.Build) ?[]const u8 {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
+    const strip = b.option(bool, "strip", "Omit debug info from the binary");
 
     // An EMPTY -Dversion is treated as absent: b.option returns a non-null empty slice,
     // which would ship `seshat \n`.

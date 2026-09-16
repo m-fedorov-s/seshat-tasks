@@ -245,7 +245,9 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     request runs inline with no deadline and `deadline_unavailable` (an atomic — the TUI writes it
     from a worker and reads it on the loop thread) is set: the CLI prints one stderr warning, the
     TUI a status-line note; this file still never prints. `main.zig`'s
-    `test "every HTTP call site is deadlined"` is what keeps the chokepoint single.
+    `test "every HTTP call site is deadlined"` is what keeps the chokepoint single. A
+    `DeadlineExceeded` on a mutation is ambiguous — the request may have already reached and been
+    applied by the server before the client gave up on it.
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
 - `src/tui/` — the interactive client (`seshat tui`). **Five files, split on one boundary:

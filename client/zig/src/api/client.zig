@@ -115,8 +115,9 @@ pub const Client = struct {
 
     /// Runs `f(args)` with a wall-clock deadline of `self.config.timeout_ms`; 0 disables it.
     ///
-    /// INVARIANT: `cancelDiscard` on EVERY path out — `sel`/`buf` are locals, and a live
-    /// task writing into a popped frame will not reproduce under test (std/Io.zig:1434).
+    /// INVARIANT: `cancelDiscard` on every path out after a task has been spawned —
+    /// `sel`/`buf` are locals, and a live task writing into a popped frame will not
+    /// reproduce under test (std/Io.zig:1434).
     /// INVARIANT: `alloc` must be an arena, and the calling thread must not touch it while
     /// the request is in flight — a cancelled task's result is dropped unfreed
     /// (std/Io.zig:1518) and ArenaAllocator is not threadsafe.

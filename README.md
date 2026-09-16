@@ -62,7 +62,9 @@ data_file: /var/lib/seshat/seshat.db
 It defaults to `+00:00`, and a malformed value is a startup error rather than a silent fallback.
 
 `timeout_ms` is a wall-clock deadline on every request (default 10000). Set it to `0` to disable
-the deadline entirely — a very slow link, or a debugging session.
+the deadline entirely — a very slow link, or a debugging session. A request that hits the
+deadline may still have been applied by the server — check with `seshat show` before re-running
+a mutation.
 
 **4. Run it.**
 
@@ -156,6 +158,7 @@ before any config exists.
 | `internal/task/` | The `Task` contract as Go types (`Task`, `Content`, `Meta`, `Status`, `Priority`, `AddRequest`, `UpdateOp`), shared by the server and the Go bot below. |
 | `schema/` | The `Task` contract shared across languages — JSON Schema, prose, and golden fixtures. |
 | `client/zig/` | The canonical client (Zig 0.16). CLI plus TUI; see [`client/zig/CLAUDE.md`](client/zig/CLAUDE.md). |
+| `client/shell/` | Shell integration files (fish in fisher layout, bash, zsh); a required build input of `client/zig/`, embedded and printed by `seshat completions`/`init`. |
 | `client/bot/` | A Go Telegram bot: capture a task from any message, browse with `/list`/`/find`, edit per-field through inline keyboards. Long-polling, no inbound port. See [`client/bot/README.md`](client/bot/README.md). |
 | `test/` | Integration tests that need a real server and client. |
 | `dev/` | A throwaway local environment. |

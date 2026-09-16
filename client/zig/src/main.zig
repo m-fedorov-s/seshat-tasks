@@ -614,8 +614,8 @@ fn usage() void {
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
         \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
-        \\  completions <shell>   Print shell completions (fish|bash|zsh)
-        \\  init fish             Print the fish prompt-hook file to stdout
+        \\  completions <shell> Print shell completions (fish|bash|zsh)
+        \\  init fish           Print the fish prompt-hook file to stdout
         \\  --version         Print the client version and exit
         \\
     , .{});

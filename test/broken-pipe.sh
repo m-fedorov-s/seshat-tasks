@@ -166,6 +166,8 @@ for sh_name in fish bash zsh; do
   set -e
   [ "$code" -eq 0 ] || { echo "FAIL: 'completions $sh_name' exited $code, expected 0"; cat "$tmp/comp.err"; exit 1; }
   [ -n "$out" ] || { echo "FAIL: 'completions $sh_name' printed nothing"; exit 1; }
+  printf '%s' "$out" | grep -q "seshat $sh_name completions" \
+    || { echo "FAIL: 'completions $sh_name' printed the wrong blob"; exit 1; }
 done
 echo "PASS: completions fish|bash|zsh print to stdout with no config"
 
@@ -249,6 +251,8 @@ for bad in 0 abc -1; do
   SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit "$bad" >/dev/null 2>"$tmp/limit.err"; code=$?
   set -e
   [ "$code" -eq 1 ] || { echo "FAIL: 'show --limit $bad' exited $code, expected 1"; exit 1; }
+  grep -q 'error: --limit must be a positive integer' "$tmp/limit.err" \
+    || { echo "FAIL: --limit $bad did not print the positive-integer error"; exit 1; }
 done
 set +e
 SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit >/dev/null 2>"$tmp/limit.err"; code=$?
