@@ -22,7 +22,8 @@ pub fn parseUtcOffset(s: []const u8) OffsetError!i32 {
 pub const Config = struct {
     url: []const u8,
     secret: []const u8,
-    max_lines: u32 = 3,
+    /// Wall-clock deadline for every HTTP request, in milliseconds. 0 disables it.
+    timeout_ms: u32 = 10_000,
     cache_ttl_seconds: u64 = 300,
     cache_dir: []const u8 = "",
     width: u32 = 120,
@@ -119,4 +120,29 @@ test "loadFromSlice ignores an offset_minutes supplied directly in JSON" {
     var d = try Config.loadFromSlice(a, "{\"url\":\"http://x\",\"secret\":\"s\",\"utc_offset\":\"+03:00\",\"offset_minutes\":-999}", "/home/u");
     defer d.deinit();
     try std.testing.expectEqual(@as(i32, 180), d.value.offset_minutes);
+}
+
+test "config defaults timeout_ms to 10000 and parses an override" {
+    const a = std.testing.allocator;
+    var d = try Config.loadFromSlice(a, "{\"url\":\"http://x\",\"secret\":\"s\"}", "/home/u");
+    defer d.deinit();
+    try std.testing.expectEqual(@as(u32, 10_000), d.value.timeout_ms);
+
+    var o = try Config.loadFromSlice(a, "{\"url\":\"http://x\",\"secret\":\"s\",\"timeout_ms\":1500}", "/home/u");
+    defer o.deinit();
+    try std.testing.expectEqual(@as(u32, 1500), o.value.timeout_ms);
+
+    // 0 is a documented opt-out, not an error.
+    var z = try Config.loadFromSlice(a, "{\"url\":\"http://x\",\"secret\":\"s\",\"timeout_ms\":0}", "/home/u");
+    defer z.deinit();
+    try std.testing.expectEqual(@as(u32, 0), z.value.timeout_ms);
+}
+
+// max_lines was deleted; an existing config.json that still carries it must keep loading.
+test "config still loads when a stale max_lines key is present" {
+    const a = std.testing.allocator;
+    var d = try Config.loadFromSlice(a, "{\"url\":\"http://x\",\"secret\":\"s\",\"max_lines\":7}", "/home/u");
+    defer d.deinit();
+    try std.testing.expectEqualStrings("http://x", d.value.url);
+    try std.testing.expectEqual(@as(u32, 10_000), d.value.timeout_ms);
 }

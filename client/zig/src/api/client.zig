@@ -24,12 +24,32 @@ pub const UpdateResult = union(enum) {
     conflict: []Task,
 };
 
+// Zig 0.16's std.http.Client has no timeout, and neither does the socket layer under it
+// (spec §5.1/D4), so the deadline is task cancellation: Io.Select races the request against
+// Io.sleep. KNOWN GAP: macOS DNS is not cancellable (Threaded.zig:13704).
+
+fn Ret(comptime f: anytype) type {
+    return @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+}
+
+fn Payload(comptime f: anytype) type {
+    return @typeInfo(Ret(f)).error_union.payload;
+}
+
+// The babysitter half of the race. `.awake` is std.Io's monotonic clock.
+fn tick(io: std.Io, ms: u32) void {
+    std.Io.sleep(io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
+}
+
 pub const Client = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     config: *const Config,
     // Owned by `allocator` (see recordError/clearError). Null until a request fails.
     last_error: ?ApiError = null,
+    // D6: set when a request ran with NO deadline (`concurrent` refused); the front ends
+    // announce it once per process. Atomic: the TUI writes it from a worker, reads on the loop.
+    deadline_unavailable: std.atomic.Value(bool) = .init(false),
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: *const Config) Client {
         return .{ .io = io, .allocator = allocator, .config = config };
@@ -91,34 +111,123 @@ pub const Client = struct {
         return error.ApiFailed;
     }
 
-    // GET all tasks. Everything (connection buffers, the response body, the parsed tasks)
-    // comes from `alloc`, so a long-lived caller can hand in a per-fetch arena and reclaim
-    // the whole lot. The tasks are parsed .alloc_always, so they do NOT alias the body.
-    pub fn fetchTasks(self: *Client, alloc: std.mem.Allocator) ![]Task {
+    const RawResponse = struct { status: std.http.Status, body: []u8 };
+
+    /// Runs `f(args)` with a wall-clock deadline of `self.config.timeout_ms`; 0 disables it.
+    ///
+    /// INVARIANT: `cancelDiscard` on EVERY path out — `sel`/`buf` are locals, and a live
+    /// task writing into a popped frame will not reproduce under test (std/Io.zig:1434).
+    /// INVARIANT: `alloc` must be an arena, and the calling thread must not touch it while
+    /// the request is in flight — a cancelled task's result is dropped unfreed
+    /// (std/Io.zig:1518) and ArenaAllocator is not threadsafe.
+    /// `concurrent`, never `async`: the async path silently runs inline when out of budget.
+    /// `DeadlineExceeded`, not `Timeout`: `error.Timeout` is already reachable from Io.net.
+    fn deadlined(self: *Client, comptime f: anytype, args: std.meta.ArgsTuple(@TypeOf(f))) !Payload(f) {
+        const timeout_ms = self.config.timeout_ms;
+        if (timeout_ms == 0) return @call(.auto, f, args);
+
+        const U = union(enum) { done: Ret(f), tick: void };
+        var buf: [2]U = undefined;
+        var sel = std.Io.Select(U).init(self.io, &buf);
+
+        sel.concurrent(.done, f, args) catch {
+            self.deadline_unavailable.store(true, .monotonic);
+            return @call(.auto, f, args);
+        };
+        sel.concurrent(.tick, tick, .{ self.io, timeout_ms }) catch {
+            self.deadline_unavailable.store(true, .monotonic);
+            const only = sel.await() catch |e| {
+                sel.cancelDiscard();
+                return e;
+            };
+            sel.cancelDiscard();
+            switch (only) {
+                .done => |r| return r,
+                .tick => unreachable,
+            }
+        };
+
+        // `await`'s only error is error.Canceled, meaning THIS task was cancelled — not
+        // that the deadline expired. Propagated as itself.
+        switch (sel.await() catch |e| {
+            sel.cancelDiscard();
+            return e;
+        }) {
+            .done => |r| {
+                sel.cancelDiscard();
+                return r;
+            },
+            .tick => {
+                sel.cancelDiscard();
+                return error.DeadlineExceeded;
+            },
+        }
+    }
+
+    // The ONE network chokepoint; `main.zig`'s "every HTTP call site is deadlined" test
+    // fails if a second std.http.Client appears under src/. Parsing stays in the callers,
+    // outside the deadline, so a cancelled task can only discard a body buffer. `self` is in
+    // the args tuple because Select.concurrent takes a plain ArgsTuple, not a bound method.
+    fn requestInner(
+        self: *Client,
+        alloc: std.mem.Allocator,
+        method: std.http.Method,
+        path: []const u8,
+        body: ?[]u8,
+    ) !RawResponse {
         var client = std.http.Client{ .io = self.io, .allocator = alloc };
         defer client.deinit();
 
-        const url = try self.endpointUrl(alloc, "/api/tasks/get");
+        const url = try self.endpointUrl(alloc, path);
         defer alloc.free(url);
         const uri = try std.Uri.parse(url);
 
-        var req = try client.request(.GET, uri, .{
-            .headers = .{ .authorization = .{ .override = self.config.secret } },
-        });
+        var req = if (body == null)
+            try client.request(method, uri, .{
+                .headers = .{ .authorization = .{ .override = self.config.secret } },
+            })
+        else
+            try client.request(method, uri, .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                    .{ .name = "Authorization", .value = self.config.secret },
+                },
+            });
         defer req.deinit();
-        try req.sendBodiless();
+
+        if (body) |b| {
+            req.transfer_encoding = .{ .content_length = b.len };
+            try req.sendBodyComplete(b);
+        } else {
+            try req.sendBodiless();
+        }
 
         var rb: [1024]u8 = undefined;
         var resp = try req.receiveHead(&rb);
-        if (resp.head.status != .ok) {
-            const err_body = resp.reader(&.{}).allocRemaining(alloc, .unlimited) catch "";
-            defer if (err_body.len > 0) alloc.free(err_body);
-            return self.fail(resp.head.status, err_body);
-        }
+        return .{
+            .status = resp.head.status,
+            .body = try resp.reader(&.{}).allocRemaining(alloc, .unlimited),
+        };
+    }
 
-        const body = try resp.reader(&.{}).allocRemaining(alloc, .unlimited);
-        defer alloc.free(body);
-        return parseGet(alloc, body);
+    // Every HTTP request goes through here, and therefore through the deadline.
+    fn request(
+        self: *Client,
+        alloc: std.mem.Allocator,
+        method: std.http.Method,
+        path: []const u8,
+        body: ?[]u8,
+    ) !RawResponse {
+        return self.deadlined(requestInner, .{ self, alloc, method, path, body });
+    }
+
+    // GET all tasks. Everything comes from `alloc`, which MUST be an arena (see
+    // `deadlined`); the tasks are parsed .alloc_always, so they do NOT alias the body.
+    pub fn fetchTasks(self: *Client, alloc: std.mem.Allocator) ![]Task {
+        const res = try self.request(alloc, .GET, "/api/tasks/get", null);
+        defer alloc.free(res.body);
+        if (res.status != .ok) return self.fail(res.status, res.body);
+        return parseGet(alloc, res.body);
     }
 
     pub fn addTask(self: *Client, alloc: std.mem.Allocator, content: types.Content, parent_id: ?[]const u8) !Task {
@@ -148,58 +257,27 @@ pub const Client = struct {
         alloc.free(res.body);
     }
 
-    const PostResult = struct {
-        status: std.http.Status,
-        // Allocated from the caller's `alloc`; the caller frees it.
-        body: []u8,
-    };
-
-    // postJson serializes payload, POSTs it, and returns the status + response body for
-    // any status the caller listed in ok_statuses. Anything else is recorded via fail().
-    // Note 409 is only accepted when the caller asks for it (updateTasks does); on any
-    // other endpoint the server never emits one, so it falls through to fail() rather
-    // than getting a bespoke error.
+    // Returns the status + body for any status in ok_statuses; anything else goes to fail().
     fn postJson(
         self: *Client,
         alloc: std.mem.Allocator,
         path: []const u8,
         payload: anytype,
         ok_statuses: []const std.http.Status,
-    ) !PostResult {
-        var client = std.http.Client{ .io = self.io, .allocator = alloc };
-        defer client.deinit();
-
-        const url = try self.endpointUrl(alloc, path);
-        defer alloc.free(url);
-        const uri = try std.Uri.parse(url);
-
+    ) !RawResponse {
+        // `payload: anytype` must not cross the deadline boundary: ArgsTuple does not
+        // exist for a generic function.
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         var w = std.json.Stringify{ .writer = &aw.writer, .options = .{} };
         try w.write(payload);
-        const body = aw.written();
 
-        var req = try client.request(.POST, uri, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Authorization", .value = self.config.secret },
-            },
-        });
-        defer req.deinit();
-        req.transfer_encoding = .{ .content_length = body.len };
-        try req.sendBodyComplete(body);
-
-        var rb: [1024]u8 = undefined;
-        var resp = try req.receiveHead(&rb);
-        for (ok_statuses) |s| {
-            if (resp.head.status == s) return .{
-                .status = resp.head.status,
-                .body = try resp.reader(&.{}).allocRemaining(alloc, .unlimited),
-            };
-        }
-        const err_body = resp.reader(&.{}).allocRemaining(alloc, .unlimited) catch "";
-        defer if (err_body.len > 0) alloc.free(err_body);
-        return self.fail(resp.head.status, err_body);
+        // aw.deinit() frees the body on the way out; safe because `deadlined` joins the
+        // request task before returning.
+        const res = try self.request(alloc, .POST, path, aw.written());
+        for (ok_statuses) |st| if (res.status == st) return res;
+        defer alloc.free(res.body);
+        return self.fail(res.status, res.body);
     }
 };
 
@@ -568,4 +646,105 @@ test "defaultMessage covers the statuses Stage 0 introduced" {
     try std.testing.expectEqualStrings("request too large", defaultMessage(413));
     try std.testing.expectEqualStrings("access denied (check your secret)", defaultMessage(403));
     try std.testing.expectEqualStrings("unexpected response from server", defaultMessage(500));
+}
+
+// The only unit tests here that open a socket; `zig build test` only, since a bare
+// `zig test src/api/client.zig` fails on the sibling imports (client/zig/CLAUDE.md).
+
+// std.Io.net exposes no getsockname, so port 0 would leave the test unable to build a URL.
+fn testListen(io: std.Io, first_port: u16) !struct { server: std.Io.net.Server, port: u16 } {
+    const last = first_port +| 100;
+    var port = first_port;
+    while (port < last) : (port += 1) {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        const server = addr.listen(io, .{ .reuse_address = true }) catch continue;
+        return .{ .server = server, .port = port };
+    }
+    return error.NoFreePort;
+}
+
+// Accept, then never write a byte.
+fn blackHole(io: std.Io, listener: *std.Io.net.Server) void {
+    var stream = listener.accept(io) catch return;
+    defer stream.close(io);
+    std.Io.sleep(io, .fromSeconds(5), .awake) catch {};
+}
+
+fn tinyResponder(io: std.Io, listener: *std.Io.net.Server) void {
+    var stream = listener.accept(io) catch return;
+    defer stream.close(io);
+
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    _ = r.interface.peekDelimiterInclusive('\n') catch {};
+
+    const payload = "{\"state_version\":1,\"tasks\":[]}";
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    w.interface.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ payload.len, payload },
+    ) catch {};
+    w.interface.flush() catch {};
+}
+
+test "fetchTasks returns error.DeadlineExceeded against a server that never responds" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var l = try testListen(io, 18800);
+    defer l.server.deinit(io);
+    var hole = try io.concurrent(blackHole, .{ io, &l.server });
+    defer _ = hole.cancel(io);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{l.port});
+    const cfg = Config{ .url = url, .secret = "t", .timeout_ms = 200 };
+    var client = Client.init(io, a, &cfg);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    // DeadlineExceeded is ours — no socket path produces it — so the deadline fired.
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchTasks(a));
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
+}
+
+test "a request that hits the deadline records no ApiError" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var l = try testListen(io, 18800);
+    defer l.server.deinit(io);
+    var hole = try io.concurrent(blackHole, .{ io, &l.server });
+    defer _ = hole.cancel(io);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{l.port});
+    const cfg = Config{ .url = url, .secret = "t", .timeout_ms = 200 };
+    var client = Client.init(io, a, &cfg);
+
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchTasks(a));
+    // Otherwise the CLI would print a stale `server error (409): …` from an earlier command.
+    try std.testing.expect(client.lastError() == null);
+}
+
+test "timeout_ms = 0 disables the deadline" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var l = try testListen(io, 18900);
+    defer l.server.deinit(io);
+    var serving = try io.concurrent(tinyResponder, .{ io, &l.server });
+    defer _ = serving.cancel(io);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{l.port});
+    const cfg = Config{ .url = url, .secret = "t", .timeout_ms = 0 };
+    var client = Client.init(io, a, &cfg);
+
+    const tasks = try client.fetchTasks(a);
+    try std.testing.expectEqual(@as(usize, 0), tasks.len);
 }

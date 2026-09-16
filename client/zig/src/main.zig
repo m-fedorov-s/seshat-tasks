@@ -49,6 +49,14 @@ fn stdoutErr(err: anyerror) anyerror {
 // same text, same `error.Reported` → silent exit 1 as before. Any other error (network,
 // OOM) passes through untouched to main's catch-all.
 fn reportApiError(client: *Client, err: anyerror) anyerror {
+    // A deadline records no ApiError, so lastError() here would be a stale message.
+    if (err == error.DeadlineExceeded) {
+        std.debug.print("server did not respond within {d} s ({s})\n", .{
+            @as(f64, @floatFromInt(client.config.timeout_ms)) / 1000.0,
+            client.config.url,
+        });
+        return error.Reported;
+    }
     if (err != error.ApiFailed) return err;
     const e = client.lastError() orelse return err;
     std.debug.print("server error ({d}): {s}\n", .{ e.code, e.message });
@@ -96,6 +104,11 @@ fn run(init: std.process.Init) !void {
 
     if (args.len < 2) return usage();
     const cmd = args[1];
+
+    // D6: announced once, on stderr so stdout stays clean. Not for `tui` — it uses its status line.
+    const is_tui = std.mem.eql(u8, cmd, "tui");
+    defer if (client.deadline_unavailable.load(.monotonic) and !is_tui)
+        std.debug.print("warning: no request deadline available\n", .{});
 
     if (std.mem.eql(u8, cmd, "show")) {
         try runShow(allocator, init, &client, &out.interface, args[2..]);
@@ -637,4 +650,48 @@ test {
 // check that can see a broken fallback.
 test "build_options.version is non-empty" {
     try std.testing.expect(build_options.version.len > 0);
+}
+
+// Every source file in the module. ADD NEW FILES HERE — this list is what makes the
+// deadline non-bypassable (see the test below).
+const src_files = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "main.zig", .text = @embedFile("main.zig") },
+    .{ .name = "formatter.zig", .text = @embedFile("formatter.zig") },
+    .{ .name = "shell.zig", .text = @embedFile("shell.zig") },
+    .{ .name = "schema_test.zig", .text = @embedFile("schema_test.zig") },
+    .{ .name = "api/client.zig", .text = @embedFile("api/client.zig") },
+    .{ .name = "api/types.zig", .text = @embedFile("api/types.zig") },
+    .{ .name = "core/args.zig", .text = @embedFile("core/args.zig") },
+    .{ .name = "core/config.zig", .text = @embedFile("core/config.zig") },
+    .{ .name = "core/display.zig", .text = @embedFile("core/display.zig") },
+    .{ .name = "core/edit.zig", .text = @embedFile("core/edit.zig") },
+    .{ .name = "core/filterspec.zig", .text = @embedFile("core/filterspec.zig") },
+    .{ .name = "core/task.zig", .text = @embedFile("core/task.zig") },
+    .{ .name = "core/view.zig", .text = @embedFile("core/view.zig") },
+    .{ .name = "tui/app.zig", .text = @embedFile("tui/app.zig") },
+    .{ .name = "tui/editors.zig", .text = @embedFile("tui/editors.zig") },
+    .{ .name = "tui/ledger.zig", .text = @embedFile("tui/ledger.zig") },
+    .{ .name = "tui/model.zig", .text = @embedFile("tui/model.zig") },
+    .{ .name = "tui/render.zig", .text = @embedFile("tui/render.zig") },
+};
+
+// The deadline is only non-bypassable if requestInner is the sole place an HTTP client is
+// constructed. The needle is split so this file's own source does not match it.
+test "every HTTP call site is deadlined" {
+    const needle = "std.http" ++ ".Client{";
+    const client_src = @embedFile("api/client.zig");
+    const inner = std.mem.indexOf(u8, client_src, "fn requestInner(").?;
+    const after = std.mem.indexOf(u8, client_src, "fn request(").?;
+    try std.testing.expect(inner < after);
+
+    for (src_files) |f| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, f.text, i, needle)) |at| : (i = at + needle.len) {
+            const ok = std.mem.eql(u8, f.name, "api/client.zig") and at > inner and at < after;
+            if (!ok) {
+                std.debug.print("un-deadlined HTTP client in {s} at byte {d}\n", .{ f.name, at });
+                return error.HttpCallSiteBypassesDeadline;
+            }
+        }
+    }
 }
