@@ -51,6 +51,15 @@ echo "building server + seeder + client..."
 (cd "$root" && go build -o "$tmp/seshat-seed" ./test/seed)
 (cd "$root/client/zig" && zig build)
 
+bin="$root/client/zig/zig-out/bin/seshat"
+
+# The only check that can catch build.zig's gitDescribe reading an uninitialised `code`
+# (spec F1): a unit test sees build_options after it has already been baked.
+v=$("$bin" --version)
+[ -n "$v" ] || { echo "FAIL: --version printed nothing"; exit 1; }
+[ "$v" != "seshat dev" ] || { echo "FAIL: --version is '$v' — the git describe fallback is broken"; exit 1; }
+echo "PASS: --version is '$v' (git describe, not the dev fallback)"
+
 "$tmp/seshat-server" -config "$tmp/server.yaml" >"$tmp/server.log" 2>&1 &
 pid=$!
 
@@ -145,3 +154,117 @@ if [[ "$detailed_out" == *"due 2026-08-02"* ]]; then
   exit 1
 fi
 echo "PASS: --detailed renders due_at in the configured local (+03:00) offset"
+
+# --- Stage 3 (b): `completions` and `init` -------------------------------------------
+# Dispatched before the config load, so they must work with no config and no $HOME —
+# which is how the installer calls them.
+
+for sh_name in fish bash zsh; do
+  set +e
+  out=$(env -u HOME SESHAT_CONFIG=/nonexistent/seshat.json "$bin" completions "$sh_name" 2>"$tmp/comp.err")
+  code=$?
+  set -e
+  [ "$code" -eq 0 ] || { echo "FAIL: 'completions $sh_name' exited $code, expected 0"; cat "$tmp/comp.err"; exit 1; }
+  [ -n "$out" ] || { echo "FAIL: 'completions $sh_name' printed nothing"; exit 1; }
+  printf '%s' "$out" | grep -q "seshat $sh_name completions" \
+    || { echo "FAIL: 'completions $sh_name' printed the wrong blob"; exit 1; }
+done
+echo "PASS: completions fish|bash|zsh print to stdout with no config"
+
+set +e
+"$bin" completions tcsh >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'completions tcsh' exited $code, expected 1"; exit 1; }
+grep -q 'unknown shell "tcsh"' "$tmp/comp.err" \
+  || { echo "FAIL: 'completions tcsh' did not name the shell:"; cat "$tmp/comp.err"; exit 1; }
+
+set +e
+"$bin" completions >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: bare 'completions' exited $code, expected 1"; exit 1; }
+grep -q 'Usage: seshat completions' "$tmp/comp.err" \
+  || { echo "FAIL: bare 'completions' printed no usage line"; exit 1; }
+
+set +e
+"$bin" completions fish bash >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'completions fish bash' exited $code, expected 1"; exit 1; }
+echo "PASS: completions rejects an unknown shell, no argument, and two arguments"
+
+set +e
+init_out=$(env -u HOME SESHAT_CONFIG=/nonexistent/seshat.json "$bin" init fish 2>"$tmp/comp.err"); code=$?
+set -e
+[ "$code" -eq 0 ] || { echo "FAIL: 'init fish' exited $code, expected 0"; cat "$tmp/comp.err"; exit 1; }
+[ -n "$init_out" ] || { echo "FAIL: 'init fish' printed nothing"; exit 1; }
+# Order is load-bearing: the function definitions must precede conf.d's
+# `status is-interactive; or exit` guard, which aborts sourcing at that point.
+func_line=$(printf '%s\n' "$init_out" | grep -n 'function seshat-prompt' | sed -n '1s/:.*//p')
+guard_line=$(printf '%s\n' "$init_out" | grep -n 'status is-interactive' | sed -n '1s/:.*//p')
+[ -n "$func_line" ] && [ -n "$guard_line" ] && [ "$func_line" -lt "$guard_line" ] \
+  || { echo "FAIL: 'init fish' must emit the functions file BEFORE conf.d (func=$func_line guard=$guard_line)"; exit 1; }
+
+set +e
+"$bin" init bash >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'init bash' exited $code, expected 1"; exit 1; }
+grep -q 'only "fish" is supported' "$tmp/comp.err" \
+  || { echo "FAIL: 'init bash' printed the wrong message:"; cat "$tmp/comp.err"; exit 1; }
+
+set +e
+"$bin" init >/dev/null 2>"$tmp/comp.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: bare 'init' exited $code, expected 1"; exit 1; }
+grep -q 'Usage: seshat init fish' "$tmp/comp.err" \
+  || { echo "FAIL: bare 'init' printed no usage line"; exit 1; }
+echo "PASS: init fish emits functions before conf.d; init bash and bare init exit 1"
+
+# Exit status only. The blob is under a kilobyte, so it fits the pipe buffer whole and
+# EPIPE is unreachable here — the real broken-pipe coverage is the `show` assertion above,
+# which is guarded by min_bytes for exactly this reason.
+set +e
+"$bin" completions fish 2>"$tmp/comp.err" | head -1 >/dev/null
+code=${PIPESTATUS[0]}
+set -e
+[ "$code" -eq 0 ] || { echo "FAIL: 'completions fish | head -1' exited $code, expected 0"; exit 1; }
+echo "PASS: completions exits 0 when stdout is a pipe"
+
+# --- Stage 3 (b): show --limit ---------------------------------------------------------
+lines=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 | wc -l)
+[ "$lines" -eq 6 ] || { echo "FAIL: 'show --limit 5' printed $lines lines, expected 6 (5 rows + trailer)"; exit 1; }
+trailer=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 | sed -n '$p')
+[ "$trailer" = "… and 1995 more" ] \
+  || { echo "FAIL: trailer was '$trailer', expected '… and 1995 more'"; exit 1; }
+echo "PASS: show --limit 5 is 5 rows plus '… and 1995 more'"
+
+flat_lines=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --flat --limit 3 | wc -l)
+[ "$flat_lines" -eq 4 ] || { echo "FAIL: 'show --flat --limit 3' printed $flat_lines lines, expected 4"; exit 1; }
+echo "PASS: show --flat --limit 3 is at most N+1 lines"
+
+json_out=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 --json)
+ids=$(printf '%s' "$json_out" | grep -o '"id"' | wc -l)
+[ "$ids" -eq 5 ] || { echo "FAIL: 'show --limit 5 --json' has $ids \"id\" keys, expected 5"; exit 1; }
+case "$json_out" in *…*) echo "FAIL: --json output carries the '…' trailer, which would break the JSON"; exit 1;; esac
+echo "PASS: show --limit 5 --json is 5 elements with no trailer"
+
+for bad in 0 abc -1; do
+  set +e
+  SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit "$bad" >/dev/null 2>"$tmp/limit.err"; code=$?
+  set -e
+  [ "$code" -eq 1 ] || { echo "FAIL: 'show --limit $bad' exited $code, expected 1"; exit 1; }
+  grep -q 'error: --limit must be a positive integer' "$tmp/limit.err" \
+    || { echo "FAIL: --limit $bad did not print the positive-integer error"; exit 1; }
+done
+set +e
+SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit >/dev/null 2>"$tmp/limit.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: trailing 'show --limit' exited $code, expected 1"; exit 1; }
+echo "PASS: show rejects --limit 0, abc, -1 and a missing value"
+
+# D7: the TUI rejects --limit as an unknown flag, before the terminal is touched.
+set +e
+SESHAT_CONFIG="$tmp/client.json" "$bin" tui --limit 5 >/dev/null 2>"$tmp/limit.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'tui --limit 5' exited $code, expected 1"; exit 1; }
+grep -q 'Bad arguments to `tui`' "$tmp/limit.err" \
+  || { echo "FAIL: 'tui --limit 5' was not rejected as a bad argument:"; cat "$tmp/limit.err"; exit 1; }
+echo "PASS: tui rejects --limit"

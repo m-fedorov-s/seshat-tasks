@@ -10,6 +10,7 @@ const argparse = @import("core/args.zig");
 const edit = @import("core/edit.zig");
 const filterspec = @import("core/filterspec.zig");
 const app = @import("tui/app.zig");
+const shell = @import("shell.zig");
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -48,6 +49,14 @@ fn stdoutErr(err: anyerror) anyerror {
 // same text, same `error.Reported` → silent exit 1 as before. Any other error (network,
 // OOM) passes through untouched to main's catch-all.
 fn reportApiError(client: *Client, err: anyerror) anyerror {
+    // A deadline records no ApiError, so lastError() here would be a stale message.
+    if (err == error.DeadlineExceeded) {
+        std.debug.print("server did not respond within {d} s ({s})\n", .{
+            @as(f64, @floatFromInt(client.config.timeout_ms)) / 1000.0,
+            client.config.url,
+        });
+        return error.Reported;
+    }
     if (err != error.ApiFailed) return err;
     const e = client.lastError() orelse return err;
     std.debug.print("server error ({d}): {s}\n", .{ e.code, e.message });
@@ -66,6 +75,12 @@ fn run(init: std.process.Init) !void {
         out.flush() catch |err| return stdoutErr(err);
         return;
     }
+
+    // Before the config load, like --version: the installer has no config file, maybe no $HOME.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "completions"))
+        return runCompletions(&out, args[2..]);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "init"))
+        return runInit(&out, args[2..]);
 
     const home = init.environ_map.get("HOME") orelse return error.HomeNotFound;
     const config_path = init.environ_map.get("SESHAT_CONFIG") orelse
@@ -89,6 +104,11 @@ fn run(init: std.process.Init) !void {
 
     if (args.len < 2) return usage();
     const cmd = args[1];
+
+    // D6: announced once, on stderr so stdout stays clean. Not for `tui` — it uses its status line.
+    const is_tui = std.mem.eql(u8, cmd, "tui");
+    defer if (client.deadline_unavailable.load(.monotonic) and !is_tui)
+        std.debug.print("warning: no request deadline available\n", .{});
 
     if (std.mem.eql(u8, cmd, "show")) {
         try runShow(allocator, init, &client, &out.interface, args[2..]);
@@ -124,6 +144,43 @@ fn run(init: std.process.Init) !void {
     }
 }
 
+fn runCompletions(out: *std.Io.File.Writer, argv: []const []const u8) !void {
+    if (argv.len != 1) {
+        std.debug.print("Usage: seshat completions <fish|bash|zsh>\n", .{});
+        return error.Reported;
+    }
+    // Annotated because each @embedFile has its own `*const [N:0]u8` type.
+    const blob: []const u8 = if (std.mem.eql(u8, argv[0], "fish"))
+        shell.fish_completions
+    else if (std.mem.eql(u8, argv[0], "bash"))
+        shell.bash_completions
+    else if (std.mem.eql(u8, argv[0], "zsh"))
+        shell.zsh_completions
+    else {
+        std.debug.print("unknown shell \"{s}\" (want fish, bash or zsh)\n", .{argv[0]});
+        return error.Reported;
+    };
+    out.interface.writeAll(blob) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
+}
+
+// ORDER IS LOAD-BEARING: conf.d's `status is-interactive; or exit` guard aborts sourcing at
+// that point, so the function definitions must precede it. This makes
+// `seshat init fish > ~/.config/fish/conf.d/seshat.fish` a complete single-file install.
+fn runInit(out: *std.Io.File.Writer, argv: []const []const u8) !void {
+    if (argv.len != 1) {
+        std.debug.print("Usage: seshat init fish\n", .{});
+        return error.Reported;
+    }
+    if (!std.mem.eql(u8, argv[0], "fish")) {
+        std.debug.print("seshat init: only \"fish\" is supported (got \"{s}\")\n", .{argv[0]});
+        return error.Reported;
+    }
+    out.interface.writeAll(shell.fish_functions) catch |err| return stdoutErr(err);
+    out.interface.writeAll(shell.fish_conf_d) catch |err| return stdoutErr(err);
+    out.flush() catch |err| return stdoutErr(err);
+}
+
 const show_specs = [_]argparse.OptionSpec{
     .{ .name = "sort", .kind = .value },
     .{ .name = "filter", .kind = .multi },
@@ -132,6 +189,7 @@ const show_specs = [_]argparse.OptionSpec{
     .{ .name = "detailed", .kind = .boolean },
     .{ .name = "json", .kind = .boolean },
     .{ .name = "no-color", .kind = .boolean },
+    .{ .name = "limit", .kind = .value },
 };
 
 fn runShow(
@@ -146,6 +204,15 @@ fn runShow(
         return error.Reported;
     };
     defer argparse.deinit(allocator, &parsed);
+
+    // Parsed before the fetch so a bad value costs no request.
+    const limit: ?usize = if (parsed.getValue("limit")) |s|
+        argparse.positiveInt(s) orelse {
+            std.debug.print("error: --limit must be a positive integer\n", .{});
+            return error.Reported;
+        }
+    else
+        null;
 
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s));
     const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
@@ -194,8 +261,17 @@ fn runShow(
     defer allocator.free(selected);
     view.rank(selected, strategy, now);
 
+    // Derived from the parsed flags, not opts.show_children — opts is built below, after
+    // the --json early return.
+    const count_children = !parsed.getBool("flat") and !parsed.getBool("json");
+    const lim = if (limit) |n|
+        view.limitRows(selected, count_children, n)
+    else
+        view.Limited{ .shown = selected, .hidden_rows = 0 };
+
     if (parsed.getBool("json")) {
-        formatter.renderJson(out, selected) catch |err| return stdoutErr(err);
+        // No trailer: a trailer would make the output not-JSON.
+        formatter.renderJson(out, lim.shown) catch |err| return stdoutErr(err);
         out.flush() catch |err| return stdoutErr(err);
         return;
     }
@@ -218,7 +294,9 @@ fn runShow(
     for (tasks) |t| try all_ids.append(allocator, t.id);
     opts.handle_len = try view.minUniqueSuffixLen(allocator, all_ids.items);
 
-    formatter.render(out, opts, now, selected, &idx) catch |err| return stdoutErr(err);
+    formatter.render(out, opts, now, lim.shown, &idx) catch |err| return stdoutErr(err);
+    if (lim.hidden_rows > 0)
+        out.print("… and {d} more\n", .{lim.hidden_rows}) catch |err| return stdoutErr(err);
     out.flush() catch |err| return stdoutErr(err);
 }
 
@@ -520,6 +598,7 @@ fn usage() void {
         \\                      --detailed    rich output (tags, dates, ids, description)
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
+        \\                      --limit N     at most N task rows, then "… and M more"
         \\  tui [flags]       Interactive full-screen view. Flags:
         \\                      --sort <priority|due|title|created|urgency>  (default urgency)
         \\                      --filter <tag:NAME|status:S1,S2|overdue>     (repeatable, AND)
@@ -535,6 +614,8 @@ fn usage() void {
         \\                      --verbose   print the resulting task on success
         \\  delete <id>       Delete a task (accepts an id tail / #handle, e.g. delete a1b2)
         \\  done <id>         Mark a task done (accepts an id tail / #handle, e.g. done a1b2)
+        \\  completions <shell> Print shell completions (fish|bash|zsh)
+        \\  init fish           Print the fish prompt-hook file to stdout
         \\  --version         Print the client version and exit
         \\
     , .{});
@@ -543,6 +624,7 @@ fn usage() void {
 test {
     // Make the pure-module unit tests reachable from `zig build test`
     // (the build test root is this file; see client/zig/CLAUDE.md).
+    _ = @import("shell.zig");
     _ = @import("core/view.zig");
     _ = @import("core/args.zig");
     _ = @import("core/display.zig");
@@ -562,4 +644,59 @@ test {
     // reaches it until the `tui` subcommand exists. This import plus its own
     // `refAllDecls` block is what typechecks the event loop at all.
     _ = @import("tui/app.zig");
+}
+
+// A floor only: build_options is baked before this runs, so test/broken-pipe.sh is the
+// check that can see a broken fallback.
+test "build_options.version is non-empty" {
+    try std.testing.expect(build_options.version.len > 0);
+}
+
+// Every source file in the module. ADD NEW FILES HERE — this list is what makes the
+// deadline non-bypassable (see the test below).
+const src_files = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "main.zig", .text = @embedFile("main.zig") },
+    .{ .name = "formatter.zig", .text = @embedFile("formatter.zig") },
+    .{ .name = "shell.zig", .text = @embedFile("shell.zig") },
+    .{ .name = "schema_test.zig", .text = @embedFile("schema_test.zig") },
+    .{ .name = "api/client.zig", .text = @embedFile("api/client.zig") },
+    .{ .name = "api/types.zig", .text = @embedFile("api/types.zig") },
+    .{ .name = "core/args.zig", .text = @embedFile("core/args.zig") },
+    .{ .name = "core/config.zig", .text = @embedFile("core/config.zig") },
+    .{ .name = "core/display.zig", .text = @embedFile("core/display.zig") },
+    .{ .name = "core/edit.zig", .text = @embedFile("core/edit.zig") },
+    .{ .name = "core/filterspec.zig", .text = @embedFile("core/filterspec.zig") },
+    .{ .name = "core/task.zig", .text = @embedFile("core/task.zig") },
+    .{ .name = "core/view.zig", .text = @embedFile("core/view.zig") },
+    .{ .name = "tui/app.zig", .text = @embedFile("tui/app.zig") },
+    .{ .name = "tui/editors.zig", .text = @embedFile("tui/editors.zig") },
+    .{ .name = "tui/ledger.zig", .text = @embedFile("tui/ledger.zig") },
+    .{ .name = "tui/model.zig", .text = @embedFile("tui/model.zig") },
+    .{ .name = "tui/render.zig", .text = @embedFile("tui/render.zig") },
+};
+
+// The deadline is only non-bypassable if requestInner is the sole place an HTTP client is
+// constructed. Both needles are split (never written whole in a comment) so this file's own
+// source does not match them. Two needles because the plain struct-literal form and the
+// decl-literal form (a type annotation assigned `.{ ... }`) are both idiomatic Zig 0.16;
+// neither needle alone catches both constructions.
+test "every HTTP call site is deadlined" {
+    const needles = [_][]const u8{ "std.http" ++ ".Client{", ": std.http" ++ ".Client" };
+    const client_src = @embedFile("api/client.zig");
+    const inner = std.mem.indexOf(u8, client_src, "fn requestInner(").?;
+    const after = std.mem.indexOf(u8, client_src, "fn request(").?;
+    try std.testing.expect(inner < after);
+
+    for (src_files) |f| {
+        for (needles) |needle| {
+            var i: usize = 0;
+            while (std.mem.indexOfPos(u8, f.text, i, needle)) |at| : (i = at + needle.len) {
+                const ok = std.mem.eql(u8, f.name, "api/client.zig") and at > inner and at < after;
+                if (!ok) {
+                    std.debug.print("un-deadlined HTTP client in {s} at byte {d}\n", .{ f.name, at });
+                    return error.HttpCallSiteBypassesDeadline;
+                }
+            }
+        }
+    }
 }

@@ -583,3 +583,127 @@ test "minUniqueSuffixLen: duplicate ids fall back to 26" {
     const dup = [_][]const u8{ "01HZZ0000000000000000WORK1", "01HZZ0000000000000000WORK1" };
     try std.testing.expectEqual(@as(usize, 26), try minUniqueSuffixLen(a, &dup));
 }
+
+pub const Limited = struct {
+    /// A prefix sub-slice of `toplevel` (no copy); `hidden_rows` is what was NOT rendered.
+    shown: []const Task,
+    hidden_rows: usize,
+};
+
+/// Caps the forest at `max_rows` rendered rows: a top-level entry plus, when
+/// `count_children`, each of its `child_ids` — dangling ids included, since the renderer
+/// spends a `[missing: …]` line on them. `count_children` mirrors what the renderer will
+/// print, not what the filter selected: false for `--flat` and `--json`. Whole roots only,
+/// so no orphaned `├─` can be printed; a first root larger than `max_rows` goes out anyway.
+/// Asserts `max_rows >= 1`.
+pub fn limitRows(toplevel: []const Task, count_children: bool, max_rows: usize) Limited {
+    std.debug.assert(max_rows >= 1);
+
+    var total: usize = 0;
+    for (toplevel) |t| total += if (count_children) 1 + t.content.child_ids.len else 1;
+
+    var used: usize = 0;
+    var n: usize = 0;
+    for (toplevel) |t| {
+        const cost: usize = if (count_children) 1 + t.content.child_ids.len else 1;
+        // Stop at the first misfit; skipping it would reorder the ranking. `n > 0` is the
+        // render-the-first-root-anyway rule.
+        if (n > 0 and used + cost > max_rows) break;
+        used += cost;
+        n += 1;
+    }
+
+    return .{ .shown = toplevel[0..n], .hidden_rows = total - used };
+}
+
+// Spec §4.4's worked example: four ranked roots with 3, 0, 5 and 1 children — 13 rows.
+const lim_a_kids = [_][]const u8{ "a1", "a2", "a3" };
+const lim_c_kids = [_][]const u8{ "c1", "c2", "c3", "c4", "c5" };
+const lim_d_kids = [_][]const u8{"d1"};
+
+fn limitRootsFixture() [4]Task {
+    return .{
+        .{ .id = "A", .content = .{ .title = "A", .child_ids = @constCast(&lim_a_kids) }, .meta = .{ .created_at = 1 } },
+        .{ .id = "B", .content = .{ .title = "B" }, .meta = .{ .created_at = 2 } },
+        .{ .id = "C", .content = .{ .title = "C", .child_ids = @constCast(&lim_c_kids) }, .meta = .{ .created_at = 3 } },
+        .{ .id = "D", .content = .{ .title = "D", .child_ids = @constCast(&lim_d_kids) }, .meta = .{ .created_at = 4 } },
+    };
+}
+
+// The same forest flattened: the shape `--flat` produces.
+fn limitAllFixture() [13]Task {
+    const roots = limitRootsFixture();
+    const kid_ids = [_][]const u8{ "a1", "a2", "a3", "c1", "c2", "c3", "c4", "c5", "d1" };
+    var all: [13]Task = undefined;
+    for (roots, 0..) |r, i| all[i] = r;
+    for (kid_ids, 0..) |id, i| all[4 + i] = .{ .id = id, .content = .{ .title = id }, .meta = .{ .created_at = 10 } };
+    return all;
+}
+
+test "limitRows counts a root plus its rendered children as rows" {
+    const roots = limitRootsFixture();
+    // A costs 1 + 3 and fits exactly; B would make 5.
+    const lim = limitRows(&roots, true, 4);
+    try std.testing.expectEqual(@as(usize, 1), lim.shown.len);
+    try std.testing.expectEqualStrings("A", lim.shown[0].id);
+    try std.testing.expectEqual(@as(usize, 9), lim.hidden_rows);
+}
+
+test "limitRows never splits a root from its children" {
+    const roots = limitRootsFixture();
+    // A(4) + B(1) fits; C costs 6 and is dropped WHOLE — a split C would print orphaned
+    // `├─` lines. hidden_rows counts rows (8), not the 2 dropped roots.
+    const lim = limitRows(&roots, true, 5);
+    try std.testing.expectEqual(@as(usize, 2), lim.shown.len);
+    try std.testing.expectEqualStrings("A", lim.shown[0].id);
+    try std.testing.expectEqualStrings("B", lim.shown[1].id);
+    try std.testing.expectEqual(@as(usize, 8), lim.hidden_rows);
+}
+
+test "limitRows always renders at least the first root" {
+    const roots = limitRootsFixture();
+    // A costs 4 against max_rows = 2: rendering nothing but "… and 13 more" helps nobody.
+    const lim = limitRows(&roots, true, 2);
+    try std.testing.expectEqual(@as(usize, 1), lim.shown.len);
+    try std.testing.expectEqualStrings("A", lim.shown[0].id);
+    try std.testing.expectEqual(@as(usize, 9), lim.hidden_rows);
+}
+
+test "limitRows with count_children=false is a plain prefix slice" {
+    const all = limitAllFixture();
+    const flat = limitRows(&all, false, 3);
+    try std.testing.expectEqual(@as(usize, 3), flat.shown.len);
+    try std.testing.expectEqual(@as(usize, 10), flat.hidden_rows);
+
+    // --json over a CHILD-BEARING forest: renderJson serializes the top level only. If
+    // children counted, A alone would cost 4 and this would return one element.
+    const roots = limitRootsFixture();
+    const json = limitRows(&roots, false, 2);
+    try std.testing.expectEqual(@as(usize, 2), json.shown.len);
+    try std.testing.expectEqualStrings("B", json.shown[1].id);
+    try std.testing.expectEqual(@as(usize, 2), json.hidden_rows);
+}
+
+test "limitRows counts a dangling child id as a row" {
+    const dangling = [_][]const u8{"gone"};
+    const roots = [_]Task{
+        .{ .id = "X", .content = .{ .title = "X", .child_ids = @constCast(&dangling) }, .meta = .{ .created_at = 1 } },
+        .{ .id = "Y", .content = .{ .title = "Y" }, .meta = .{ .created_at = 2 } },
+    };
+    // X costs 2. If a dangling id were free, Y would fit and nothing would be hidden.
+    const lim = limitRows(&roots, true, 2);
+    try std.testing.expectEqual(@as(usize, 1), lim.shown.len);
+    try std.testing.expectEqualStrings("X", lim.shown[0].id);
+    try std.testing.expectEqual(@as(usize, 1), lim.hidden_rows);
+}
+
+test "limitRows drops nothing when max_rows exceeds the total" {
+    const roots = limitRootsFixture();
+    const exact = limitRows(&roots, true, 13);
+    try std.testing.expectEqual(@as(usize, 4), exact.shown.len);
+    try std.testing.expectEqual(@as(usize, 0), exact.hidden_rows);
+
+    const plenty = limitRows(&roots, true, 100);
+    try std.testing.expectEqual(@as(usize, 4), plenty.shown.len);
+    try std.testing.expectEqual(@as(usize, 0), plenty.hidden_rows);
+}

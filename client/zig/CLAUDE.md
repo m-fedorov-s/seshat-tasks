@@ -13,9 +13,23 @@ zig build test         # runs the whole suite (main.zig aggregates the other fil
 zig test src/<file>.zig # run a single file's unit tests directly (fastest iteration)
 ```
 
-**Requires a git checkout.** `build.zig` derives the `--version` string by shelling out to `git
-describe --tags --always --dirty` and aborts the build if that fails (e.g. building from a
-tarball with no `.git`). Override with `-Dversion=<string>` when building outside a checkout.
+**Version string, and building without `.git`.** `build.zig` derives `--version` from
+`-Dversion=<string>` if it is **non-empty**, else `git describe --tags --always --dirty`, else the
+literal `dev` — it no longer aborts, so an exported tree still builds. Caveat: `runAllowFail` spawns
+without setting a cwd, so `git describe` resolves against wherever `zig build` was *invoked*, not
+the build root — `zig build --build-file …` from outside the repo silently reports `dev`.
+
+**Build flags.** `zig build` takes the standard `-Dtarget=<triple>` / `-Doptimize=<mode>` plus
+`-Dstrip` (omit debug info; the release does **not** use it — spec (d) keeps ReleaseSafe stack
+traces) and `-Dversion=`. All four release targets (`{x86_64,aarch64}-{linux-musl,macos}`) build
+from this tree unchanged. The **test** artifact is pinned to `b.graph.host`, because a
+foreign-target test binary cannot be run here: `zig build test -Dtarget=…` still compiles and runs
+the full *host* suite, so a green `test` says nothing about a cross-target build — use
+`zig build -Dtarget=…` for that. `-Doptimize` is not wired through to the test artifact either; the
+tests exercise Debug safety checks and `std.debug.assert`.
+
+**`client/shell/` is a build input.** `build.zig` embeds five files from it (see `src/shell.zig`).
+A copy of `client/zig` without its `client/shell` sibling does not build.
 
 **Gotcha:** `zig build test` uses `src/main.zig` as the test root, so a file's tests only run if
 reachable from main's import graph. `src/main.zig` ends with a `test { _ = @import("core/view.zig");
@@ -44,17 +58,26 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 ## Layout
 
-- `src/main.zig` — entry point + subcommand dispatch (`--version`, `show`, `tui`, `add`,
-  `update <id>`, `delete <id>`, `done <id>`, `help`). `--version` is checked before the config load (and prints
-  `build_options.version`), so it works on a machine with no config file. Uses the 0.16
-  `std.process.Init` entry signature: `pub fn main(init:
+- `src/main.zig` — entry point + subcommand dispatch (`--version`, `completions <fish|bash|zsh>`,
+  `init fish`, `show`, `tui`, `add`, `update <id>`, `delete <id>`, `done <id>`, `help`).
+  `--version`, `completions` and `init` are all handled **before the config load** (the installer
+  runs `seshat completions fish` on a machine with no config file and possibly no `$HOME`);
+  `completions`/`init` print blobs embedded from `client/shell/` — see `src/shell.zig`. Uses the
+  0.16 `std.process.Init` entry signature: `pub fn main(init:
   std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
-  from `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O. Owns the
-  `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline (parse →
-  fetch → `view.select` → `view.rank` → `formatter.render`|`renderJson`), resolves color
+  from `init.environ_map`, and passes `init.io` (the `std.Io` instance) down into all I/O.
+  Owns the `show` flag declaration (`show_specs`) and `runShow`, which wires the view pipeline
+  (parse → fetch → `view.select` → `view.rank` → **`view.limitRows`** → `formatter.render`|
+  `renderJson`) … `--limit N` caps *rendered rows* and prints a `… and M more` trailer;
+  `count_children` is derived from the parsed flags **before** the `--json` early return, because
+  `opts.show_children` does not exist yet at that point. Also resolves color
   (`.auto`→on/off via `std.Io.File.stdout().isTty`), width (`COLUMNS` env → `config.width`), and the
   `#handle` length (`view.minUniqueSuffixLen` over *all* fetched tasks, so handles resolve uniquely).
-  `done`/`delete` resolve an id **tail/suffix** (or `#handle`) via `view.resolve`.
+  `done`/`delete` resolve an id **tail/suffix** (or `#handle`) via `view.resolve`. Also holds two
+  structural tests: `build_options.version is non-empty`, and **`every HTTP call site is
+  deadlined`**, which embeds every file under `src/` and fails if a `std.http.Client` is
+  constructed anywhere but `api/client.zig`'s `requestInner` — **add new source files to its
+  `src_files` list**.
   - **`add`/`update`** share one flag set (`edit.flag_specs`) and the flag→patch builder
     (`edit.patchFromArgs`): `runAdd`/`runUpdate` build an `edit.Patch`, apply it client-side
     (`edit.applyPatch` — `add` over a default `Content` seeded with the positional title; `update`
@@ -96,15 +119,33 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     helper before it can reach `main`'s catch; a `error.WriteFailed` from anywhere else (notably a
     dropped network connection in `api/client.zig`, which raises the identical error) is left
     unmapped and still fails nonzero with the one-line message, so a network failure can never be
-    mistaken for a successful mutation.
+    mistaken for a successful mutation. The same `stdoutErr` path covers `completions`/`init`, so
+    `seshat completions fish > file` exits 0 even if the write itself failed (a full disk, say) —
+    an installer must check the written file is non-empty rather than trust the exit code.
+- `src/shell.zig` — the five shell-integration files, `@embedFile`d at build time from
+  **`client/shell/`, which is the single source of truth** (`client/shell/fish/` is also the fisher
+  plugin root, and the whole tree is the installer's input). Do **not** edit an embedded copy and
+  do not generate these files from the flag tables. `@embedFile` cannot escape a module root, so
+  `build.zig` mounts each file as its own anonymous module (`addAnonymousImport` +
+  `b.path("../shell/…")`) on **both** the exe and the test
+  artifact — the documented mechanism, see the build-system guide's "Producing Assets for
+  `@embedFile`". All five files are a **required build input**: delete one and `zig build` fails
+  with `error: failed to check cache: '…' file_hash FileNotFound`. Edits to them are cache-tracked
+  by content. Two tests: every blob is non-empty, and the fish completion carries an
+  `-a <subcommand>` entry for every subcommand (a drift alarm — the completions are hand-written).
 - `src/core/view.zig` — the pure view layer: `Index` (id→Task + which ids are referenced as
   children, for root-ness), `Filters` + `select` (AND-combined `is_root`/tag/status/overdue),
   sort `Strategy` + `rank` (completed sink, stable `created_at,id` tiebreak), the time-aware
   `urgency` score (which compares durations, so the UTC offset cancels and must not be threaded
-  in), `resolve` (id **suffix/tail** → unique task), and `minUniqueSuffixLen` (shortest
-  unique tail length). All pure, `now: i64` passed in.
+  in), `resolve` (id **suffix/tail** → unique task), `minUniqueSuffixLen` (shortest unique tail
+  length), and `limitRows` (`show --limit N`: caps the ranked top-level slice at N *rendered
+  rows* — a root plus, when the renderer will print them, its `child_ids`, dangling ids included
+  — cutting only on whole-root boundaries so no orphaned `├─` can be printed, and always emitting
+  at least the first root). All pure, `now: i64` passed in.
 - `src/core/args.zig` — a generic, declaration-driven flag parser: `OptionSpec` table in →
   `ParsedArgs` (query by name with `getBool`/`getValue`/`getMulti`). No seshat flag names baked in.
+  Also `positiveInt(s) ?usize`, a generic "positive integer, as `std.fmt.parseUnsigned` parses it"
+  helper (`--limit` uses it).
 - `src/core/edit.zig` — the **pure edit core** (no I/O), shared by `add`/`update` and the future
   TUI. `Edit(T) = union(enum){ unchanged, set: T }` is the uniform per-field patch; `Patch` is one
   `Edit` per editable `Content` field (`DatePatch = Edit(?i64)`, `.set = null` clears; tags `.set`
@@ -150,10 +191,12 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   deliberately deferred until the TUI exists to reveal which strings actually need to be shared.
   Immediate children only (depth 1); `[missing: #tail]` for dangling ids.
 - `src/core/config.zig` — `Config` struct, loaded from JSON (`SESHAT_CONFIG` env or
-  `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `max_lines`,
-  `cache_ttl_seconds`, `cache_dir` (currently unused — caching is deferred), `utc_offset`
-  (format `±HH:MM`, range ±14:00, defaults to `"+00:00"`; malformed value is a hard startup
-  error, not a silent fallback), `offset_minutes` (derived from `utc_offset`).
+  `~/.config/seshat/config.json`). Fields: `url`, `secret` (required); `timeout_ms` (wall-clock
+  deadline per HTTP request, default 10000, **`0` = no deadline**); `cache_ttl_seconds`, `cache_dir`
+  (currently unused — caching is deferred), `width`, `utc_offset` (format `±HH:MM`, range ±14:00,
+  defaults to `"+00:00"`; malformed value is a hard startup error, not a silent fallback),
+  `offset_minutes` (derived from `utc_offset`). `max_lines` was deleted (dead since the fish client
+  was retired); `.ignore_unknown_fields = true` means an old config that still carries it loads fine.
 - `src/core/task.zig` — `Task = { id, content, meta }` matching `schema/SCHEMA.md`. `Status`/
   `Priority` are string enums with an unknown-value `jsonParse` fallback.
 - `src/api/client.zig` — `Client`: fetch (plain GET) / add / update (batch) / delete over HTTP.
@@ -184,6 +227,27 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     refetch. `parseConflict` yields an empty slice for an unparseable body (OOM still propagates).
     The status→result decision lives in the pure `updateResultFrom` so the 409 branch is unit
     testable — no CLI invocation can reach it (the CLI refetches immediately before every update).
+  - **One chokepoint, and every request is deadlined.** `requestInner` is the only place in the
+    whole client that constructs a `std.http.Client`; `request` wraps it in `deadlined`, which races
+    it against `Io.sleep` inside an `Io.Select` and cancels the loser — the babysitter-task pattern
+    upstream recommends (ziglang/zig#31098), since 0.16's HTTP client has no timeout at all.
+    `fetchTasks`/`postJson` interpret the status and parse *outside* the deadline, so a cancelled
+    task can only discard a body buffer. Four rules, all load-bearing: (1) **`cancelDiscard` on
+    every path out** of `deadlined` — the `Select` owns locals, and returning with a task still live
+    is a use-after-return that will not reproduce under test; (2) **`concurrent`, never `async`** —
+    the async path silently runs the function inline when it is out of budget, which would make the
+    deadline do nothing; (3) the **allocator must be an arena**, because a cancelled task's result is
+    discarded without being freed (and it is not threadsafe to touch that arena from the calling
+    thread while the request is in flight); (4) the error is **`DeadlineExceeded`, not `Timeout`** —
+    `error.Timeout` is already reachable from `Io.net`, so it could not tell a deadline from a
+    kernel ETIMEDOUT. `timeout_ms: 0` short-circuits before any `Select` exists. A deadline records
+    **no** `ApiError`, so `lastError()` is not clobbered. If `concurrent` is ever refused, the
+    request runs inline with no deadline and `deadline_unavailable` (an atomic — the TUI writes it
+    from a worker and reads it on the loop thread) is set: the CLI prints one stderr warning, the
+    TUI a status-line note; this file still never prints. `main.zig`'s
+    `test "every HTTP call site is deadlined"` is what keeps the chokepoint single. A
+    `DeadlineExceeded` on a mutation is ambiguous — the request may have already reached and been
+    applied by the server before the client gave up on it.
 - `src/api/types.zig` — API wire types (`GetResponse`, `AddRequest`, `UpdateOp`, `AddResponse`,
   `UpdateResponse`, etc.).
 - `src/tui/` — the interactive client (`seshat tui`). **Five files, split on one boundary:
@@ -265,7 +329,10 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
   symlink, which made every description edit fail with an opaque `FileNotFound`; a `$VISUAL`/
   `$EDITOR` the user set is never probed, and the failure message names the program it tried.
   Refresh is **manual** (`R`, which writes `refreshing…` so a retry that fails again is
-  distinguishable from a dead key) — there is no polling; see `plans/todo.md`.
+  distinguishable from a dead key) — there is no polling; see `plans/todo.md`. A refresh can now
+  also fail on a deadline: `server did not respond within 10 s` on the status line. Quitting with a
+  request still in flight now blocks for at most `timeout_ms` while it drains; `timeout_ms: 0`
+  removes that bound too, so `q` waits for the request instead.
 
   The **status line is transient**. The footer shows `m.status()` *instead of* the key bar, so a
   message that is never taken back costs the user their keymap for the rest of the session.

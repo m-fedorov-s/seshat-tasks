@@ -189,17 +189,20 @@ fn failEvent(a: std.mem.Allocator, client: *api.Client, err: anyerror) model.Eve
     if (err == error.ApiFailed) {
         if (client.lastError()) |e| return .{ .request_failed = e.message };
     }
+    if (err == error.DeadlineExceeded)
+        return .{ .request_failed = std.fmt.allocPrint(
+            a,
+            "server did not respond within {d} s",
+            .{@as(f64, @floatFromInt(client.config.timeout_ms)) / 1000.0},
+        ) catch "server did not respond" };
     const msg = std.fmt.allocPrint(a, "could not reach the server ({s})", .{@errorName(err)}) catch
         @errorName(err);
     return .{ .request_failed = msg };
 }
 
-// The worker body, run off the loop by `io.async` so rendering and input never
-// wait on the network (spec §6). There is no request timeout: Zig 0.16's HTTP
-// client has none (`RequestOptions` has no timeout field; the only `timeout` is a
-// *connect* timeout on `ConnectTcpOptions`). Accepted — the requirement was that
-// the LOOP stays responsive, and it does; a hung request costs the user the
-// ability to start another mutation, not the ability to scroll or quit.
+// The worker body, run off the loop by `io.async` so rendering and input never wait on
+// the network (spec §6). Requests carry a `config.timeout_ms` deadline (see `deadlined` in
+// api/client.zig), so a wedged server costs a refresh, not the session.
 fn runRequest(client: *api.Client, loop: *Loop, req: *Request, job: Job) void {
     const a = req.arena.allocator();
     const ev: model.Event = perform(a, client, job) catch |err| failEvent(a, client, err);
@@ -791,6 +794,8 @@ pub fn run(
     defer loop.uninstallResizeHandler();
 
     var pending: std.ArrayList(*Request) = .empty;
+    // D6: announced once, on the status line (a stderr write would corrupt the alt screen).
+    var deadline_warned = false;
     defer {
         // Registered after the loop's defers so it runs BEFORE them: the workers
         // must be joined while `loop` is still alive.
@@ -867,6 +872,11 @@ pub fn run(
             // Unreachable today (a `.result` always carries an event), but the
             // arena must not depend on that staying true.
             retire(io, gpa, &pending, req);
+        }
+
+        if (client.deadline_unavailable.load(.monotonic) and !deadline_warned) {
+            deadline_warned = true;
+            m.setStatus("no request deadline available", .{}) catch {};
         }
 
         render.draw(vx.window(), &m);

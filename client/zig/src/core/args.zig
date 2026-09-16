@@ -134,3 +134,22 @@ pub fn deinit(allocator: std.mem.Allocator, p: *ParsedArgs) void {
     p.multis.deinit();
     p.positionals.deinit(allocator);
 }
+
+/// A positive integer as `std.fmt.parseUnsigned` parses it, rejecting 0. Generic: this
+/// file stays free of seshat flag names.
+pub fn positiveInt(s: []const u8) ?usize {
+    const n = std.fmt.parseUnsigned(usize, s, 10) catch return null;
+    return if (n == 0) null else n;
+}
+
+test "positiveInt rejects 0, negatives, empty, trailing junk and overflow" {
+    try std.testing.expectEqual(@as(?usize, 5), positiveInt("5"));
+    try std.testing.expectEqual(@as(?usize, 1), positiveInt("1"));
+    try std.testing.expect(positiveInt("0") == null);
+    try std.testing.expect(positiveInt("-1") == null);
+    try std.testing.expect(positiveInt("") == null);
+    try std.testing.expect(positiveInt("1x") == null);
+    // A `.value` spec consumes the next argv unconditionally, so these arrive here.
+    try std.testing.expect(positiveInt("--flat") == null);
+    try std.testing.expect(positiveInt("99999999999999999999999999") == null);
+}
