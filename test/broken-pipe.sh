@@ -225,3 +225,42 @@ code=${PIPESTATUS[0]}
 set -e
 [ "$code" -eq 0 ] || { echo "FAIL: 'completions fish | head -1' exited $code, expected 0"; exit 1; }
 echo "PASS: completions exits 0 when stdout is a pipe"
+
+# --- Stage 3 (b): show --limit ---------------------------------------------------------
+lines=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 | wc -l)
+[ "$lines" -eq 6 ] || { echo "FAIL: 'show --limit 5' printed $lines lines, expected 6 (5 rows + trailer)"; exit 1; }
+trailer=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 | sed -n '$p')
+[ "$trailer" = "… and 1995 more" ] \
+  || { echo "FAIL: trailer was '$trailer', expected '… and 1995 more'"; exit 1; }
+echo "PASS: show --limit 5 is 5 rows plus '… and 1995 more'"
+
+flat_lines=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --flat --limit 3 | wc -l)
+[ "$flat_lines" -eq 4 ] || { echo "FAIL: 'show --flat --limit 3' printed $flat_lines lines, expected 4"; exit 1; }
+echo "PASS: show --flat --limit 3 is at most N+1 lines"
+
+json_out=$(SESHAT_CONFIG="$tmp/client.json" COLUMNS=120 "$bin" show --limit 5 --json)
+ids=$(printf '%s' "$json_out" | grep -o '"id"' | wc -l)
+[ "$ids" -eq 5 ] || { echo "FAIL: 'show --limit 5 --json' has $ids \"id\" keys, expected 5"; exit 1; }
+case "$json_out" in *…*) echo "FAIL: --json output carries the '…' trailer, which would break the JSON"; exit 1;; esac
+echo "PASS: show --limit 5 --json is 5 elements with no trailer"
+
+for bad in 0 abc -1; do
+  set +e
+  SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit "$bad" >/dev/null 2>"$tmp/limit.err"; code=$?
+  set -e
+  [ "$code" -eq 1 ] || { echo "FAIL: 'show --limit $bad' exited $code, expected 1"; exit 1; }
+done
+set +e
+SESHAT_CONFIG="$tmp/client.json" "$bin" show --limit >/dev/null 2>"$tmp/limit.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: trailing 'show --limit' exited $code, expected 1"; exit 1; }
+echo "PASS: show rejects --limit 0, abc, -1 and a missing value"
+
+# D7: the TUI rejects --limit as an unknown flag, before the terminal is touched.
+set +e
+SESHAT_CONFIG="$tmp/client.json" "$bin" tui --limit 5 >/dev/null 2>"$tmp/limit.err"; code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: 'tui --limit 5' exited $code, expected 1"; exit 1; }
+grep -q 'Bad arguments to `tui`' "$tmp/limit.err" \
+  || { echo "FAIL: 'tui --limit 5' was not rejected as a bad argument:"; cat "$tmp/limit.err"; exit 1; }
+echo "PASS: tui rejects --limit"

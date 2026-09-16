@@ -176,6 +176,7 @@ const show_specs = [_]argparse.OptionSpec{
     .{ .name = "detailed", .kind = .boolean },
     .{ .name = "json", .kind = .boolean },
     .{ .name = "no-color", .kind = .boolean },
+    .{ .name = "limit", .kind = .value },
 };
 
 fn runShow(
@@ -190,6 +191,15 @@ fn runShow(
         return error.Reported;
     };
     defer argparse.deinit(allocator, &parsed);
+
+    // Parsed before the fetch so a bad value costs no request.
+    const limit: ?usize = if (parsed.getValue("limit")) |s|
+        argparse.positiveInt(s) orelse {
+            std.debug.print("error: --limit must be a positive integer\n", .{});
+            return error.Reported;
+        }
+    else
+        null;
 
     const now: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(init.io, .real).nanoseconds, std.time.ns_per_s));
     const tasks = client.fetchTasks(allocator) catch |err| return reportApiError(client, err);
@@ -238,8 +248,17 @@ fn runShow(
     defer allocator.free(selected);
     view.rank(selected, strategy, now);
 
+    // Derived from the parsed flags, not opts.show_children — opts is built below, after
+    // the --json early return.
+    const count_children = !parsed.getBool("flat") and !parsed.getBool("json");
+    const lim = if (limit) |n|
+        view.limitRows(selected, count_children, n)
+    else
+        view.Limited{ .shown = selected, .hidden_rows = 0 };
+
     if (parsed.getBool("json")) {
-        formatter.renderJson(out, selected) catch |err| return stdoutErr(err);
+        // No trailer: a trailer would make the output not-JSON.
+        formatter.renderJson(out, lim.shown) catch |err| return stdoutErr(err);
         out.flush() catch |err| return stdoutErr(err);
         return;
     }
@@ -262,7 +281,9 @@ fn runShow(
     for (tasks) |t| try all_ids.append(allocator, t.id);
     opts.handle_len = try view.minUniqueSuffixLen(allocator, all_ids.items);
 
-    formatter.render(out, opts, now, selected, &idx) catch |err| return stdoutErr(err);
+    formatter.render(out, opts, now, lim.shown, &idx) catch |err| return stdoutErr(err);
+    if (lim.hidden_rows > 0)
+        out.print("… and {d} more\n", .{lim.hidden_rows}) catch |err| return stdoutErr(err);
     out.flush() catch |err| return stdoutErr(err);
 }
 
@@ -564,6 +585,7 @@ fn usage() void {
         \\                      --detailed    rich output (tags, dates, ids, description)
         \\                      --json        machine-readable Task array
         \\                      --no-color    disable color
+        \\                      --limit N     at most N task rows, then "… and M more"
         \\  tui [flags]       Interactive full-screen view. Flags:
         \\                      --sort <priority|due|title|created|urgency>  (default urgency)
         \\                      --filter <tag:NAME|status:S1,S2|overdue>     (repeatable, AND)
