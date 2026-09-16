@@ -144,8 +144,9 @@ is tagged `ops`, rather than erasing it.
 (`seshat show | head`) exits 0, as Unix expects.
 
 `--limit N` bounds *rows*, not lines: a root is never split from its subtree, so add `--flat` when
-you need a hard line count (`--flat --limit N` is at most N+1 lines). `completions` and `init` print
-files that are compiled into the binary, and both work before any config exists.
+you need a hard line count (in the default compact layout, `--flat --limit N` is at most N+1
+lines). `completions` and `init` print files that are compiled into the binary, and both work
+before any config exists.
 
 ## Layout
 

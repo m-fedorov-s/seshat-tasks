@@ -123,10 +123,11 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     `seshat completions fish > file` exits 0 even if the write itself failed (a full disk, say) —
     an installer must check the written file is non-empty rather than trust the exit code.
 - `src/shell.zig` — the five shell-integration files, `@embedFile`d at build time from
-  **`client/shell/`, which is the single source of truth** (it is also the fisher plugin root and
-  the installer's input). Do **not** edit an embedded copy and do not generate these files from the
-  flag tables. `@embedFile` cannot escape a module root, so `build.zig` mounts each file as its own
-  anonymous module (`addAnonymousImport` + `b.path("../shell/…")`) on **both** the exe and the test
+  **`client/shell/`, which is the single source of truth** (`client/shell/fish/` is also the fisher
+  plugin root, and the whole tree is the installer's input). Do **not** edit an embedded copy and
+  do not generate these files from the flag tables. `@embedFile` cannot escape a module root, so
+  `build.zig` mounts each file as its own anonymous module (`addAnonymousImport` +
+  `b.path("../shell/…")`) on **both** the exe and the test
   artifact — the documented mechanism, see the build-system guide's "Producing Assets for
   `@embedFile`". All five files are a **required build input**: delete one and `zig build` fails
   with `error: failed to check cache: '…' file_hash FileNotFound`. Edits to them are cache-tracked
@@ -144,7 +145,7 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 - `src/core/args.zig` — a generic, declaration-driven flag parser: `OptionSpec` table in →
   `ParsedArgs` (query by name with `getBool`/`getValue`/`getMulti`). No seshat flag names baked in.
   Also `positiveInt(s) ?usize`, a generic "positive integer, as `std.fmt.parseUnsigned` parses it"
-  helper (`--limit` uses it). No seshat flag names baked in.
+  helper (`--limit` uses it).
 - `src/core/edit.zig` — the **pure edit core** (no I/O), shared by `add`/`update` and the future
   TUI. `Edit(T) = union(enum){ unchanged, set: T }` is the uniform per-field patch; `Patch` is one
   `Edit` per editable `Content` field (`DatePatch = Edit(?i64)`, `.set = null` clears; tags `.set`

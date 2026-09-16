@@ -84,11 +84,11 @@ The Zig client:
 2. On `show`, fetches all tasks and renders the forest through a `select → rank → render`
    pipeline. Flags: `--sort <priority|due|title|created|urgency>` (default urgency),
    `--filter <tag:NAME|status:S1,S2|overdue>` (repeatable, AND), `--open`, `--flat` (rank all
-   tasks, no tree), `--detailed`, `--json`, `--no-color`,
-   `--limit N` (at most N *rendered rows*, cut only on whole-root boundaries, then a
-   `… and M more` trailer; under `--flat` that also bounds lines, otherwise it does not). Compact =
-   one line/task with a `#handle`; `--detailed` = git-log-style multi-line blocks (meta line +
-   description + `│`-rail subtasks).
+   tasks, no tree), `--detailed`, `--json`, `--no-color`, `--limit N` (at most N *rendered rows*,
+   cut only on whole-root boundaries, then a `… and M more` trailer; under `--flat` in compact
+   layout that also bounds lines, otherwise it does not). Compact = one line/task with a
+   `#handle`; `--detailed` = git-log-style multi-line blocks (meta line + description +
+   `│`-rail subtasks).
 3. Supports `add <title> [edits]`, `update <id> [edits]`, `delete <id>`, and `done <id>` — `<id>`
    accepts a short id **tail** / `#handle` — mutating via the server with optimistic concurrency.
    `add`/`update` share one flag set (`--title/--description/--status/--priority/--due/
