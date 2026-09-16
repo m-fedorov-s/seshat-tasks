@@ -56,8 +56,11 @@ All five test targets must pass before any commit.
   keyboard, with free-text fields (title/description/tags) taken over a ForceReply reply and
   pinned-version optimistic concurrency. See `client/bot/README.md` for config, BotFather
   settings, and deployment.
-- `client/fish/` — **placeholder README only**; the standalone fish client was retired and the
-  shell integration (completions/prompt) is not built yet. See `plans/roadmap.md` → Stage 3.
+- `client/shell/` — the shell integration files (fish `completions`/`conf.d`/`functions`, bash and
+  zsh completions), **the single source of truth** for them. They are `@embedFile`d into the Zig
+  binary at build time and printed by `seshat completions <shell>` / `seshat init fish`, so the
+  installer's shell step is one `>` redirect. Contents land with Stage 3 (c); the directory is a
+  required input of `client/zig/build.zig`.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
   `test/seed` loads a legacy JSON task file through the API; also the migration tool.
 - `dev/` — local dev environment: a throwaway server/client config + scripts to run the server,
@@ -74,13 +77,18 @@ A `Task` is `{ id (ULID), content, meta }`. `content` (user-editable) = title, d
 ## Client behaviour
 
 The Zig client:
-1. Reads config (server URL, secret, optional `width`, `utc_offset`) from JSON (`SESHAT_CONFIG` or
-   `~/.config/seshat/config.json`).
+1. Reads config (server URL, secret, optional `width`, `utc_offset`, `timeout_ms`) from JSON
+   (`SESHAT_CONFIG` or `~/.config/seshat/config.json`). `timeout_ms` (default 10000, `0` disables)
+   is a wall-clock deadline on every HTTP request, so no command can hang forever on a wedged
+   server.
 2. On `show`, fetches all tasks and renders the forest through a `select → rank → render`
    pipeline. Flags: `--sort <priority|due|title|created|urgency>` (default urgency),
    `--filter <tag:NAME|status:S1,S2|overdue>` (repeatable, AND), `--open`, `--flat` (rank all
-   tasks, no tree), `--detailed`, `--json`, `--no-color`. Compact = one line/task with a `#handle`;
-   `--detailed` = git-log-style multi-line blocks (meta line + description + `│`-rail subtasks).
+   tasks, no tree), `--detailed`, `--json`, `--no-color`,
+   `--limit N` (at most N *rendered rows*, cut only on whole-root boundaries, then a
+   `… and M more` trailer; under `--flat` that also bounds lines, otherwise it does not). Compact =
+   one line/task with a `#handle`; `--detailed` = git-log-style multi-line blocks (meta line +
+   description + `│`-rail subtasks).
 3. Supports `add <title> [edits]`, `update <id> [edits]`, `delete <id>`, and `done <id>` — `<id>`
    accepts a short id **tail** / `#handle` — mutating via the server with optimistic concurrency.
    `add`/`update` share one flag set (`--title/--description/--status/--priority/--due/
@@ -94,8 +102,10 @@ The Zig client:
    climbs back one level; four editor kinds (line, picker, date, and `$EDITOR` for the
    description). Edits commit per field with optimistic concurrency; **refresh is manual** (`R`),
    with polling deferred. See `client/zig/CLAUDE.md` for the full keymap.
-5. Supports `--version` (build-time git describe), exits 0 on a broken pipe, and prints the
-   server's error message on failure.
+5. Supports `--version` (build-time git describe, falling back to `dev` without a `.git`),
+   `completions <fish|bash|zsh>` and `init fish` (both print files embedded from `client/shell/`,
+   before any config is loaded), exits 0 on a broken pipe, and prints the server's error message on
+   failure.
 
 The Telegram bot (`client/bot/`):
 1. Reads config (bot token, server URL, `utc_offset`, and a `telegram_id → seshat token` map)

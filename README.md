@@ -50,7 +50,8 @@ data_file: /var/lib/seshat/seshat.db
 {
   "url": "http://localhost:8799",
   "secret": "<the token you were given>",
-  "utc_offset": "+02:00"
+  "utc_offset": "+02:00",
+  "timeout_ms": 10000
 }
 ```
 
@@ -59,6 +60,9 @@ data_file: /var/lib/seshat/seshat.db
 
 `utc_offset` is applied when **parsing and rendering** dates only — everything is stored in UTC.
 It defaults to `+00:00`, and a malformed value is a startup error rather than a silent fallback.
+
+`timeout_ms` is a wall-clock deadline on every request (default 10000). Set it to `0` to disable
+the deadline entirely — a very slow link, or a debugging session.
 
 **4. Run it.**
 
@@ -120,11 +124,16 @@ seshat show --open --sort due        # only todo/in_progress
 seshat show --filter tag:work --filter overdue     # repeatable, AND-combined
 seshat show --detailed               # git-log-style blocks
 seshat show --json                   # machine-readable
+seshat show --limit 5                # at most 5 task rows, then "… and N more"
+seshat show --open --flat --limit 5  # …and at most 6 LINES: the prompt-block spelling
 
 seshat add "Write the docs" --priority high --due 2026-08-14 --tags work,writing
 seshat update a1b2 --status in_progress --dry-run
 seshat done a1b2
 seshat delete a1b2
+
+seshat completions fish > ~/.config/fish/completions/seshat.fish
+seshat init fish > ~/.config/fish/conf.d/seshat.fish
 ```
 
 Every command that takes an id accepts a **tail** of it, or the `#handle` shown in the output —
@@ -133,6 +142,10 @@ is tagged `ops`, rather than erasing it.
 
 `seshat --version` reports a build-time `git describe`. Piping into something that closes early
 (`seshat show | head`) exits 0, as Unix expects.
+
+`--limit N` bounds *rows*, not lines: a root is never split from its subtree, so add `--flat` when
+you need a hard line count (`--flat --limit N` is at most N+1 lines). `completions` and `init` print
+files that are compiled into the binary, and both work before any config exists.
 
 ## Layout
 
@@ -167,6 +180,7 @@ entry point — run `zig build` as well.
 
 The server, the CLI and the TUI work, and a Telegram bot client (`client/bot/`) can capture,
 browse and edit tasks, and several users can share one server with fully isolated data. Not built
-yet: client-side caching and offline use, shell completions, end-to-end encryption, and
-background refresh. Hierarchy is read-only in the TUI and the bot — you can see and edit a
-forest, but not restructure one.
+yet: client-side caching and offline use, the shell integration itself (the binary can already
+print the completion and prompt files; their contents are placeholders), end-to-end encryption, and
+background refresh. Hierarchy is read-only in the TUI and the bot — you can see and edit a forest,
+but not restructure one.
