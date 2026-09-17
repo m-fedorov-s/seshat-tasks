@@ -280,13 +280,68 @@ test_fish_syntax() {
   done
 }
 
+test_resume_prints_next() {
+  seed '-2 hours' "$block"$'\n'
+  run_fish "$tmp/bin" "$src_conf" "$src_fn" 'seshat-prompt pause' 'seshat-prompt resume' \
+    'set -q seshat_prompt_paused; and echo STILL-SET' 'emit fish_prompt'
+  [[ $out != *STILL-SET* ]] || { why="resume left the variable set"; return 1; }
+  [[ $out == *"seshat prompt: paused"*"seshat prompt: resumed"*"$block" ]] || { why="got: [$out]"; return 1; }
+}
+
+test_status_reports_content_age() {
+  seed '-2 hours' "$block"$'\n'
+  touch -d '-7 days' "$cache/prompt"
+  touch "$cache/prompt.attempt"
+  run_fish "$tmp/bin" -n "$src_conf" "$src_fn" 'seshat-prompt status'
+  [[ $out =~ content:\ +6048[0-9][0-9]\ s\ old ]] || { why="content age: $out"; return 1; }
+  [[ $out =~ last\ try:\ +[0-9]\ s\ ago ]] || { why="last try: $out"; return 1; }
+  [[ $out == *"idle:       15 min"* ]] || { why="idle line: $out"; return 1; }
+}
+
+test_seshat_prompt_status_noninteractive() {
+  run_fish "$tmp/bin" -n "$src_conf" "$src_fn" 'seshat-prompt status'
+  [ "$code" -eq 0 ] || { why="exit $code"; return 1; }
+  [[ $out == *"idle:       15 min"* && $out == *"rows:       (no cache)"* ]] || { why="got: $out"; return 1; }
+}
+
+test_status_rows_excludes_trailer() {
+  seed '-2 hours' "$block"$'\n'
+  run_fish "$tmp/bin" -n "$src_conf" "$src_fn" 'seshat-prompt status'
+  [[ $out == *"rows:       3"* ]] || { why="got: $out"; return 1; }
+}
+
+test_prompt_now() {
+  run_fish "$tmp/slowbin" "$src_conf" "$src_fn" 'seshat-prompt now' "echo calls=(count (cat $calls))" \
+    'path is -f -- $__seshat_stamp; and echo STAMP-PRESENT'
+  [[ $out == *"calls=1"* ]] || { why="now returned before the fetch: $out"; return 1; }
+  [[ $out != *STAMP-PRESENT* ]] || { why="stamp not removed"; return 1; }
+}
+
+test_prompt_bare_usage() {
+  run_fish "$tmp/bin" -n "$src_conf" "$src_fn" 'seshat-prompt' 'echo "code=$status"'
+  [[ $err == *"usage: seshat-prompt pause|resume|now|status"* ]] || { why="stderr: $err"; return 1; }
+  [[ $out == *"code=1"* ]] || { why="bare call did not fail: $out"; return 1; }
+}
+
+# The single-file layout `seshat init fish` produces: functions first, then conf.d, so a
+# non-interactive shell reaches the function before the guard aborts sourcing.
+test_single_file_layout() {
+  cat "$shell/fish/functions/seshat-prompt.fish" "$shell/fish/conf.d/seshat.fish" > "$tmp/single.fish"
+  run_fish "$tmp/bin" -n "source $tmp/single.fish" 'seshat-prompt status'
+  [ "$code" -eq 0 ] && [[ $out == *"idle:       15 min"* ]] || { why="code=$code out=[$out] err=[$err]"; return 1; }
+  run_fish "$tmp/bin" "source $tmp/single.fish" 'functions -q __seshat_prompt; and echo DEFINED'
+  [[ $out == *DEFINED* ]] || { why="interactive single-file layout did not define the hook"; return 1; }
+}
+
 # --- main ------------------------------------------------------------------------------------
 
 for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_silent test_dir_mode_corrected \
-  test_new_file_mode_during_write test_refresh_argv test_knobs_late_bound test_idle_prints test_recent_stamp_silent \
-  test_stamp_updated test_paused_silent test_no_binary_silent test_no_config_silent \
-  test_missing_cache_dir_is_silent test_future_mtime_recovers test_trailing_newline test_serve_stale \
-  test_empty_cache_silent test_postexec_triggers test_postexec_no_double_spawn test_no_umask_leak \
+  test_new_file_mode_during_write test_refresh_argv test_knobs_late_bound test_idle_prints \
+  test_recent_stamp_silent test_stamp_updated test_paused_silent test_resume_prints_next \
+  test_no_binary_silent test_no_config_silent test_missing_cache_dir_is_silent test_future_mtime_recovers \
+  test_trailing_newline test_serve_stale test_status_reports_content_age test_seshat_prompt_status_noninteractive \
+  test_status_rows_excludes_trailer test_empty_cache_silent test_postexec_triggers test_postexec_no_double_spawn \
+  test_prompt_now test_prompt_bare_usage test_single_file_layout test_no_umask_leak \
   test_refresh_is_async test_refresh_job_is_disowned test_hot_path_is_fast test_fish_syntax; do
   run "$t"
   [ "$t" = test_fish_version_floor ] && [ "$fail" -gt 0 ] && break
