@@ -10,13 +10,15 @@ make server-test              # Go server tests (runs with -race)
 make schema-test              # shared Task-contract tests (Go + Zig halves)
 make client-integration-test  # spawns a real server + client through a pipe
 make bot-test                 # Go Telegram bot client tests
+make shell-test               # the shell files under fish/bash/zsh, no server (local only)
 cd client/zig && zig build test   # Zig client unit tests
 
 make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
 ```
 
-All five test targets must pass before any commit.
+All six test targets must pass before any commit. `make shell-test` is local-only — CI does not
+run it and installs no fish.
 
 ## Layout
 
@@ -56,11 +58,13 @@ All five test targets must pass before any commit.
   keyboard, with free-text fields (title/description/tags) taken over a ForceReply reply and
   pinned-version optimistic concurrency. See `client/bot/README.md` for config, BotFather
   settings, and deployment.
-- `client/shell/` — the shell integration files (fish `completions`/`conf.d`/`functions`, bash and
-  zsh completions), **the single source of truth** for them. They are `@embedFile`d into the Zig
-  binary at build time and printed by `seshat completions <shell>` / `seshat init fish`, so the
-  installer's shell step is one `>` redirect. Contents land with Stage 3 (c); the directory is a
-  required input of `client/zig/build.zig`.
+- `client/shell/` — shell integration. `fish/` is a fisher-layout plugin (completions, a `conf.d`
+  `fish_prompt` hook printing a cached task block after inactivity, and the `seshat-prompt`
+  control function); `bash/` and `zsh/` are static completions only. The files are embedded in
+  the client binary and printed by `seshat completions <shell>` / `seshat init fish`; the
+  installer is the distribution channel and a local-path `fisher install` is the dev loop.
+  Cache: `$XDG_CACHE_HOME/seshat/prompt`. Tested headlessly by `make shell-test`
+  (`test/shell/run.sh`); see `client/shell/README.md`.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
   `test/seed` loads a legacy JSON task file through the API; also the migration tool.
 - `dev/` — local dev environment: a throwaway server/client config + scripts to run the server,
