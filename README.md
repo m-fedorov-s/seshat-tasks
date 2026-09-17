@@ -150,6 +150,15 @@ you need a hard line count (in the default compact layout, `--flat --limit N` is
 lines). `completions` and `init` print files that are compiled into the binary, and both work
 before any config exists.
 
+## Shell integration
+
+In fish, `seshat` completes every subcommand, flag and value, and a short block of your most
+urgent open tasks appears above the prompt when you come back to a terminal after a quiet quarter
+hour — cached, refreshed in the background, never delaying a prompt.
+`seshat-prompt pause|resume|now|status` controls it. bash and zsh get completions. The installer
+that writes the files lands with Stage 3 (d); until then, install them with fisher — see
+[`client/shell/README.md`](client/shell/README.md).
+
 ## Layout
 
 | | |
@@ -174,17 +183,17 @@ make server-test              # Go server
 make schema-test              # the shared Task contract, both halves
 make client-integration-test  # a real server and client through a pipe
 make bot-test                 # the Telegram bot client
+make shell-test               # the shell files, driven under fish/bash/zsh (no server)
 cd client/zig && zig build test
 ```
 
-All five must pass before a commit. Note that `zig build test` does **not** typecheck the CLI
+All six must pass before a commit. Note that `zig build test` does **not** typecheck the CLI
 entry point — run `zig build` as well.
 
 ## Status
 
 The server, the CLI and the TUI work, and a Telegram bot client (`client/bot/`) can capture,
 browse and edit tasks, and several users can share one server with fully isolated data. Not built
-yet: client-side caching and offline use, the shell integration itself (the binary can already
-print the completion and prompt files; their contents are placeholders), end-to-end encryption, and
-background refresh. Hierarchy is read-only in the TUI and the bot — you can see and edit a forest,
+yet: client-side caching and offline use, end-to-end encryption, and background
+refresh. Hierarchy is read-only in the TUI and the bot — you can see and edit a forest,
 but not restructure one.

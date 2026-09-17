@@ -1,2 +1,37 @@
 #compdef seshat
-# seshat zsh completions — PLACEHOLDER. Contents owned by the Stage 3 (c) spec.
+# seshat zsh completions; installed as ${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions/_seshat.
+# Colons inside an _arguments action must be escaped, or the spec is cut short at completion time.
+_seshat() {
+  local state
+  local -a cmds=(
+    'show:Show the task forest' 'tui:Interactive full-screen view'
+    'add:Add a top-level task'  'update:Edit a task'
+    'delete:Delete a task'      'done:Mark a task done'
+    'completions:Print shell completions' 'init:Print the fish prompt-hook file'
+    'help:Print usage'
+  )
+  _arguments -C '1:command:->cmd' '*::arg:->args' '--version[Print the client version]'
+  case $state in
+    cmd)  _describe 'command' cmds ;;
+    args) case $words[1] in
+      show) _arguments \
+        '--sort[Ordering]:sort:(urgency priority due title created)' \
+        '*--filter[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
+        '--limit[Cap rendered rows]:n:' \
+        '--open[Only todo/in_progress]' '--flat[No tree]' '--detailed[Multi-line blocks]' \
+        '--json[Machine-readable]' '--no-color[Disable color]' ;;
+      tui) _arguments \
+        '--sort[Ordering]:sort:(urgency priority due title created)' \
+        '*--filter[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
+        '--open[Only todo/in_progress]' ;;
+      add|update) _arguments \
+        '--status[Status]:status:(todo in_progress done cancelled)' \
+        '--priority[Priority]:priority:(none low medium high)' \
+        '--title:title:' '--description:description:' '--due:date:' '--scheduled:date:' \
+        '--tags:tags:' '--dry-run[Preview]' '--verbose[Print result]' ;;
+      completions) _values shell fish bash zsh ;;
+      init) _values shell fish ;;
+    esac ;;
+  esac
+}
+_seshat "$@"

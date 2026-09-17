@@ -1,4 +1,4 @@
-.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test
+.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test shell-test
 
 server-test:
 	go test -race ./server/... ./internal/...
@@ -21,3 +21,8 @@ bot-test:
 # End-to-end client tests that need a real server + real pipes.
 client-integration-test:
 	./test/broken-pipe.sh
+
+# Shell integration files under fish/bash/zsh, no server. Local pre-commit target only; CI does
+# not run it.
+shell-test:
+	./test/shell/run.sh
