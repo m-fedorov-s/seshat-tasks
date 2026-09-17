@@ -374,6 +374,47 @@ test_complete_handles_no_cache() {
   [ "$code" -eq 0 ] && [ -z "$out" ] && [ -z "$err" ] || { why="code=$code out=[$out] err=[$err]"; return 1; }
 }
 
+# --- bash and zsh ----------------------------------------------------------------------------
+
+# drive_bash <line> <word>...: runs _seshat with COMP_LINE/COMP_POINT/COMP_WORDS/COMP_CWORD set
+# the way bash sets them (colons are separate words); candidates land in $out, one per line.
+drive_bash() {
+  out=$(bash --norc --noprofile -c '
+    source /usr/share/bash-completion/bash_completion; source "$1"; shift
+    COMP_LINE=$1; shift; COMP_POINT=${#COMP_LINE}
+    COMP_WORDS=("$@"); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=()
+    _seshat; printf "%s\n" "${COMPREPLY[@]}"' _ "$shell/bash/seshat.bash" "$@")
+}
+
+test_bash_completions() {
+  bash -n "$shell/bash/seshat.bash" || { why="syntax"; return 1; }
+  drive_bash 'seshat show --filter status:' seshat show --filter status :
+  [ "$out" = $'todo\nin_progress\ndone\ncancelled' ] || { why="status: → $(echo $out)"; return 1; }
+  drive_bash 'seshat show --filter status:t' seshat show --filter status : t
+  [ "$out" = todo ] || { why="status:t → $(echo $out)"; return 1; }
+  drive_bash 'seshat show --sort ' seshat show --sort ''
+  [ "$(echo $out | wc -w)" -eq 5 ] || { why="--sort → $(echo $out)"; return 1; }
+  drive_bash 'seshat show --' seshat show --
+  [ "$(echo $out | wc -w)" -eq 8 ] || { why="show -- → $(echo $out)"; return 1; }
+  drive_bash 'seshat ' seshat ''
+  [ "$(echo $out | wc -w)" -eq 10 ] || { why="seshat → $(echo $out)"; return 1; }
+  drive_bash 'seshat help ' seshat help ''
+  [ -z "$out" ] || { why="help → $(echo $out)"; return 1; }
+}
+
+zsh_names() { zsh "$root/test/shell/zsh-complete.zsh" "$shell/zsh" "$tmp/zcompdump" "$1" | tr '\n' ' '; }
+
+test_zsh_completions() {
+  zsh -n "$shell/zsh/_seshat" || { why="syntax"; return 1; }
+  local got
+  got=$(zsh_names 'seshat ') || { why="zsh printed an error completing 'seshat '"; return 1; }
+  [ "$got" = "add completions delete done help init show tui update " ] || { why="seshat → $got"; return 1; }
+  got=$(zsh_names 'seshat show --') || { why="zsh printed an error completing 'seshat show --'"; return 1; }
+  [ "$got" = "--detailed --filter --flat --json --limit --no-color --open --sort " ] || { why="show -- → $got"; return 1; }
+  got=$(zsh_names 'seshat show --filter status:') || { why="zsh printed an error completing --filter status:"; return 1; }
+  [ "$got" = "status:cancelled status:done status:in_progress status:todo " ] || { why="status: → $got"; return 1; }
+}
+
 # --- main ------------------------------------------------------------------------------------
 
 for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_silent test_dir_mode_corrected \
@@ -389,6 +430,11 @@ for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_si
   run "$t"
   [ "$t" = test_fish_version_floor ] && [ "$fail" -gt 0 ] && break
 done
+
+if [ -r /usr/share/bash-completion/bash_completion ]; then run test_bash_completions
+else skip test_bash_completions "bash-completion is not installed"; fi
+if command -v zsh >/dev/null; then run test_zsh_completions
+else skip test_zsh_completions "zsh is not installed"; fi
 
 echo "shell-test: $pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ] || { printf '  %s\n' "${failed[@]}"; exit 1; }
