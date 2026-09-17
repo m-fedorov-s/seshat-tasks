@@ -17,6 +17,8 @@ set -g __seshat_attempt $__seshat_dir/prompt.attempt
 # `__seshat_refresh` = TTL-gated async; `force` = async, no gate; `force sync` = blocking.
 function __seshat_refresh --argument-names force mode
     if test "$force" != force
+        # a mistyped knob must not put an error above every prompt
+        string match -qr '^\d{1,9}$' -- "$seshat_prompt_ttl"; or set -l seshat_prompt_ttl 60
         set -l tried (path mtime --relative -- $__seshat_attempt)
         # a future mtime reads negative: treat it as stale
         if test -n "$tried"; and test $tried -ge 0; and test $tried -lt $seshat_prompt_ttl
@@ -71,6 +73,7 @@ function __seshat_prompt --on-event fish_prompt
     __seshat_refresh
 
     # derived per prompt, so the knob can be set in config.fish (sourced after conf.d)
+    string match -qr '^\d{1,9}$' -- "$seshat_prompt_idle_minutes"; or set -l seshat_prompt_idle_minutes 15
     set -l threshold (math -s0 "$seshat_prompt_idle_minutes * 60")
     # a missing stamp, or a future mtime, reads as maximally idle
     test -n "$idle"; and test $idle -ge 0; or set idle $threshold

@@ -144,6 +144,16 @@ test_knobs_late_bound() {
   [ "$(cat "$calls")" = "show --open --flat --no-color --limit 3" ] || { why="limit set after conf.d was ignored: $(cat "$calls")"; return 1; }
 }
 
+# A mistyped knob falls back to its default instead of erroring above every prompt.
+test_knobs_garbage_silent() {
+  seed '-2 hours' "$block"$'\n'
+  touch -d '-2 hours' "$cache/prompt.attempt"
+  run_fish "$tmp/bin" "$src_conf" 'set -g seshat_prompt_idle_minutes abc' 'set -g seshat_prompt_ttl abc' 'emit fish_prompt'
+  [ -z "$err" ] || { why="stderr: $err"; return 1; }
+  [ "$out" = "$block" ] || { why="printed: [$out]"; return 1; }
+  wait_calls 1 || { why="no refresh with a garbage ttl"; return 1; }
+}
+
 test_idle_prints() {
   seed '-2 hours' "$block"$'\n'
   run_fish "$tmp/bin" "$src_conf" 'emit fish_prompt'
@@ -418,7 +428,7 @@ test_zsh_completions() {
 # --- main ------------------------------------------------------------------------------------
 
 for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_silent test_dir_mode_corrected \
-  test_new_file_mode_during_write test_refresh_argv test_knobs_late_bound test_idle_prints \
+  test_new_file_mode_during_write test_refresh_argv test_knobs_late_bound test_knobs_garbage_silent test_idle_prints \
   test_recent_stamp_silent test_stamp_updated test_paused_silent test_resume_prints_next \
   test_no_binary_silent test_no_config_silent test_missing_cache_dir_is_silent test_future_mtime_recovers \
   test_trailing_newline test_serve_stale test_status_reports_content_age test_seshat_prompt_status_noninteractive \

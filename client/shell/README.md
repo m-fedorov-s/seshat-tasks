@@ -19,7 +19,7 @@ Needs **fish ≥ 3.6.0** (`path mtime --relative`).
 It is the output of `seshat show --open --flat --no-color --limit 5`, cached in
 `$XDG_CACHE_HOME/seshat/prompt` (default `~/.cache/seshat/prompt`, directory mode 0700) and
 refreshed by a detached background job at most once a minute. The prompt itself never waits on the
-network and never forks.
+network; at most once a TTL it forks a detached worker that does.
 
 The block prints on a prompt when **all** of these hold: it is not paused, `seshat` is on `$PATH`,
 no fish prompt has been drawn anywhere for `seshat_prompt_idle_minutes`, and the cache exists and
@@ -36,7 +36,7 @@ is non-empty. In practice:
 | client installed but not configured | never — the refresh fails silently and nothing is printed |
 | `seshat-prompt now` | on the next prompt of the shell you ran it in (the idle stamp is shared, and the first prompt drawn anywhere re-creates it) |
 
-Nothing is ever printed when the cache is empty, missing, or the last refresh failed:
+Nothing is printed when the cache is empty or missing; a failed refresh keeps the last good block.
 `seshat-prompt status` is where to look when the block is quiet.
 
 ### `seshat-prompt`
@@ -64,7 +64,7 @@ Set these with `set -g` in `config.fish` (`set -U` also works):
 
 | variable | default | meaning |
 |---|---|---|
-| `seshat_prompt_idle_minutes` | 15 | quiet time before the block prints; takes effect in the next shell |
+| `seshat_prompt_idle_minutes` | 15 | quiet time before the block prints; read on every prompt |
 | `seshat_prompt_ttl` | 60 | seconds between refresh attempts |
 | `seshat_prompt_limit` | 5 | rows in the block, and how many ids `done <TAB>` can offer |
 
