@@ -333,6 +333,47 @@ test_single_file_layout() {
   [[ $out == *DEFINED* ]] || { why="interactive single-file layout did not define the hook"; return 1; }
 }
 
+# --- fish completions ------------------------------------------------------------------------
+
+complete_names() { printf '%s\n' "$out" | cut -f1 | sort | tr '\n' ' '; }
+
+test_complete_subcommands() {
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat '"
+  [ "$(complete_names)" = "add completions delete done help init show tui update " ] || { why="$(complete_names)"; return 1; }
+}
+
+test_complete_show_flags() {
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --'"
+  [ "$(complete_names)" = "--detailed --filter --flat --json --limit --no-color --open --sort " ] || { why="$(complete_names)"; return 1; }
+}
+
+test_complete_sort_order() {
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --sort '"
+  [ "$(printf '%s\n' "$out" | head -1 | cut -f1)" = urgency ] || { why="first candidate: $(printf '%s\n' "$out" | head -1)"; return 1; }
+}
+
+test_complete_filter() {
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --filter '"
+  [ "$(complete_names)" = "overdue status:cancelled status:done status:in_progress status:todo " ] || { why="bare: $(complete_names)"; return 1; }
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --filter status:'"
+  [ "$(complete_names)" = "status:cancelled status:done status:in_progress status:todo " ] || { why="status: → $(complete_names)"; return 1; }
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --filter status:todo,'"
+  [ "$(complete_names)" = "status:todo,cancelled status:todo,done status:todo,in_progress " ] || { why="status:todo, → $(complete_names)"; return 1; }
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --filter tag:'"
+  [ -z "$out" ] || { why="tag: offered: $out"; return 1; }
+}
+
+test_complete_handles() {
+  seed '-2 hours' $'○ Über task #a1b2\n├─ ○ fix bug #123 in parser #c3d4\n└─ ○ [missing: #host]\n… and 12 more\n'
+  run_fish "$tmp/bin" -n "$src_conf" "$src_comp" "complete -C 'seshat done '"
+  [ "$out" = $'a1b2\tÜber task\nc3d4\tfix bug #123 in parser' ] || { why="got: [$out]"; return 1; }
+}
+
+test_complete_handles_no_cache() {
+  run_fish "$tmp/bin" -n "$src_conf" "$src_comp" "complete -C 'seshat done '"
+  [ "$code" -eq 0 ] && [ -z "$out" ] && [ -z "$err" ] || { why="code=$code out=[$out] err=[$err]"; return 1; }
+}
+
 # --- main ------------------------------------------------------------------------------------
 
 for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_silent test_dir_mode_corrected \
@@ -342,7 +383,9 @@ for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_si
   test_trailing_newline test_serve_stale test_status_reports_content_age test_seshat_prompt_status_noninteractive \
   test_status_rows_excludes_trailer test_empty_cache_silent test_postexec_triggers test_postexec_no_double_spawn \
   test_prompt_now test_prompt_bare_usage test_single_file_layout test_no_umask_leak \
-  test_refresh_is_async test_refresh_job_is_disowned test_hot_path_is_fast test_fish_syntax; do
+  test_refresh_is_async test_refresh_job_is_disowned test_hot_path_is_fast test_complete_subcommands \
+  test_complete_show_flags test_complete_sort_order test_complete_filter test_complete_handles \
+  test_complete_handles_no_cache test_fish_syntax; do
   run "$t"
   [ "$t" = test_fish_version_floor ] && [ "$fail" -gt 0 ] && break
 done
