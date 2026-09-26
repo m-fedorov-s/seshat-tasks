@@ -46,17 +46,17 @@ complete -c seshat -n "$seen add update" -l verbose  -d "Print the resulting tas
 complete -c seshat -n "$seen update delete done" -a "(__seshat_handles)"
 
 function __seshat_statuses_unchosen
-    set -l chosen (string split , -- (string replace -r '^status:' '' -- (commandline -ct)))
+    set -l chosen (string split , -- (string replace -r '^(--filter=)?status:' '' -- (commandline -ct)))
     for s in todo in_progress done cancelled
         contains -- $s $chosen; or echo $s
     end
 end
 
 function __seshat_filter
-    switch (commandline -ct)
+    switch (string replace -r -- '^--filter=' '' (commandline -ct))
         case 'status:*'
             # prefix goes as the 3rd argument; as the 4th it would yield status:todo,status:done
-            __fish_complete_list , __seshat_statuses_unchosen 'status:'
+            __fish_stripprefix='^--filter=' __fish_complete_list , __seshat_statuses_unchosen 'status:'
         case '*'
             printf 'status:%s\n' todo in_progress done cancelled
             echo overdue
@@ -66,11 +66,11 @@ end
 # Parses compact `show` rows (`<glyph> <title> #<tail>`); offers the bare tail, since a leading
 # `#` starts a comment in fish.
 function __seshat_handles --description 'ids + titles from the prompt-block cache'
-    path is -f -- $__seshat_cache; or return
+    path is -fr -- $__seshat_cache; or return
     read -zl buf < $__seshat_cache
     for line in (string split -- \n $buf)
         set -l m (string match -r '^(.*?)\s+#([0-9a-z]+)$' -- $line)
         test (count $m) -eq 3; or continue
-        printf '%s\t%s\n' $m[3] (string replace -r -- '(*UCP)^[^\w]+' '' $m[2])
+        printf '%s\t%s\n' $m[3] (string replace -r -- '^\S+ ' '' $m[2])
     end
 end

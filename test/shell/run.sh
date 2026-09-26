@@ -7,6 +7,7 @@
 # conf.d's `status is-interactive` guard pass), with HOME and the three XDG dirs inside a fresh
 # temp sandbox and a fake `seshat` first on a PATH that never contains the developer's own.
 set -uo pipefail
+unset BASH_ENV ZDOTDIR
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 shell=$root/client/shell
@@ -20,12 +21,14 @@ src_comp="source $shell/fish/completions/seshat.fish"
 
 pass=0; fail=0; skip=0; failed=()
 tmp=""
-trap '[ -n "$tmp" ] && rm -rf "$tmp"' EXIT
+reap() { [ -n "$tmp" ] || return 0; pkill -f -- "$tmp/" 2>/dev/null; chmod -R u+rwx "$tmp" 2>/dev/null; rm -rf "$tmp"; }
+trap reap EXIT
+trap 'exit 130' INT TERM
 
 # --- sandbox ---------------------------------------------------------------------------------
 
 sandbox() {
-  [ -n "$tmp" ] && rm -rf "$tmp"
+  reap
   tmp=$(mktemp -d)
   mkdir -p "$tmp/home" "$tmp/config" "$tmp/data" "$tmp/cache" "$tmp/bin" "$tmp/failbin" "$tmp/slowbin" "$tmp/nobin"
   export HOME=$tmp/home XDG_CONFIG_HOME=$tmp/config XDG_DATA_HOME=$tmp/data XDG_CACHE_HOME=$tmp/cache
@@ -42,7 +45,7 @@ FAKE
   cat > "$tmp/slowbin/seshat" <<FAKE
 #!/bin/sh
 printf '%s\n' "\$*" >> "$calls"
-sleep 3
+sleep 1
 cat <<'BLOCK'
 $block
 BLOCK
@@ -148,10 +151,12 @@ test_knobs_late_bound() {
 test_knobs_garbage_silent() {
   seed '-2 hours' "$block"$'\n'
   touch -d '-2 hours' "$cache/prompt.attempt"
-  run_fish "$tmp/bin" "$src_conf" 'set -g seshat_prompt_idle_minutes abc' 'set -g seshat_prompt_ttl abc' 'emit fish_prompt'
+  run_fish "$tmp/bin" "$src_conf" 'set -g seshat_prompt_idle_minutes abc' 'set -g seshat_prompt_ttl abc' \
+    'set -g seshat_prompt_limit 0' 'emit fish_prompt'
   [ -z "$err" ] || { why="stderr: $err"; return 1; }
   [ "$out" = "$block" ] || { why="printed: [$out]"; return 1; }
   wait_calls 1 || { why="no refresh with a garbage ttl"; return 1; }
+  [ "$(cat "$calls")" = "show --open --flat --no-color --limit 5" ] || { why="argv with limit=0: $(cat "$calls")"; return 1; }
 }
 
 test_idle_prints() {
@@ -203,7 +208,7 @@ test_future_mtime_recovers() {
   seed '+1 hour' "$block"$'\n'
   touch -d '+1 hour' "$cache/prompt.attempt"
   run_fish "$tmp/bin" "$src_conf" 'emit fish_prompt'
-  [ "$out" = "$block" ] || { why="printed: [$out]"; return 1; }
+  [ -z "$out" ] || { why="printed: [$out]"; return 1; }
   wait_calls 1 || { why="no refresh with a future attempt clock"; return 1; }
 }
 
@@ -245,11 +250,52 @@ test_postexec_triggers() {
 }
 
 test_postexec_no_double_spawn() {
-  seed '-2 hours'
+  seed '-2 hours' "$block"$'\n'
   touch -d '-5 min' "$cache/prompt.attempt"
   run_fish "$tmp/bin" "$src_conf" 'emit fish_postexec "seshat done a1b2"' 'emit fish_prompt'
   sleep 1
+  [ -z "$out" ] || { why="printed the pre-mutation cache after seshat done"; return 1; }
   [ "$(wc -l < "$calls")" -eq 1 ] || { why="$(wc -l < "$calls") workers for one postexec+prompt pair"; return 1; }
+}
+
+test_uninstall_stays_clean() {
+  seed '-2 hours' "$block"$'\n'
+  run_fish "$tmp/bin" "$src_conf" 'emit seshat_uninstall' 'emit fish_prompt'
+  sleep 0.5
+  [ ! -e "$cache" ] || { why="uninstall was undone by the next prompt"; return 1; }
+}
+
+# Two ways a redirect can fail: the target file exists but is read-only, or it is absent and the
+# directory that would hold it is read-only. Neither may print above the prompt.
+test_unwritable_files_silent() {
+  seed '-2 hours' "$block"$'\n'
+  touch -d '-2 hours' "$cache/prompt.attempt"
+  chmod 444 "$cache/prompt.attempt"
+  chmod 000 "$cache/prompt"
+  run_fish "$tmp/failbin" -n "$src_conf" "$src_fn" "$src_comp" 'seshat-prompt status' "complete -C 'seshat done '"
+  local err_ro=$err
+  run_fish "$tmp/failbin" "$src_conf" 'emit fish_prompt'
+  chmod 700 "$cache"; chmod 600 "$cache/prompt.stamp" "$cache/prompt.attempt" "$cache/prompt"
+  [ -z "$err_ro$err" ] || { why="mode 444 attempt, mode 000 prompt: $err_ro$err"; return 1; }
+
+  sandbox
+  seed '-2 hours' "$block"$'\n'
+  rm -f "$cache/prompt.stamp"
+  chmod 555 "$cache"
+  run_fish "$tmp/bin" "$src_conf" 'emit fish_prompt'
+  chmod 700 "$cache"
+  [ -z "$err" ] || { why="stamp missing, dir mode 555: $err"; return 1; }
+}
+
+# An unwritable stamp can never be reset, so idle would otherwise stay stuck above threshold and
+# print on every prompt forever; the guard forces idle back to 0 instead.
+test_unwritable_stamp_stays_silent() {
+  seed '-2 hours' "$block"$'\n'
+  chmod 444 "$cache/prompt.stamp"
+  run_fish "$tmp/bin" "$src_conf" 'emit fish_prompt' 'emit fish_prompt'
+  chmod 600 "$cache/prompt.stamp"
+  [ -z "$out" ] || { why="printed: [$out]"; return 1; }
+  [ -z "$err" ] || { why="stderr: $err"; return 1; }
 }
 
 test_no_umask_leak() {
@@ -261,7 +307,7 @@ test_refresh_is_async() {
   local t0 t1; t0=$(now_ms)
   run_fish "$tmp/slowbin" "$src_conf" 'emit fish_prompt'
   t1=$(now_ms)
-  [ $(( t1 - t0 )) -lt 300 ] || { why="prompt took $(( t1 - t0 )) ms with a 3 s fetch"; return 1; }
+  [ $(( t1 - t0 )) -lt 300 ] || { why="prompt took $(( t1 - t0 )) ms with a 1 s fetch"; return 1; }
 }
 
 test_refresh_job_is_disowned() {
@@ -291,11 +337,12 @@ test_fish_syntax() {
 }
 
 test_resume_prints_next() {
-  seed '-2 hours' "$block"$'\n'
+  seed '-10 seconds' "$block"$'\n'
   run_fish "$tmp/bin" "$src_conf" "$src_fn" 'seshat-prompt pause' 'seshat-prompt resume' \
-    'set -q seshat_prompt_paused; and echo STILL-SET' 'emit fish_prompt'
+    'set -q seshat_prompt_paused; and echo STILL-SET' 'emit fish_prompt' 'emit fish_prompt'
   [[ $out != *STILL-SET* ]] || { why="resume left the variable set"; return 1; }
   [[ $out == *"seshat prompt: paused"*"seshat prompt: resumed"*"$block" ]] || { why="got: [$out]"; return 1; }
+  [ "$(grep -c 'Alpha task' <<< "$out")" -eq 1 ] || { why="the stamp was not re-created: printed on every prompt"; return 1; }
 }
 
 test_status_reports_content_age() {
@@ -347,6 +394,27 @@ test_single_file_layout() {
 
 complete_names() { printf '%s\n' "$out" | cut -f1 | sort | tr '\n' ' '; }
 
+# Flag and enum-value listings, driven through all three shells.
+surface=(
+  'seshat tui --|--filter --open --sort'
+  'seshat update a1b2 --|--description --dry-run --due --priority --scheduled --status --tags --title --verbose'
+  'seshat add x --priority |high low medium none'
+  'seshat add x --status |cancelled done in_progress todo'
+  'seshat show --sort |created due priority title urgency'
+)
+
+test_complete_surface() {
+  local row line want
+  for row in "${surface[@]}"; do
+    line=${row%%|*}; want=${row#*|}
+    run_fish "$tmp/bin" -n "$src_comp" "complete -C '$line'"
+    [ "$(complete_names)" = "$want " ] || { why="'$line' -> $(complete_names) want '$want '"; return 1; }
+  done
+  run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat show --filter=status:todo,'"
+  [ "$(complete_names)" = "--filter=status:todo,cancelled --filter=status:todo,done --filter=status:todo,in_progress " ] \
+    || { why="--filter=status:todo, -> $(complete_names)"; return 1; }
+}
+
 test_complete_subcommands() {
   run_fish "$tmp/bin" -n "$src_comp" "complete -C 'seshat '"
   [ "$(complete_names)" = "add completions delete done help init show tui update " ] || { why="$(complete_names)"; return 1; }
@@ -374,9 +442,9 @@ test_complete_filter() {
 }
 
 test_complete_handles() {
-  seed '-2 hours' $'○ Über task #a1b2\n├─ ○ fix bug #123 in parser #c3d4\n└─ ○ [missing: #host]\n… and 12 more\n'
+  seed '-2 hours' $'○ Über task #a1b2\n◐ fix bug #123 in parser #c3d4\n○ (draft) spec #e5f6\n… and 12 more\n'
   run_fish "$tmp/bin" -n "$src_conf" "$src_comp" "complete -C 'seshat done '"
-  [ "$out" = $'a1b2\tÜber task\nc3d4\tfix bug #123 in parser' ] || { why="got: [$out]"; return 1; }
+  [ "$out" = $'a1b2\tÜber task\nc3d4\tfix bug #123 in parser\ne5f6\t(draft) spec' ] || { why="got: [$out]"; return 1; }
 }
 
 test_complete_handles_no_cache() {
@@ -402,17 +470,28 @@ test_bash_completions() {
   [ "$out" = $'todo\nin_progress\ndone\ncancelled' ] || { why="status: → $(echo $out)"; return 1; }
   drive_bash 'seshat show --filter status:t' seshat show --filter status : t
   [ "$out" = todo ] || { why="status:t → $(echo $out)"; return 1; }
-  drive_bash 'seshat show --sort ' seshat show --sort ''
-  [ "$(echo $out | wc -w)" -eq 5 ] || { why="--sort → $(echo $out)"; return 1; }
-  drive_bash 'seshat show --' seshat show --
-  [ "$(echo $out | wc -w)" -eq 8 ] || { why="show -- → $(echo $out)"; return 1; }
+  local row line want w
+  for row in "${surface[@]}"; do
+    line=${row%%|*}; want=${row#*|}
+    read -ra w <<< "$line"
+    [[ $line == *' ' ]] && w+=('')
+    drive_bash "$line" "${w[@]}"
+    [ "$(printf '%s\n' "$out" | sort | tr '\n' ' ')" = "$want " ] || { why="'$line' -> $(echo $out) want '$want'"; return 1; }
+  done
   drive_bash 'seshat ' seshat ''
   [ "$(echo $out | wc -w)" -eq 10 ] || { why="seshat → $(echo $out)"; return 1; }
   drive_bash 'seshat help ' seshat help ''
   [ -z "$out" ] || { why="help → $(echo $out)"; return 1; }
+  # --flag=value splitting (bash-completion's -s), verified interactively against real bash
+  drive_bash 'seshat show --sort=ur' seshat show --sort = ur
+  [ "$out" = urgency ] || { why="--sort=ur → $(echo $out)"; return 1; }
+  drive_bash 'seshat show --filter=status:t' seshat show --filter = status : t
+  [ "$out" = todo ] || { why="--filter=status:t → $(echo $out)"; return 1; }
+  drive_bash 'seshat add x --status=' seshat add x --status = ''
+  [ "$(printf '%s\n' "$out" | sort | tr '\n' ' ')" = "cancelled done in_progress todo " ] || { why="add x --status= → $(echo $out)"; return 1; }
 }
 
-zsh_names() { zsh "$root/test/shell/zsh-complete.zsh" "$shell/zsh" "$tmp/zcompdump" "$1" | tr '\n' ' '; }
+zsh_names() { TMPDIR=$tmp zsh -f "$root/test/shell/zsh-complete.zsh" "$shell/zsh" "$tmp/zcompdump" "$1" | tr '\n' ' '; }
 
 test_zsh_completions() {
   zsh -n "$shell/zsh/_seshat" || { why="syntax"; return 1; }
@@ -423,6 +502,16 @@ test_zsh_completions() {
   [ "$got" = "--detailed --filter --flat --json --limit --no-color --open --sort " ] || { why="show -- → $got"; return 1; }
   got=$(zsh_names 'seshat show --filter status:') || { why="zsh printed an error completing --filter status:"; return 1; }
   [ "$got" = "status:cancelled status:done status:in_progress status:todo " ] || { why="status: → $got"; return 1; }
+  local row line want
+  for row in "${surface[@]}"; do
+    line=${row%%|*}; want=${row#*|}
+    got=$(zsh_names "$line") || { why="zsh printed an error completing '$line'"; return 1; }
+    [ "$got" = "$want " ] || { why="'$line' -> $got want '$want '"; return 1; }
+  done
+  got=$(zsh_names 'seshat show --sort=') || { why="zsh printed an error completing --sort="; return 1; }
+  [ "$got" = "created due priority title urgency " ] || { why="--sort= → $got"; return 1; }
+  got=$(zsh_names 'seshat add x --status=') || { why="zsh printed an error completing --status="; return 1; }
+  [ "$got" = "cancelled done in_progress todo " ] || { why="add x --status= → $got"; return 1; }
 }
 
 # --- main ------------------------------------------------------------------------------------
@@ -433,10 +522,11 @@ for t in test_fish_version_floor test_noninteractive_is_inert test_cold_cache_si
   test_no_binary_silent test_no_config_silent test_missing_cache_dir_is_silent test_future_mtime_recovers \
   test_trailing_newline test_serve_stale test_status_reports_content_age test_seshat_prompt_status_noninteractive \
   test_status_rows_excludes_trailer test_empty_cache_silent test_postexec_triggers test_postexec_no_double_spawn \
+  test_uninstall_stays_clean test_unwritable_files_silent test_unwritable_stamp_stays_silent \
   test_prompt_now test_prompt_bare_usage test_single_file_layout test_no_umask_leak \
   test_refresh_is_async test_refresh_job_is_disowned test_hot_path_is_fast test_complete_subcommands \
   test_complete_show_flags test_complete_sort_order test_complete_filter test_complete_handles \
-  test_complete_handles_no_cache test_fish_syntax; do
+  test_complete_handles_no_cache test_complete_surface test_fish_syntax; do
   run "$t"
   [ "$t" = test_fish_version_floor ] && [ "$fail" -gt 0 ] && break
 done

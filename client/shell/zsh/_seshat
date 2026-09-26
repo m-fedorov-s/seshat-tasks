@@ -15,20 +15,21 @@ _seshat() {
     cmd)  _describe 'command' cmds ;;
     args) case $words[1] in
       show) _arguments \
-        '--sort[Ordering]:sort:(urgency priority due title created)' \
-        '*--filter[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
-        '--limit[Cap rendered rows]:n:' \
+        '--sort=[Ordering]:sort:(urgency priority due title created)' \
+        '*--filter=[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
+        '--limit=[Cap rendered rows]:n:' \
         '--open[Only todo/in_progress]' '--flat[No tree]' '--detailed[Multi-line blocks]' \
         '--json[Machine-readable]' '--no-color[Disable color]' ;;
       tui) _arguments \
-        '--sort[Ordering]:sort:(urgency priority due title created)' \
-        '*--filter[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
+        '--sort=[Ordering]:sort:(urgency priority due title created)' \
+        '*--filter=[Filter]:filter:(overdue status\:todo status\:in_progress status\:done status\:cancelled)' \
         '--open[Only todo/in_progress]' ;;
       add|update) _arguments \
-        '--status[Status]:status:(todo in_progress done cancelled)' \
-        '--priority[Priority]:priority:(none low medium high)' \
-        '--title:title:' '--description:description:' '--due:date:' '--scheduled:date:' \
-        '--tags:tags:' '--dry-run[Preview]' '--verbose[Print result]' ;;
+        '1:title or id:' \
+        '--status=[Status]:status:(todo in_progress done cancelled)' \
+        '--priority=[Priority]:priority:(none low medium high)' \
+        '--title=:title:' '--description=:description:' '--due=:date:' '--scheduled=:date:' \
+        '--tags=:tags:' '--dry-run[Preview]' '--verbose[Print result]' ;;
       completions) _values shell fish bash zsh ;;
       init) _values shell fish ;;
     esac ;;

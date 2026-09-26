@@ -2,8 +2,8 @@
 # __ltrim_colon_completions, which handle the `:` in --filter status:…); installed as
 # ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/seshat.
 _seshat() {
-    local cur prev words cword cmd i
-    _init_completion -n : || return
+    local cur prev words cword split cmd i
+    _init_completion -s -n : || return
     local cmds="show tui add update delete done completions init help"
     for ((i=1; i<cword; i++)); do
         case ${words[i]} in
@@ -20,6 +20,7 @@ _seshat() {
         completions) COMPREPLY=($(compgen -W "fish bash zsh" -- "$cur")); return;;
         init)        COMPREPLY=($(compgen -W "fish" -- "$cur")); return;;
     esac
+    $split && return
     if [[ -z $cmd ]]; then COMPREPLY=($(compgen -W "$cmds --version" -- "$cur")); return; fi
     case $cmd in
         show) COMPREPLY=($(compgen -W "--sort --filter --open --flat --detailed --json --no-color --limit" -- "$cur"));;

@@ -10,20 +10,20 @@ out=${TMPDIR:-/tmp}/zsh-complete.$$
 zpty -b z env TERM=dumb zsh -f -i
 zpty -w z "PS1=''; fpath=($dir \$fpath); autoload -Uz compinit; compinit -u -d $dump"
 zpty -w z 'zstyle ":completion:*" completer _complete'
-zpty -w z 'compadd () { local -a m; builtin compadd -O m "$@"; (( $#m )) && print -l -- $m >> '$out'; return 1 }'
+# -D/-O/-A calls only filter or store; recording them lists words zsh never offers
+zpty -w z 'compadd () { local -a m; builtin compadd -O m "$@"; (( $#m && ! $@[(I)-[DOA]] )) && print -l -- $m >> '$out'; return 1 }'
 zpty -w z 'bindkey "^I" complete-word; setopt nobeep; print READY'
 wait_for() {  # <marker>: drain the pty until the marker shows up, 5 s budget
   local chunk; acc=""
-  for i in {1..50}; do
+  for i in {1..500}; do
     zpty -r -t z chunk && acc+=$chunk
     [[ $acc == *$1* ]] && return 0
-    sleep 0.1
+    sleep 0.01
   done
   return 1
 }
 wait_for READY || { echo 'zsh-complete: shell did not start' >&2; zpty -d z; rm -f $out; exit 2 }
 zpty -w -n z "$line"$'\t'
-sleep 0.5
 zpty -w -n z $'\x15'"print MARK"$'\n'   # ^U clears whatever the completion inserted
 wait_for MARK || { echo 'zsh-complete: no MARK after TAB' >&2; zpty -d z; rm -f $out; exit 2 }
 zpty -d z

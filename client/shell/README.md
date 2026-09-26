@@ -71,7 +71,9 @@ Set these with `set -g` in `config.fish` (`set -U` also works):
 ### Refresh after a mutation
 
 A `fish_postexec` handler force-refreshes after `seshat add|update|delete|done|tui`. The match is
-a heuristic on the command line as typed; misses cost one stale block for at most a minute.
+a heuristic on the command line as typed; misses cost one stale block for at most a minute. The
+handler also counts as activity, so the prompt right after the command does not print the
+pre-command block.
 
 | command line | refresh? |
 |---|---|
@@ -99,14 +101,26 @@ fpath=(${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions $fpath)
 
 then `rm -f ~/.zcompdump* && exec zsh`.
 
+Manual install for bash and zsh, for use until the installer exists:
+
+```sh
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+seshat completions bash > "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/seshat"
+```
+
+```sh
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+seshat completions zsh > "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_seshat"
+```
+
 ## Installing
 
 Pick **one** channel per machine:
 
-- **Installer** (lands with Stage 3 (d); until then, use fisher). `install.sh` writes the fish
-  files (only if `${XDG_CONFIG_HOME:-~/.config}/fish` exists), the bash file (only if the
-  bash-completion user directory exists) and the zsh file. `install.sh --no-shell` skips all of
-  them.
+- **Installer** (lands with Stage 3 (d); until then, fisher for fish and the manual lines above
+  for bash/zsh). `install.sh` writes the fish files (only if
+  `${XDG_CONFIG_HOME:-~/.config}/fish` exists), the bash file (creating its directory; it is inert
+  until bash-completion is installed) and the zsh file. `install.sh --no-shell` skips all of them.
 - **fisher** (the dev loop). `install.sh --no-shell`, then
   `fisher install ~/src/seshat/client/shell/fish`; `fisher update` re-copies the working tree.
   fisher refuses to overwrite files the installer wrote, so when switching, first
@@ -127,6 +141,9 @@ ${XDG_CACHE_HOME:-~/.cache}/seshat/
 ```
 
 plus `set -e seshat_prompt_paused` in fish (no `-U`).
+
+Delete the binary first, or close every fish session: a running fish keeps the hook loaded and,
+while `seshat` is on `$PATH`, re-creates the cache.
 
 ## Tests
 
