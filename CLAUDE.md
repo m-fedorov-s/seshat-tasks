@@ -32,11 +32,14 @@ run it and installs no fish.
   buckets; `format_version` per file; `state_version` per user). Auth: per-user opaque tokens in
   the `Authorization` header, resolved by `Tenants.Authenticate` at one chokepoint
   (`tenantBranch`) that hands each handler its own `*Store` — `Server` holds no store. A separate
-  `admin_token` (config, ≥32 chars) authenticates only `/api/admin/users/{add,list,delete}`
-  (`admin.go`); deleting a user deletes their data. Config (admin_token, port, data_file, bind,
-  rate_limit) from YAML — `bind` defaults to `127.0.0.1`; `rate_limit` defaults to 10 req/s with
-  burst 2x. Endpoints under `/api/tasks/` (`get`, `add`, `update`, `delete`). Optimistic
-  concurrency via per-task `meta.version`. Requests pass through `MaxBytesHandler → prefix
+  admin token (≥32 chars; `admin_token`, `admin_token_file` or `SESHAT_ADMIN_TOKEN[_FILE]`)
+  authenticates only `/api/admin/users/{add,list,delete}` (`admin.go`); deleting a user deletes
+  their data. Config (admin_token / admin_token_file, port, data_file, bind, rate_limit) from YAML
+  (optional at the default path `config.yaml`), each key overridable by a `SESHAT_*` variable
+  (env > file > default); the startup log prints each value and its source. `bind` defaults to
+  `127.0.0.1`, `port` to 8799, `rate_limit` to 10 req/s with burst 2x. Endpoints under
+  `/api/tasks/` (`get`, `add`, `update`, `delete`). Optimistic concurrency via per-task
+  `meta.version`. Requests pass through `MaxBytesHandler → prefix
   dispatch on the escaped path → {adminAuth → admin limiter → admin route table | Authenticate →
   per-tenant limiter → task route table}` — no `ServeMux`, no path cleaning or decoding, so every
   response without a valid credential is a 403. Two distinct version fields: `state_version`
