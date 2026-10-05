@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -150,6 +152,76 @@ func loadConfigFile(path string, explicit bool) (cfg Config, found bool, err err
 		return Config{}, false, err
 	}
 	return cfg, true, nil
+}
+
+// applyEnv overlays SESHAT_* onto cfg (env > file > default) and records each override in
+// from. An unset or empty variable changes nothing.
+func applyEnv(cfg *Config, getenv func(string) string, from provenance) error {
+	if v := getenv("SESHAT_BIND"); v != "" {
+		cfg.Bind, from["bind"] = v, "SESHAT_BIND"
+	}
+	if v := getenv("SESHAT_PORT"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 16)
+		if err != nil {
+			return fmt.Errorf("SESHAT_PORT=%q: want a port number 0-65535", v)
+		}
+		cfg.Port, from["port"] = uint(n), "SESHAT_PORT"
+	}
+	if v := getenv("SESHAT_DATA_FILE"); v != "" {
+		cfg.DataFile, from["data_file"] = v, "SESHAT_DATA_FILE"
+	}
+	if v := getenv("SESHAT_RATE_LIMIT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("SESHAT_RATE_LIMIT=%q: want an integer", v)
+		}
+		// 0 still means "default"; a negative is validateConfig's to reject.
+		cfg.RateLimit, from["rate_limit"] = n, "SESHAT_RATE_LIMIT"
+	}
+	// One credential slot: an env credential replaces both file fields. Within the env
+	// layer the file form wins, because image, compose file and shell can each set one.
+	file, plain := getenv("SESHAT_ADMIN_TOKEN_FILE"), strings.TrimSpace(getenv("SESHAT_ADMIN_TOKEN"))
+	switch {
+	case file != "":
+		if plain != "" {
+			log.Print("WARNING: SESHAT_ADMIN_TOKEN ignored because SESHAT_ADMIN_TOKEN_FILE is set")
+		}
+		cfg.AdminToken, cfg.AdminTokenFile = "", file
+		from["admin_token_file"] = "SESHAT_ADMIN_TOKEN_FILE"
+	case plain != "":
+		log.Print("WARNING: SESHAT_ADMIN_TOKEN puts the admin token in the process environment, " +
+			"readable through docker inspect, systemctl show and /proc; prefer SESHAT_ADMIN_TOKEN_FILE")
+		cfg.AdminToken, cfg.AdminTokenFile = plain, ""
+		from["admin_token"] = "SESHAT_ADMIN_TOKEN"
+	}
+	return nil
+}
+
+// resolveAdminToken collapses the two credential sources into cfg.AdminToken, so everything
+// downstream sees one string. It returns the credential's source for the startup log.
+func resolveAdminToken(cfg *Config, from provenance) (string, error) {
+	if cfg.AdminTokenFile == "" {
+		if cfg.AdminToken != "" {
+			return from["admin_token"], nil
+		}
+		return "", nil
+	}
+	if cfg.AdminToken != "" {
+		return "", errors.New("admin_token and admin_token_file are both set; set exactly one")
+	}
+	raw, err := os.ReadFile(cfg.AdminTokenFile)
+	if err != nil {
+		// Not the path: a token pasted where its path belongs must not reach the log.
+		return "", fmt.Errorf("admin_token_file from %s: %w", from["admin_token_file"], errors.Unwrap(err))
+	}
+	// `openssl rand -hex 32 > f` leaves a newline; a token with a trailing \n fails the
+	// constant-time compare and the only symptom is a 403 on every admin request.
+	tok := strings.TrimSpace(string(raw))
+	if tok == "" {
+		return "", fmt.Errorf("admin_token_file %s is empty", cfg.AdminTokenFile)
+	}
+	cfg.AdminToken = tok
+	return from["admin_token_file"] + " (" + cfg.AdminTokenFile + ")", nil
 }
 
 // resolveRateLimit applies the requests-per-second default (0 -> defaultRateLimit)
