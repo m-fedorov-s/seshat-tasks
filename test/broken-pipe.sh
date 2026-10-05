@@ -3,6 +3,9 @@
 # must exit 0 with no stack trace. Unix convention treats EPIPE as a clean stop.
 # Blocks Stage 3 (the prompt hook captures output through a pipe).
 set -euo pipefail
+# The server reads SESHAT_* as well as its config; do not inherit them from the operator's
+# shell (an exported SESHAT_DATA_FILE would seed fixtures into a real DB).
+unset SESHAT_BIND SESHAT_PORT SESHAT_DATA_FILE SESHAT_RATE_LIMIT SESHAT_ADMIN_TOKEN SESHAT_ADMIN_TOKEN_FILE
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 port=8811
@@ -60,6 +63,49 @@ v=$("$bin" --version)
 [ "$v" != "seshat dev" ] || { echo "FAIL: --version is '$v' — the git describe fallback is broken"; exit 1; }
 echo "PASS: --version is '$v' (git describe, not the dev fallback)"
 
+# -version reads no config, opens no data file, binds no port. Unstamped, it must print
+# "dev (<revision>)", never a bare "dev".
+sv=$("$tmp/seshat-server" -version)
+[[ $sv == "seshat-server dev ("*")" ]] || { echo "FAIL: server -version printed '$sv'"; exit 1; }
+echo "PASS: server -version is '$sv'"
+
+# main() has no unit test: pin its order, its bind, port and rate_limit defaults and its warning
+# call sites on starts it must refuse. Every data file sits under a missing directory, so a
+# start that gets past its refusal still dies before it listens, and timeout bounds anything
+# else. Files are 0644 on purpose.
+start() { timeout 5 env SESHAT_DATA_FILE="$tmp/none/x.db" "$@" 2>&1 || true; }
+expect() { grep -qF "$1" <<<"$out" || { echo "FAIL: $2"; echo "$out"; exit 1; }; }
+printf 'short-token\n' > "$tmp/admin_token"
+printf 'admin_token_file: %s\ndata_file: %s/none/x.db\n' "$tmp/admin_token" "$tmp" > "$tmp/ref.yaml"
+printf 'admin_token: %s\ndata_file: %s/none/x.db\n' "$admin" "$tmp" > "$tmp/inline.yaml"
+chmod 644 "$tmp/admin_token" "$tmp/ref.yaml" "$tmp/inline.yaml"
+
+out=$(start SESHAT_PORT=0 "$tmp/seshat-server" -config "$tmp/ref.yaml")
+expect "config bind=127.0.0.1 (default)" "bind not defaulted to loopback, or no settings logged before the fatal"
+expect "config port=8799 (SESHAT_PORT)" "SESHAT_PORT=0 did not get the default port"
+expect "config data_file=$tmp/none/x.db (SESHAT_DATA_FILE)" "an env value was logged as the file's"
+expect "WARNING: $tmp/admin_token has mode 0644" "no warning on a 0644 admin_token_file"
+expect "admin token from $tmp/ref.yaml ($tmp/admin_token)" "the token's source was not logged before the fatal"
+expect "admin_token must be at least 32 characters, got 11" "main must load the token file, then validate it"
+if grep -qF "WARNING: $tmp/ref.yaml" <<<"$out"; then
+  echo "FAIL: warned on a config that holds no token"; echo "$out"; exit 1
+fi
+
+out=$(start SESHAT_ADMIN_TOKEN_FILE="$tmp/admin_token" "$tmp/seshat-server" -config "$tmp/inline.yaml")
+expect "WARNING: $tmp/inline.yaml has mode 0644" "a 0644 config with an inline token was not warned on"
+expect "WARNING: $tmp/admin_token has mode 0644" "no warning on a token file named by the environment"
+expect "config rate_limit=10 (default)" "rate_limit not defaulted before it is logged"
+
+out=$(start "$tmp/seshat-server" -config "$tmp/nope.yaml")
+expect "config $tmp/nope.yaml: open" "a missing -config path was tolerated"
+out=$(start "$tmp/seshat-server" "$tmp/ref.yaml")
+expect "unexpected argument" "a config path given without -config was not refused"
+out=$(cd "$tmp" && start "$tmp/seshat-server")
+expect "no config file at $tmp/config.yaml" "a missing default config was not reported by its absolute path"
+expect "admin_token required (or admin_token_file, SESHAT_ADMIN_TOKEN_FILE, SESHAT_ADMIN_TOKEN)" \
+  "the no-token fatal does not name the ways to supply a token"
+echo "PASS: main's order, defaults, warnings and refusals"
+
 "$tmp/seshat-server" -config "$tmp/server.yaml" >"$tmp/server.log" 2>&1 &
 pid=$!
 
@@ -81,6 +127,17 @@ if [ "$ready" -ne 1 ]; then
   cat "$tmp/server.log"
   exit 1
 fi
+
+for want in "config port=$port ($tmp/server.yaml)" "config bind=127.0.0.1 ($tmp/server.yaml)" \
+  "config rate_limit=5000 ($tmp/server.yaml)" "admin token from $tmp/server.yaml" \
+  "seshat server listening on 127.0.0.1:$port, users=0, version=dev ("; do
+  grep -qF "$want" "$tmp/server.log" \
+    || { echo "FAIL: startup log lacks '$want'"; cat "$tmp/server.log"; exit 1; }
+done
+if grep -qF "$admin" "$tmp/server.log"; then
+  echo "FAIL: the admin token value appears in the server log"; exit 1
+fi
+echo "PASS: startup log reports config provenance and the token source, not the token"
 
 echo "creating the integration user..."
 # Two steps, so a curl transport failure (set -e) and an empty/odd body both reach a

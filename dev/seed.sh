@@ -3,10 +3,12 @@
 # Creates (or rotates) the dev user first: the previous dev user recorded in dev/.user-id is
 # deleted, a fresh one is created, and its token is written into dev/client.json.
 # Requires: a running dev server (dev/run-server.sh) and `jq`.
-# Usage: dev/seed.sh        (override URL / SESHAT_ADMIN_TOKEN via env if needed)
+# Usage: dev/seed.sh        (override SESHAT_DEV_URL / SESHAT_DEV_ADMIN_TOKEN via env if needed)
+# SESHAT_DEV_*, not SESHAT_*: those names are the server's own inputs, and an export meant
+# for this script would reconfigure a server started from the same shell.
 set -euo pipefail
-URL=${SESHAT_URL:-http://localhost:8799}
-ADMIN=${SESHAT_ADMIN_TOKEN:-devadmin-devadmin-devadmin-devadmin}
+URL=${SESHAT_DEV_URL:-http://localhost:8799}
+ADMIN=${SESHAT_DEV_ADMIN_TOKEN:-devadmin-devadmin-devadmin-devadmin}
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 command -v jq >/dev/null || { echo "this script needs 'jq'"; exit 1; }

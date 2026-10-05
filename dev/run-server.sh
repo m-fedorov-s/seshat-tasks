@@ -8,4 +8,7 @@ cd "$(dirname "$0")/.."   # repo root
 # own permission warning fires on it. See test/broken-pipe.sh for the same fix.
 chmod 600 dev/server.yaml
 echo "Starting seshat dev server on http://localhost:8799 (admin token in dev/server.yaml)"
+# The server reads SESHAT_* from its environment; an exported one (a SESHAT_DATA_FILE
+# naming a real database) must not redirect the dev server. Edit dev/server.yaml instead.
+unset SESHAT_BIND SESHAT_PORT SESHAT_DATA_FILE SESHAT_RATE_LIMIT SESHAT_ADMIN_TOKEN SESHAT_ADMIN_TOKEN_FILE
 exec ./server/seshat -config dev/server.yaml

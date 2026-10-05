@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -136,9 +137,17 @@ func replyTargetSender(u *models.Update) int64 {
 	return u.Message.ReplyToMessage.From.ID
 }
 
+// version is stamped with -ldflags "-X main.version=v0.1.0"; "dev" means unstamped.
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "", "path to bot config (default $SESHAT_BOT_CONFIG or ~/.config/seshat/bot.json)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("seshat-bot", version)
+		return
+	}
 
 	path := *configPath
 	if path == "" {
