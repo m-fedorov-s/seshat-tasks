@@ -33,16 +33,49 @@ cd server && go build -o seshat . && cd ..
 cd client/zig && zig build && cd ../..     # needs Zig 0.16
 ```
 
-**2. Configure the server** (`config.yaml`, gitignored — it holds the admin token):
+**2. Configure the server** — a YAML file, environment variables, or both. Every key is
+optional, and so is the file itself at its default path (`config.yaml` in the working directory;
+`-config <path>` names another, and that one must exist):
 
 ```yaml
-admin_token: <at least 32 characters — openssl rand -hex 32>
-bind: 127.0.0.1        # default; only change if you know you want to
-port: 8799
-data_file: /var/lib/seshat/seshat.db
+admin_token_file: /etc/seshat/admin_token   # the recommended way to hold the admin token
+bind: 127.0.0.1                             # default; only change if you know you want to
+port: 8799                                  # default
+data_file: /var/lib/seshat/seshat.db        # default seshat.db; the directory must exist
+rate_limit: 10                              # requests per second per user; default 10
 ```
 
-(the directory must exist; `~` is not expanded)
+Generate the token once and keep it out of the config file. The token file must belong to the
+user the server runs as; the `umask` creates it at mode `600`:
+
+```sh
+sh -c 'umask 077; openssl rand -hex 32 > /etc/seshat/admin_token'
+```
+
+An inline `admin_token: <at least 32 characters>` still works, but not both keys at once. Keep
+such a file at mode `600` (the server warns otherwise) and out of git (`config.yaml` is
+gitignored). `~` is not expanded in any path. Relative paths resolve against the server's
+working directory, not the config file's; use absolute paths in anything deployed.
+
+Each key has an environment variable that overrides it, so a container needs no config file:
+
+| Variable | Overrides |
+| --- | --- |
+| `SESHAT_BIND` | `bind` |
+| `SESHAT_PORT` | `port` |
+| `SESHAT_DATA_FILE` | `data_file` |
+| `SESHAT_RATE_LIMIT` | `rate_limit` |
+| `SESHAT_ADMIN_TOKEN_FILE` | `admin_token_file` |
+| `SESHAT_ADMIN_TOKEN` | `admin_token` — works, with a warning: `docker inspect` and `/proc` can read the environment |
+
+Precedence is environment > file > default, per key, and an empty variable counts as unset.
+Either token variable replaces both token keys, whatever the file holds; if both variables are
+set, the file form wins. The startup log lists every effective value with where it came from —
+`config port=8799 (config.yaml)`,
+`admin token from SESHAT_ADMIN_TOKEN_FILE (/run/secrets/admin_token)` — so a forgotten
+`export` is one `grep` away, even on a start the server then refuses. The token the server uses
+is never logged; a startup error for a config that does not parse, or for a value in the wrong
+place, may quote part of what you typed.
 
 **3. Configure the client** (`~/.config/seshat/config.json`, or point `SESHAT_CONFIG` at one):
 
@@ -69,7 +102,7 @@ a mutation.
 **4. Run it.**
 
 ```sh
-./server/seshat -config config.yaml &
+./server/seshat &
 seshat add "Try seshat" --priority high --due +2d
 seshat tui
 ```
@@ -79,7 +112,8 @@ With the server running, create a user:
 > **Users and the admin API.** The server knows a user as a token; there are no usernames.
 > Create one:
 > ```sh
-> curl -sS -X POST -H "Authorization: $ADMIN_TOKEN" http://127.0.0.1:8799/api/admin/users/add
+> printf 'Authorization: %s\n' "$(cat /etc/seshat/admin_token)" |
+>   curl -sS -X POST -H @- http://127.0.0.1:8799/api/admin/users/add
 > ```
 > Hand the returned `token` to the user (it goes into their client config as `secret`) and
 > forget it — the server stores only a hash, and **a lost token is lost data**: there is no
@@ -89,6 +123,9 @@ With the server running, create a user:
 > reverse proxy** unless you want remote administration (the server matches the request path
 > exactly as sent, without decoding, so a rule on the raw target is sufficient), and treat the
 > token like a root password.
+
+`./server/seshat -version` prints `seshat-server <tag>` on a release build and
+`seshat-server dev (<git revision>)` on a local one, and exits without reading any config.
 
 Coming from a pre-Stage-2 JSON data file? Start the server on a fresh `data_file`, create a
 user, then `go run ./test/seed -token <token> old.json`.
