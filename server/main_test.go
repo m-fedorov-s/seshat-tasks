@@ -1,7 +1,9 @@
 package main
 
 import (
+	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -91,5 +93,90 @@ func TestResolveRateLimit(t *testing.T) {
 				t.Errorf("resolveRateLimit(%d) = %d, want %d", c.configured, got, c.want)
 			}
 		})
+	}
+}
+
+func writeFile(t *testing.T, name, contents string, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(contents), mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfigFileOptional(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "config.yaml")
+
+	cfg, found, err := loadConfigFile(missing, false)
+	if err != nil || found || cfg != (Config{}) {
+		t.Fatalf("missing at the default path: got (%+v, %v, %v), want zero Config, found=false, nil", cfg, found, err)
+	}
+	if _, _, err := loadConfigFile(missing, true); err == nil {
+		t.Fatal("missing at an explicit -config path: err = nil, want error")
+	}
+
+	if os.Geteuid() == 0 {
+		t.Log("running as root; skipping the unreadable-file case")
+	} else {
+		unreadable := writeFile(t, "config.yaml", "bind: 0.0.0.0\n", 0o000)
+		if _, found, err := loadConfigFile(unreadable, false); err == nil || found {
+			t.Fatalf("unreadable at the default path: got (found=%v, err=%v), want an error — never an all-defaults start", found, err)
+		}
+	}
+
+	present := writeFile(t, "config.yaml", "admin_token_file: /run/secrets/admin_token\nport: 9000\n", 0o600)
+	cfg, found, err = loadConfigFile(present, false)
+	if err != nil || !found {
+		t.Fatalf("present: got (found=%v, err=%v), want found=true, nil", found, err)
+	}
+	if cfg.AdminTokenFile != "/run/secrets/admin_token" || cfg.Port != 9000 {
+		t.Fatalf("present: parsed %+v, want AdminTokenFile=/run/secrets/admin_token Port=9000", cfg)
+	}
+
+	malformed := writeFile(t, "config.yaml", "bind: [\n", 0o600)
+	if _, _, err := loadConfigFile(malformed, false); err == nil {
+		t.Fatal("malformed YAML: err = nil, want error")
+	}
+}
+
+func TestRecordFileAndConfigLines(t *testing.T) {
+	path := "/etc/seshat/config.yaml"
+	from := provenance{}
+	from.recordFile(Config{Port: 9000, DataFile: "/var/lib/seshat/seshat.db", AdminToken: "x"}, path)
+	if want := (provenance{"port": path, "data_file": path, "admin_token": path}); !maps.Equal(from, want) {
+		t.Fatalf("recordFile = %v, want %v", from, want)
+	}
+
+	cfg := Config{Bind: "0.0.0.0", Port: 9000, DataFile: "/var/lib/seshat/seshat.db", RateLimit: 10, AdminToken: "never-logged"}
+	from["bind"] = "SESHAT_BIND"
+	got := configLines(cfg, from)
+	want := []string{
+		"config bind=0.0.0.0 (SESHAT_BIND)",
+		"config port=9000 (/etc/seshat/config.yaml)",
+		"config data_file=/var/lib/seshat/seshat.db (/etc/seshat/config.yaml)",
+		"config rate_limit=10 (default)",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("configLines =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if strings.Contains(strings.Join(got, "\n"), "never-logged") {
+		t.Fatal("configLines must not carry the admin token")
+	}
+}
+
+func TestVersionString(t *testing.T) {
+	prev := version
+	t.Cleanup(func() { version = prev })
+
+	for _, v := range []string{"dev", ""} {
+		version = v
+		if got := versionString(); !strings.HasPrefix(got, "dev (") {
+			t.Errorf("version=%q: versionString() = %q, want \"dev (<revision>)\"", v, got)
+		}
+	}
+	version = "v9.9.9"
+	if got := versionString(); got != "v9.9.9" {
+		t.Errorf("stamped: versionString() = %q, want the bare tag", got)
 	}
 }

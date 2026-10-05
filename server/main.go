@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,9 @@ type Config struct {
 	// AdminToken authenticates /api/admin/* only. At least 32 characters: a human does
 	// not type 32 random characters by accident (README: openssl rand -hex 32).
 	AdminToken string `yaml:"admin_token"`
+	// AdminTokenFile names a file whose contents are the admin token, with surrounding
+	// whitespace trimmed. Mutually exclusive with AdminToken.
+	AdminTokenFile string `yaml:"admin_token_file"`
 	// Bind is the listen address. Defaults to loopback: the process sits behind a
 	// TLS-terminating reverse proxy, and listening on all interfaces would let the
 	// proxy be bypassed by hitting the port directly. A field rather than a constant
@@ -31,26 +35,80 @@ type Config struct {
 	RateLimit int `yaml:"rate_limit"`
 }
 
-const defaultBind = "127.0.0.1"
+// The built-in defaults. A default port is needed because port 0 is legal to the kernel:
+// without one, a start that sets no port binds an ephemeral port with no diagnostic.
+const (
+	defaultBind     = "127.0.0.1"
+	defaultPort     = 8799
+	defaultDataFile = "seshat.db"
+)
 
 // minAdminTokenLen is the minimum accepted length for the admin token: a human does not
 // type 32 random characters by accident, so anything shorter is almost certainly a typo
 // or a placeholder left over from copying an example config.
 const minAdminTokenLen = 32
 
+// version is the release tag, stamped with -ldflags "-X main.version=v0.1.0": Go's own
+// VCS stamp carries the revision, never the tag. "dev" means unstamped.
+var version = "dev"
+
+// versionString is what -version prints and what the startup log line reports.
+func versionString() string {
+	// The linker silently accepts `-X main.version=` with an empty value (a build arg
+	// forwarding an unset shell variable); treat that like an unstamped build.
+	if version != "" && version != "dev" {
+		return version
+	}
+	return "dev (" + buildRevision() + ")"
+}
+
+// provenance maps a config key to where its effective value came from: the config file's
+// path or a SESHAT_* variable name. An absent key took the built-in default.
+type provenance map[string]string
+
+func (p provenance) recordFile(cfg Config, path string) {
+	for key, set := range map[string]bool{
+		"bind":             cfg.Bind != "",
+		"port":             cfg.Port != 0,
+		"data_file":        cfg.DataFile != "",
+		"rate_limit":       cfg.RateLimit != 0,
+		"admin_token":      cfg.AdminToken != "",
+		"admin_token_file": cfg.AdminTokenFile != "",
+	} {
+		if set {
+			p[key] = path
+		}
+	}
+}
+
+// configLines leaves the admin token out by design: main logs only its source.
+func configLines(cfg Config, from provenance) []string {
+	src := func(key string) string {
+		if from[key] == "" {
+			return "default"
+		}
+		return from[key]
+	}
+	return []string{
+		fmt.Sprintf("config bind=%s (%s)", cfg.Bind, src("bind")),
+		fmt.Sprintf("config port=%d (%s)", cfg.Port, src("port")),
+		fmt.Sprintf("config data_file=%s (%s)", cfg.DataFile, src("data_file")),
+		fmt.Sprintf("config rate_limit=%d (%s)", cfg.RateLimit, src("rate_limit")),
+	}
+}
+
 // tooPermissive reports whether a file mode grants any access to group or other.
-// The config holds the admin token in plaintext.
 func tooPermissive(mode os.FileMode) bool { return mode.Perm()&0o077 != 0 }
 
-// warnIfPermissive warns (does not refuse) on a group/world-readable config.
-// Refusing to start over a permission bit is hostile for a single-operator server.
+// warnIfPermissive warns (does not refuse) on a group/world-readable file holding the admin
+// token. Refusing to start over a permission bit is hostile for a single-operator server.
 func warnIfPermissive(path string) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return
 	}
 	if tooPermissive(info.Mode()) {
-		log.Printf("WARNING: config %s has mode %#o and contains the admin token; run: chmod 600 %s",
+		log.Printf("WARNING: %s has mode %#o and holds the admin token; run: chmod 600 %s",
 			path, info.Mode().Perm(), path)
 	}
 }
@@ -75,6 +133,23 @@ func buildRevision() string {
 		return rev + "-dirty"
 	}
 	return rev
+}
+
+// loadConfigFile reads and parses the config file. Only a missing file at the default path
+// is tolerated (found=false): an env-only deployment has no config to mount, but a typo'd
+// -config or an unreadable file must never degrade into an all-defaults start.
+func loadConfigFile(path string, explicit bool) (cfg Config, found bool, err error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) && !explicit {
+		return Config{}, false, nil
+	}
+	if err != nil {
+		return Config{}, false, err
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return Config{}, false, err
+	}
+	return cfg, true, nil
 }
 
 // resolveRateLimit applies the requests-per-second default (0 -> defaultRateLimit)
