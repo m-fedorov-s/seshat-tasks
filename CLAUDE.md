@@ -36,10 +36,11 @@ run it and installs no fish.
   authenticates only `/api/admin/users/{add,list,delete}` (`admin.go`); deleting a user deletes
   their data. Config (admin_token / admin_token_file, port, data_file, bind, rate_limit) from YAML
   (optional at the default path `config.yaml`), each key overridable by a `SESHAT_*` variable
-  (env > file > default); the startup log prints each value and its source. `bind` defaults to
-  `127.0.0.1`, `port` to 8799, `rate_limit` to 10 req/s with burst 2x. Endpoints under
-  `/api/tasks/` (`get`, `add`, `update`, `delete`). Optimistic concurrency via per-task
-  `meta.version`. Requests pass through `MaxBytesHandler → prefix
+  (env > file > default); the startup log prints each non-secret value and its source, and only
+  the source of the admin token. `bind` defaults to `127.0.0.1`, `port` to 8799, `data_file` to
+  `seshat.db`, `rate_limit` to 10 req/s with burst 2x. Endpoints under `/api/tasks/` (`get`,
+  `add`, `update`, `delete`). Optimistic concurrency via per-task `meta.version`. Requests pass
+  through `MaxBytesHandler → prefix
   dispatch on the escaped path → {adminAuth → admin limiter → admin route table | Authenticate →
   per-tenant limiter → task route table}` — no `ServeMux`, no path cleaning or decoding, so every
   response without a valid credential is a 403. Two distinct version fields: `state_version`
@@ -117,8 +118,9 @@ The Zig client:
 
 The Telegram bot (`client/bot/`):
 1. Reads config (bot token, server URL, `utc_offset`, and a `telegram_id → seshat token` map)
-   from JSON (`SESHAT_BOT_CONFIG` or `~/.config/seshat/bot.json`). Refuses to start on an empty
-   token, an empty user map, or a bad offset; warns on a group/world-readable file.
+   from JSON (`-config <path>`, else `SESHAT_BOT_CONFIG`, else `~/.config/seshat/bot.json`).
+   Refuses to start on an empty token, an empty user map, or a bad offset; warns on a
+   group/world-readable file.
 2. **Any non-command message becomes a task** — first line is the title, everything after the
    first newline is the description. This rule is unconditional; it is why field edits arrive
    through Telegram's `ForceReply` rather than "the next message you send is the value".
@@ -141,6 +143,9 @@ The Telegram bot (`client/bot/`):
 - The server is authoritative; clients must not assume local state is canonical.
 - Auth is a per-user opaque token in the `Authorization` header (no Bearer prefix); the admin
   token is a separate credential for `/api/admin/*` only.
+- A new server `SESHAT_*` variable must also be added to the `unset` lines in
+  `test/broken-pipe.sh` and `dev/run-server.sh`, or an exported value leaks into the test and
+  dev servers.
 - **Never delete an SDD workspace — archive it.** `superpowers:subagent-driven-development` tells
   you to delete `.superpowers/sdd/<plan>/` once a plan's final review is clean. Do not. Move it to
   `sdd_archive/<plan>/` instead. The ledger, task briefs, implementer reports and review write-ups

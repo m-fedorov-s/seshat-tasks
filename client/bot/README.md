@@ -5,13 +5,15 @@ inbound port** and makes only outbound HTTPS calls to `api.telegram.org`.
 
 ## Config
 
-`-config <path>`, else `$SESHAT_BOT_CONFIG`, else `~/.config/seshat/bot.json`. Mode
-`0600` — it holds the bot token *and* every user's seshat token.
+`-config <path>`, else `$SESHAT_BOT_CONFIG`, else `~/.config/seshat/bot.json`.
+Mode `0600` — it holds the bot token *and* every user's seshat token.
+`seshat-bot -version` prints the build-time version (`seshat-bot v0.1.0` on a
+release binary, `seshat-bot dev` otherwise) and exits.
 
 ```json
 {
   "bot_token": "123456:ABC-DEF…",
-  "server_url": "http://127.0.0.1:8080",
+  "server_url": "http://127.0.0.1:8799",
   "utc_offset": "+03:00",
   "users": { "123456789": "<seshat token>" }
 }
@@ -51,9 +53,6 @@ User=seshat
 [Install]
 WantedBy=multi-user.target
 ```
-
-`seshat-bot -version` prints the build-time version (`seshat-bot v0.1.0` on a
-release binary, `seshat-bot dev` otherwise) and exits.
 
 ## Usage
 

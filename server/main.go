@@ -213,7 +213,7 @@ func resolveAdminToken(cfg *Config, from provenance) (string, error) {
 	raw, err := os.ReadFile(cfg.AdminTokenFile)
 	if err != nil {
 		// Not the path: a token pasted where its path belongs must not reach the log.
-		return "", fmt.Errorf("admin_token_file from %s: %w", from["admin_token_file"], errors.Unwrap(err))
+		return "", fmt.Errorf("admin_token_file from %s: %w (path not shown: it may be a misplaced token)", from["admin_token_file"], errors.Unwrap(err))
 	}
 	// `openssl rand -hex 32 > f` leaves a newline; a token with a trailing \n fails the
 	// constant-time compare and the only symptom is a 403 on every admin request.

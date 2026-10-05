@@ -54,7 +54,8 @@ sh -c 'umask 077; openssl rand -hex 32 > /etc/seshat/admin_token'
 
 An inline `admin_token: <at least 32 characters>` still works, but not both keys at once. Keep
 such a file at mode `600` (the server warns otherwise) and out of git (`config.yaml` is
-gitignored). `~` is not expanded in any path.
+gitignored). `~` is not expanded in any path. Relative paths resolve against the server's
+working directory, not the config file's; use absolute paths in anything deployed.
 
 Each key has an environment variable that overrides it, so a container needs no config file:
 
