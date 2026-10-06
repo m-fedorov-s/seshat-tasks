@@ -1,0 +1,11 @@
+# BuildKit sends only what a Dockerfile COPYs: go.mod, go.sum, internal/, and server/ or
+# client/bot/. These keep a local config (a live admin token) and stale binaries out of those
+# two directories.
+server/config.yaml
+server/seshat
+client/bot/seshat-bot
+# Never COPYed today; listed so a broader COPY cannot pick up a secret or the history.
+.git
+config.yaml
+dev
+docker/secrets

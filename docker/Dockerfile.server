@@ -1,0 +1,37 @@
+# Build context is the REPO ROOT (go.mod lives there):
+#   docker build -f docker/Dockerfile.server -t seshat:dev .
+# go.mod's `go` line is a floor, not a ceiling. Bump this pin deliberately.
+ARG GO_VERSION=1.27
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-trixie AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Explicit copies, not `COPY . .`: the repo root holds dev/ configs and local binaries.
+COPY internal/ ./internal/
+COPY server/ ./server/
+ARG TARGETOS TARGETARCH
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -buildvcs=false \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/seshat ./server
+# Pre-owned data dir, so a named volume inherits 65532:65532 0700 on first use.
+# COPY it by its PARENT below: copying the directory itself recreates it as 0755.
+RUN mkdir -p /stage/seshat && chown 65532:65532 /stage/seshat && chmod 700 /stage/seshat
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=build /out/seshat /usr/local/bin/seshat
+COPY --from=build --chown=65532:65532 /stage/ /var/lib/
+USER 65532:65532
+# Documentation only: compose.yaml publishes this port.
+EXPOSE 8799
+# These three beat a mounted config file (env > file > default): a YAML mounted into this
+# image can only set rate_limit and the admin credential.
+ENV SESHAT_BIND=0.0.0.0 \
+    SESHAT_PORT=8799 \
+    SESHAT_DATA_FILE=/var/lib/seshat/seshat.db
+# No CMD: a default -config path that does not exist would be fatal. No WORKDIR either: the
+# cwd stays /home/nonroot from the base, where the optional default config.yaml is absent.
+ENTRYPOINT ["/usr/local/bin/seshat"]
