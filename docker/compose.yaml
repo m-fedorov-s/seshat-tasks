@@ -24,7 +24,7 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
 
-  # Optional. Every command needs the profile: docker compose --profile bot up -d
+  # Optional: docker compose --profile bot up -d
   seshat-bot:
     image: ghcr.io/m-fedorov-s/seshat-bot:latest
     profiles: [bot]

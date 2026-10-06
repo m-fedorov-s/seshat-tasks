@@ -7,15 +7,18 @@ file, and is published on loopback only: a reverse proxy in front of it terminat
 
 Every command here works as written in bash, zsh and fish (3.4 or later).
 
-> **Before the first release** the images are not on GHCR. Until then, build them from a
-> checkout with `make docker-build` and change the two `image:` lines in `compose.yaml` to
-> `seshat:dev` and `seshat-bot:dev`.
+> **Before the first release** the images are not on GHCR and `compose.yaml` is not on `main`.
+> Until then, work from a checkout: build the images with `make docker-build`, copy
+> `docker/compose.yaml` into `~/seshat` instead of running the `curl` below, and change its two
+> `image:` lines to `seshat:dev` and `seshat-bot:dev`.
 
 ## Prerequisites
 
 - Docker, as the usual root daemon, with the compose plugin: `docker compose version` must
   succeed. It is a separate package on several distros.
 - `openssl` and `curl`.
+- Network access to Docker Hub: the helper commands below pull `alpine` and run it as root on
+  `secrets/` and on the data volume.
 - For clients on other machines, a reverse proxy with a TLS certificate
   ([below](#reverse-proxy)).
 
@@ -45,11 +48,13 @@ file's own owner and mode, so `secrets/admin_token` has to belong to 65532. The 
 does that from a throwaway container, because the Docker daemon is already root;
 `sudo chown 65532:65532 secrets/admin_token && sudo chmod 400 secrets/admin_token` does the same.
 
-**After it you can no longer read that file.** `~/.config/seshat/admin.hdr` is your copy, written
+**After it only root can read that file.** `~/.config/seshat/admin.hdr` is your copy, written
 first, in the form `curl -H @file` takes: that keeps the token out of the process list, where
 `-H "Authorization: …"` would put it. The commands are one chain, so a failure stops everything
-after it, and running the block a second time changes nothing. `umask 077` keeps both files
-private from the moment they exist, and lasts until you close this shell.
+after it. Running the block a second time changes nothing: the token file is no longer yours to
+overwrite, so it prints `Permission denied` and the STOP line. (As root it writes a new token
+instead; restart the server afterwards.) `umask 077` keeps both files private from the moment
+they exist, and lasts until you close this shell.
 
 To start over, `rm -f secrets/admin_token`, run the block again, and restart the server if it is
 running. If you lose `admin.hdr`, root can still read the token:
@@ -112,8 +117,10 @@ docker compose --profile bot up -d
 docker compose logs seshat-bot
 ```
 
-Every later compose command that should include the bot needs `--profile bot` as well. To change
-`bot.json` afterwards, edit it as root and `docker compose --profile bot restart seshat-bot`.
+A good start ends with `seshat bot started, server=http://seshat:8799, users=1`. Every later
+compose command that should include the bot needs `--profile bot` as well. To change `bot.json`
+afterwards, edit it as root, or `rm -f` it, create it again and repeat the chown; then
+`docker compose --profile bot restart seshat-bot`.
 [`client/bot/README.md`](../client/bot/README.md) covers the bot itself.
 
 ## Configuration
@@ -149,7 +156,7 @@ before the server acknowledges it.
 docker compose stop seshat \
     && docker run --rm -v seshat-data:/data:ro -v "$PWD":/backup alpine sh -c \
         'umask 077 && tar czf "/backup/seshat-$1.tgz" -C /data . && chown "$2" "/backup/seshat-$1.tgz"' \
-        _ "$(date -u +%F)" "$(id -u):$(id -g)"
+        _ "$(date -u +%FT%H%M%SZ)" "$(id -u):$(id -g)"
 docker compose start seshat
 ```
 
@@ -157,17 +164,18 @@ The archive is every user's tasks: the `umask` keeps it at mode `600` and the `c
 you. The helper runs as root because nothing else can read a volume owned by 65532. A running bot
 answers with errors while the server is down.
 
-To restore, into a stopped server (`seshat-2026-10-05.tgz` stands for your archive):
+To restore, into a stopped server (`seshat-2026-10-05T101500Z.tgz` stands for your archive):
 
 ```sh
 docker compose stop seshat \
     && docker run --rm -v seshat-data:/data -v "$PWD":/backup alpine sh -c \
         'tar tzf "/backup/$1" >/dev/null && rm -rf /data/* && tar xzf "/backup/$1" -C /data' \
-        _ seshat-2026-10-05.tgz
+        _ seshat-2026-10-05T101500Z.tgz
 docker compose start seshat
 ```
 
-Nothing is deleted unless the server stopped and the archive can be read.
+Nothing is deleted unless the server stopped and the archive can be read. On a new host, do
+*Set up* through step 2 first, so the volume is the stack's own.
 
 **`docker compose down -v` deletes the volume and every user's tasks, with no confirmation.**
 Plain `down` keeps it; the volume's fixed name does not protect it. A server you stopped stays
@@ -179,14 +187,17 @@ Do *Set up* and step 1 as above: the admin token is not in the data file, so the
 replaces the old. Then, with the old server stopped:
 
 ```sh
-docker compose create seshat
-docker run --rm -v seshat-data:/data -v /path/to/the/old/directory:/src:ro alpine sh -c \
-    'cp /src/seshat.db /data/ && chown 65532:65532 /data/seshat.db && chmod 600 /data/seshat.db'
+docker compose create seshat \
+    && docker compose stop seshat \
+    && docker run --rm -v seshat-data:/data -v /path/to/the/old/directory:/src:ro alpine sh -c \
+        'cp /src/seshat.db /data/ && chown 65532:65532 /data/seshat.db && chmod 600 /data/seshat.db'
 docker compose up -d
 ```
 
-`create` makes the volume, already owned by 65532, without starting the server. The `users=`
-count in the log should be the one you had, and every user's token keeps working.
+`create` makes the volume, already owned by 65532, without starting the server; `stop` is for a
+stack you had already started, because the copy replaces whatever the volume holds and must not
+land under a running server. The `users=` count in the log should be the one you had, and every
+user's token keeps working.
 
 ## Reverse proxy
 
@@ -221,8 +232,9 @@ with its source, where the admin token came from, and the address it listens on.
   The container's user cannot read `secrets/admin_token`: the chown at the end of step 1 did
   not happen. Fix the owner (the `sudo chown` form in step 1 works on an existing file), then
   `docker compose restart seshat`.
-- `seshat-bot` repeats `error call getMe, unauthorized`: the `bot_token` in `secrets/bot.json`
-  is wrong.
+- `seshat-bot` repeats `error call getMe, …` (`unauthorized` or `not found`): the `bot_token`
+  in `secrets/bot.json` is wrong. If it repeats
+  `open /run/secrets/seshat_bot_config: permission denied`, the chown in step 4 did not happen.
 - **`403` on everything**, a plain `curl http://127.0.0.1:8799/` included, is the correct answer
   to a missing or wrong token. The server is up.
 - **`exec: "sh": executable file not found`.** The images contain no shell. To look inside the
@@ -233,9 +245,10 @@ with its source, where the admin token came from, and the address it listens on.
 ## Building the images
 
 From a checkout, `make docker-build` builds `seshat:dev` and `seshat-bot:dev`, and
-`make docker-smoke` builds throwaway copies and tests them in a container. Both need buildx:
-`docker buildx version` must succeed. Run both before tagging a release: CI builds no images,
-and the release workflow publishes whatever builds.
+`make docker-smoke` builds throwaway copies and tests them in a container. Both need buildx
+(`docker buildx version` must succeed); the smoke test also needs the compose plugin. Run both
+before tagging a release: CI builds no images, and the release workflow publishes whatever
+builds.
 
 ## Appendix: podman Quadlet
 
@@ -268,8 +281,8 @@ mkdir -p ~/.config/seshat
 openssl rand -hex 32 > admin_token \
     && podman secret create seshat_admin_token admin_token \
     && printf 'Authorization: %s\n' "$(cat admin_token)" > ~/.config/seshat/admin.hdr \
-    && rm admin_token \
     || echo "STOP: the token is not set up; do not go on"
+rm -f admin_token
 systemctl --user daemon-reload
 systemctl --user start seshat
 ```

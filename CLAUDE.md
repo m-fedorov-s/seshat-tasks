@@ -17,7 +17,7 @@ make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
 
 make docker-build             # both images, as seshat:dev and seshat-bot:dev (needs buildx)
-make docker-smoke             # builds throwaway images and tests them in a container
+make docker-smoke             # throwaway images, tested in a container (buildx + compose)
 ```
 
 All six test targets must pass before any commit. `make shell-test` is local-only — CI does not
@@ -83,7 +83,9 @@ pre-release ritual, run by hand before tagging, and CI runs neither.
   data file under `/var/lib/seshat`) live in the image `ENV`, never in the binary.
   `compose.yaml` runs both read-only with no capabilities, the server on a loopback publish with
   the admin token as a file secret; `README.md` is the operator guide; `smoke.sh` is
-  `make docker-smoke`.
+  `make docker-smoke`, the only test of anything under `docker/`: run it after changing it. The
+  Dockerfiles `COPY` only `go.mod`, `go.sum`, `internal/` and their own directory, so a new Go
+  directory either binary imports must be added there; only `make docker-build` notices.
 - `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans (gitignored).
 
 ## Task model
@@ -157,6 +159,11 @@ The Telegram bot (`client/bot/`):
 - A new server `SESHAT_*` variable must also be added to the `unset` lines in
   `test/broken-pipe.sh` and `dev/run-server.sh`, or an exported value leaks into the test and
   dev servers.
+- **Never `docker compose up` or `down` `docker/compose.yaml` to try it.** Its project (`seshat`),
+  volume (`seshat-data`) and port (8799) are fixed, global names: `down -v` from any directory
+  deletes a real deployment's data. The `sh` blocks in `docker/README.md` must run unchanged in
+  bash, zsh and fish (no heredoc, no `exit`, no `{ }`) and quote server and bot log lines
+  verbatim; nothing committed tests that.
 - **Never delete an SDD workspace — archive it.** `superpowers:subagent-driven-development` tells
   you to delete `.superpowers/sdd/<plan>/` once a plan's final review is clean. Do not. Move it to
   `sdd_archive/<plan>/` instead. The ledger, task briefs, implementer reports and review write-ups

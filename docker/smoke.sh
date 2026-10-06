@@ -13,6 +13,7 @@ botimg=seshat-bot:smoke-$$
 admin=smoke-admin-token-smoke-admin-token     # >= 32 chars
 tmp=$(mktemp -d)
 cleanup() {
+  trap '' INT TERM     # a second Ctrl-C must not cut this short
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker volume rm "$name" >/dev/null 2>&1 || true
   docker image rm -f "$img" "$botimg" >/dev/null 2>&1 || true
@@ -32,7 +33,8 @@ docker build -q -f docker/Dockerfile.server --build-arg VERSION=$ver -t "$img" .
 docker build -q -f docker/Dockerfile.bot --build-arg VERSION=$ver -t "$botimg" . >/dev/null \
   || fail "bot image build (make docker-build shows why)"
 
-docker compose -f docker/compose.yaml config -q || fail "docker/compose.yaml does not validate"
+docker compose -f docker/compose.yaml config -q \
+  || fail "docker/compose.yaml does not validate (or the compose plugin is missing)"
 
 user=$(docker inspect --format '{{.Config.User}}' "$img")
 [ "$user" = 65532:65532 ] || fail "server image user: want 65532:65532, got $user"

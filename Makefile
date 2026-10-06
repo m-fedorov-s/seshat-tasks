@@ -28,7 +28,8 @@ shell-test:
 	./test/shell/run.sh
 
 # Docker images (docker/README.md): pre-release, run by hand before tagging. Not among the six
-# pre-commit targets, not run by CI. Needs a Docker daemon with buildx (`docker buildx version`).
+# pre-commit targets, not run by CI. Both need a Docker daemon with buildx
+# (`docker buildx version`); docker-smoke also needs the compose plugin.
 docker-build:
 	docker build -f docker/Dockerfile.server -t seshat:dev .
 	docker build -f docker/Dockerfile.bot -t seshat-bot:dev .

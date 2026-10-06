@@ -234,7 +234,8 @@ All six must pass before a commit. Note that `zig build test` does **not** typec
 entry point — run `zig build` as well.
 
 `make docker-build` and `make docker-smoke` build the two images and test them in a container.
-They need Docker with buildx and are run by hand before a release, not before every commit.
+They need Docker with buildx (the smoke test also the compose plugin) and are run by hand before
+a release, not before every commit.
 
 ## Status
 

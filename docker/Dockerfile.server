@@ -25,7 +25,6 @@ FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/seshat /usr/local/bin/seshat
 COPY --from=build --chown=65532:65532 /stage/ /var/lib/
 USER 65532:65532
-# Documentation only: compose.yaml publishes this port.
 EXPOSE 8799
 # These three beat a mounted config file (env > file > default): a YAML mounted into this
 # image can only set rate_limit and the admin credential.

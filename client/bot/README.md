@@ -38,11 +38,14 @@ which is the authoritative check because it is in version control.
 
 ## Docker
 
-The bot ships as `ghcr.io/m-fedorov-s/seshat-bot`, an optional service in the server's compose
-stack. Put the config above at `secrets/bot.json` next to `compose.yaml`, with
-`"server_url": "http://seshat:8799"`, and start it with `docker compose --profile bot up -d`.
-**`bot.json` holds every user's seshat token in cleartext, and a leaked token cannot be
-rotated.** [`docker/README.md`](../../docker/README.md) has the steps.
+The bot ships as `ghcr.io/m-fedorov-s/seshat-bot`, an optional service in
+the server's compose stack. Put the config above at `secrets/bot.json`
+next to `compose.yaml`, with `"server_url": "http://seshat:8799"`, hand
+the file to the container's UID 65532 instead of keeping it `0600` as
+yourself, and start it with `docker compose --profile bot up -d`: step 4
+of [`docker/README.md`](../../docker/README.md) has the exact commands.
+**`bot.json` holds every user's seshat token in cleartext, and a leaked
+token cannot be rotated.**
 
 ## systemd
 
