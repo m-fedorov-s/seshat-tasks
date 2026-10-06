@@ -1,4 +1,4 @@
-.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test shell-test docker-build
+.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test shell-test docker-build docker-smoke
 
 server-test:
 	go test -race ./server/... ./internal/...
@@ -32,3 +32,6 @@ shell-test:
 docker-build:
 	docker build -f docker/Dockerfile.server -t seshat:dev .
 	docker build -f docker/Dockerfile.bot -t seshat-bot:dev .
+
+docker-smoke:
+	./docker/smoke.sh
