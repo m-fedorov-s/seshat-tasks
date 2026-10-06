@@ -26,6 +26,11 @@ You pick a status from a list instead of remembering which key sets it.
 
 ## Quick start
 
+> **Running a server for real?** Use Docker: [`docker/README.md`](docker/README.md) goes from
+> one `compose.yaml` to a first user in a handful of commands, with the admin token in a secret
+> file and the port on loopback behind your reverse proxy. The steps below build and run the
+> binaries directly, which is what you want for development or a quick look.
+
 **1. Build both halves.**
 
 ```sh
@@ -206,6 +211,7 @@ the bash/zsh files by hand — see [`client/shell/README.md`](client/shell/READM
 | `client/zig/` | The canonical client (Zig 0.16). CLI plus TUI; see [`client/zig/CLAUDE.md`](client/zig/CLAUDE.md). |
 | `client/shell/` | Shell integration files (fish in fisher layout, bash, zsh); a required build input of `client/zig/`, embedded and printed by `seshat completions`/`init`. |
 | `client/bot/` | A Go Telegram bot: capture a task from any message, browse with `/list`/`/find`, edit per-field through inline keyboards. Long-polling, no inbound port. See [`client/bot/README.md`](client/bot/README.md). |
+| `docker/` | The server and bot images, the compose stack that runs them, and the operator guide: [`docker/README.md`](docker/README.md). |
 | `test/` | Integration tests that need a real server and client. |
 | `dev/` | A throwaway local environment. |
 
@@ -226,6 +232,10 @@ cd client/zig && zig build test
 
 All six must pass before a commit. Note that `zig build test` does **not** typecheck the CLI
 entry point — run `zig build` as well.
+
+`make docker-build` and `make docker-smoke` build the two images and test them in a container.
+They need Docker with buildx (the smoke test also the compose plugin) and are run by hand before
+a release, not before every commit.
 
 ## Status
 

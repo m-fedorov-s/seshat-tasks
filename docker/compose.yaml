@@ -1,0 +1,47 @@
+# seshat: copy this file, create `secrets/` next to it, then follow README.md.
+name: seshat
+
+services:
+  seshat:
+    image: ghcr.io/m-fedorov-s/seshat:latest   # pin a version (…/seshat:0.1.0) for a reproducible rollback
+    restart: unless-stopped
+    # Loopback only: the reverse proxy is the one route in, and Docker's published ports
+    # bypass a host firewall. For another host port change the left number; the right one
+    # is the image's.
+    ports: ["127.0.0.1:8799:8799"]
+    environment:
+      SESHAT_ADMIN_TOKEN_FILE: /run/secrets/seshat_admin_token
+      # SESHAT_RATE_LIMIT: "10"       # requests per second per user, burst 2x
+    # The container sees the host file's own owner and mode: uid/gid/mode are ignored for
+    # a file-sourced secret. See README.md, "The admin token".
+    secrets: [seshat_admin_token]
+    volumes:
+      - seshat-data:/var/lib/seshat
+    read_only: true                    # the server writes only into the data volume
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  # Optional: docker compose --profile bot up -d
+  seshat-bot:
+    image: ghcr.io/m-fedorov-s/seshat-bot:latest
+    profiles: [bot]
+    restart: unless-stopped
+    secrets: [seshat_bot_config]       # the image reads /run/secrets/seshat_bot_config
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+secrets:
+  seshat_admin_token: {file: ./secrets/admin_token}
+  # Holds every bot user's seshat token in cleartext: the most sensitive file here.
+  seshat_bot_config: {file: ./secrets/bot.json}
+
+volumes:
+  seshat-data:
+    name: seshat-data     # fixed, so the backup commands in README.md are literal

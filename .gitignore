@@ -32,3 +32,6 @@ sdd_archive/
 
 # Claude local settings
 .claude/settings.local.json
+
+# Docker deployment secrets (docker/README.md)
+docker/secrets/
