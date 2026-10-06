@@ -15,10 +15,14 @@ cd client/zig && zig build test   # Zig client unit tests
 
 make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
+
+make docker-build             # both images, as seshat:dev and seshat-bot:dev (needs buildx)
+make docker-smoke             # builds throwaway images and tests them in a container
 ```
 
 All six test targets must pass before any commit. `make shell-test` is local-only — CI does not
-run it and installs no fish.
+run it and installs no fish. The two `docker-*` targets are not among the six: they are the
+pre-release ritual, run by hand before tagging, and CI runs neither.
 
 ## Layout
 
@@ -73,6 +77,13 @@ run it and installs no fish.
   `test/seed` loads a legacy JSON task file through the API; also the migration tool.
 - `dev/` — local dev environment: a throwaway server/client config + scripts to run the server,
   seed a realistic dataset, and run the client (see `dev/README.md`; `make dev-server`/`dev-seed`).
+- `docker/` — how the server is deployed. `Dockerfile.server` and `Dockerfile.bot` (build
+  context is the repo root; distroless, UID 65532, no shell) produce
+  `ghcr.io/m-fedorov-s/seshat{,-bot}`. Deployment defaults (`SESHAT_BIND=0.0.0.0`, the port, the
+  data file under `/var/lib/seshat`) live in the image `ENV`, never in the binary.
+  `compose.yaml` runs both read-only with no capabilities, the server on a loopback publish with
+  the admin token as a file secret; `README.md` is the operator guide; `smoke.sh` is
+  `make docker-smoke`.
 - `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans (gitignored).
 
 ## Task model
