@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pre-release smoke test: builds both images and pokes a server container run with the same
 # hardening as compose.yaml. Local only (`make docker-smoke`); CI does not run it.
-# Needs a Docker daemon with buildx, plus curl, sed and tar.
+# Needs a Docker daemon with buildx and the compose plugin, plus curl, sed and tar.
 # An interrupted run can leave a container or volume named seshat-smoke-<pid>.
 set -euo pipefail
 
@@ -31,6 +31,8 @@ docker build -q -f docker/Dockerfile.server --build-arg VERSION=$ver -t "$img" .
   || fail "server image build (make docker-build shows why)"
 docker build -q -f docker/Dockerfile.bot --build-arg VERSION=$ver -t "$botimg" . >/dev/null \
   || fail "bot image build (make docker-build shows why)"
+
+docker compose -f docker/compose.yaml config -q || fail "docker/compose.yaml does not validate"
 
 user=$(docker inspect --format '{{.Config.User}}' "$img")
 [ "$user" = 65532:65532 ] || fail "server image user: want 65532:65532, got $user"
