@@ -60,8 +60,8 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
 
 - `src/main.zig` — entry point + subcommand dispatch (`--version`, `completions <fish|bash|zsh>`,
   `init fish`, `show`, `tui`, `add`, `update <id>`, `delete <id>`, `done <id>`, `help`).
-  `--version`, `completions` and `init` are all handled **before the config load** (the installer
-  runs `seshat completions fish` on a machine with no config file and possibly no `$HOME`);
+  `--version`, `completions` and `init` are all handled **before the config load** (they have to
+  work on a machine with no config file and possibly no `$HOME`);
   `completions`/`init` print blobs embedded from `client/shell/` — see `src/shell.zig`. Uses the
   0.16 `std.process.Init` entry signature: `pub fn main(init:
   std.process.Init) !void`. Pulls allocator from `init.arena`, args from `init.minimal.args`, env
@@ -121,10 +121,10 @@ this client against it. Handy for eyeballing rendering. (`make dev-server` / `ma
     unmapped and still fails nonzero with the one-line message, so a network failure can never be
     mistaken for a successful mutation. The same `stdoutErr` path covers `completions`/`init`, so
     `seshat completions fish > file` exits 0 even if the write itself failed (a full disk, say) —
-    an installer must check the written file is non-empty rather than trust the exit code.
+    a script must check the written file is non-empty rather than trust the exit code.
 - `src/shell.zig` — the five shell-integration files, `@embedFile`d at build time from
   **`client/shell/`, which is the single source of truth** (`client/shell/fish/` is also the fisher
-  plugin root, and the whole tree is the installer's input). Do **not** edit an embedded copy and
+  plugin root). Do **not** edit an embedded copy and
   do not generate these files from the flag tables. `@embedFile` cannot escape a module root, so
   `build.zig` mounts each file as its own anonymous module (`addAnonymousImport` +
   `b.path("../shell/…")`) on **both** the exe and the test

@@ -72,8 +72,9 @@ neither. `make install` writes into the developer's real `~/.local/bin`: try it 
 - `client/shell/` — shell integration. `fish/` is a fisher-layout plugin (completions, a `conf.d`
   `fish_prompt` hook printing a cached task block after inactivity, and the `seshat-prompt`
   control function); `bash/` and `zsh/` are static completions only. The files are embedded in
-  the client binary and printed by `seshat completions <shell>` / `seshat init fish`; the
-  installer is the distribution channel and a local-path `fisher install` is the dev loop.
+  the client binary and printed by `seshat completions <shell>` / `seshat init fish`. A user
+  puts them in place by hand from those commands, or installs the fish plugin with fisher (a
+  local-path `fisher install` is the dev loop); `make install` installs only the binary.
   Cache: `$XDG_CACHE_HOME/seshat/prompt`. Tested headlessly by `make shell-test`
   (`test/shell/run.sh`); see `client/shell/README.md`.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
@@ -86,9 +87,10 @@ neither. `make install` writes into the developer's real `~/.local/bin`: try it 
   data file under `/var/lib/seshat`) live in the image `ENV`, never in the binary.
   `compose.yaml` runs both read-only with no capabilities, the server on a loopback publish with
   the admin token as a file secret; `README.md` is the operator guide; `smoke.sh` is
-  `make docker-smoke`, the only test of anything under `docker/`: run it after changing it. The
-  Dockerfiles `COPY` only `go.mod`, `go.sum`, `internal/` and their own directory, so a new Go
-  directory either binary imports must be added there; only `make docker-build` notices.
+  `make docker-smoke`, the only test of anything under `docker/`: run it after any change there.
+  The Dockerfiles `COPY` only `go.mod`, `go.sum`, `internal/` and the binary's own directory
+  (`server/` or `client/bot/`), so a new Go directory either binary imports must be added
+  there; none of the six test targets notices a missing one, only the two `docker-*` targets.
 - `.github/workflows/ci.yml` — CI, on pull requests and on pushes to `main` (never on pushes to
   `dev`): the test targets a fresh checkout can run, on the Go minor the Dockerfiles pin as
   `GO_VERSION` (keep the three copies equal; `go.mod`'s `go` line is only a floor). Lint it with
@@ -169,8 +171,8 @@ The Telegram bot (`client/bot/`):
 - **Never `docker compose up` or `down` `docker/compose.yaml` to try it.** Its project (`seshat`),
   volume (`seshat-data`) and port (8799) are fixed, global names: `down -v` from any directory
   deletes a real deployment's data. The `sh` blocks in `docker/README.md` must run unchanged in
-  bash, zsh and fish (no heredoc, no `exit`, no `{ }`) and quote server and bot log lines
-  verbatim; nothing committed tests that.
+  bash, zsh and fish (no heredoc, no `exit`, no `{ }`), and the guide must quote server and bot
+  log lines verbatim; nothing committed tests either.
 - **Never delete an SDD workspace — archive it.** `superpowers:subagent-driven-development` tells
   you to delete `.superpowers/sdd/<plan>/` once a plan's final review is clean. Do not. Move it to
   `sdd_archive/<plan>/` instead. The ledger, task briefs, implementer reports and review write-ups
