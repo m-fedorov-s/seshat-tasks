@@ -38,6 +38,10 @@ cd server && go build -o seshat . && cd ..
 cd client/zig && zig build && cd ../..     # needs Zig 0.16
 ```
 
+`make install` builds the client in `ReleaseSafe` mode and installs it to `~/.local/bin` (set
+`SESHAT_INSTALL_DIR` to an absolute path for another directory); step 4 expects it on your
+`PATH`.
+
 **2. Configure the server** — a YAML file, environment variables, or both. Every key is
 optional, and so is the file itself at its default path (`config.yaml` in the working directory;
 `-config <path>` names another, and that one must exist):
@@ -197,9 +201,9 @@ before any config exists.
 In fish, `seshat` completes every subcommand, flag and value, and a short block of your most
 urgent open tasks appears above the prompt when you come back to a terminal after a quiet quarter
 hour — cached, refreshed in the background, never delaying a prompt.
-`seshat-prompt pause|resume|now|status` controls it. bash and zsh get completions. The installer
-that writes the files lands with Stage 3 (d); until then, install the fish plugin with fisher and
-the bash/zsh files by hand — see [`client/shell/README.md`](client/shell/README.md).
+`seshat-prompt pause|resume|now|status` controls it. bash and zsh get completions. Nothing sets
+this up for you: the `seshat` binary prints the files and you put them in place, two or three
+commands per shell — see [`client/shell/README.md`](client/shell/README.md).
 
 ## Layout
 

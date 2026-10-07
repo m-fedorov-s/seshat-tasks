@@ -52,9 +52,9 @@ does that from a throwaway container, because the Docker daemon is already root;
 first, in the form `curl -H @file` takes: that keeps the token out of the process list, where
 `-H "Authorization: …"` would put it. The commands are one chain, so a failure stops everything
 after it. Running the block a second time changes nothing: the token file is no longer yours to
-overwrite, so it prints `Permission denied` and the STOP line. (As root it writes a new token
-instead; restart the server afterwards.) `umask 077` keeps both files private from the moment
-they exist, and lasts until you close this shell.
+overwrite, so the shell reports a permission error and the STOP line follows. (As root it writes
+a new token instead; restart the server afterwards.) `umask 077` keeps both files private from
+the moment they exist, and lasts until you close this shell.
 
 To start over, `rm -f secrets/admin_token`, run the block again, and restart the server if it is
 running. If you lose `admin.hdr`, root can still read the token:
@@ -117,8 +117,9 @@ docker compose --profile bot up -d
 docker compose logs seshat-bot
 ```
 
-A good start ends with `seshat bot started, server=http://seshat:8799, users=1`. Every later
-compose command that should include the bot needs `--profile bot` as well. To change `bot.json`
+A good start logs `seshat bot started, server=http://seshat:8799, users=1`; straight after
+`up -d` that line may not be there yet, so run the `logs` command again. Every later compose
+command that should include the bot needs `--profile bot` as well. To change `bot.json`
 afterwards, edit it as root, or `rm -f` it, create it again and repeat the chown; then
 `docker compose --profile bot restart seshat-bot`.
 [`client/bot/README.md`](../client/bot/README.md) covers the bot itself.
@@ -247,8 +248,7 @@ with its source, where the admin token came from, and the address it listens on.
 From a checkout, `make docker-build` builds `seshat:dev` and `seshat-bot:dev`, and
 `make docker-smoke` builds throwaway copies and tests them in a container. Both need buildx
 (`docker buildx version` must succeed); the smoke test also needs the compose plugin. Run both
-before tagging a release: CI builds no images, and the release workflow publishes whatever
-builds.
+before tagging a release: CI builds no images, and nothing publishes them yet.
 
 ## Appendix: podman Quadlet
 

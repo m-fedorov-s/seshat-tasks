@@ -4,7 +4,7 @@
 most urgent open tasks above the prompt when you come back to a terminal you have not touched for
 a while, and a `seshat-prompt` function to control it. `bash/` and `zsh/` are static completions
 only. All five files are compiled into the client and printed by `seshat completions <shell>` and
-`seshat init fish`, which is how the installer writes them.
+`seshat init fish`; [Installing](#installing) puts them in place.
 
 Needs **fish ≥ 3.6.0** (`path mtime --relative`).
 
@@ -91,40 +91,50 @@ id completion offers only the tasks in the prompt block (raise `seshat_prompt_li
 and `--filter tag:` completes nothing.
 
 bash: needs the `bash-completion` package (Linux; macOS users install it from Homebrew or use
-fish/zsh). zsh: the installer writes `_seshat` to
-`${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions/` and that directory has to be on `fpath`
-before `compinit` runs — add to `~/.zshrc` (before `source $ZSH/oh-my-zsh.sh`, if you use it):
-
-```zsh
-fpath=(${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions $fpath)
-```
-
-then `rm -f ~/.zcompdump* && exec zsh`.
-
-Manual install for bash and zsh, for use until the installer exists:
-
-```sh
-mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
-seshat completions bash > "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/seshat"
-```
-
-```sh
-mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
-seshat completions zsh > "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_seshat"
-```
+fish/zsh). zsh: the file has to be in a directory on `fpath` before `compinit` runs.
+[Installing](#installing) has the commands for all three shells.
 
 ## Installing
 
-Pick **one** channel per machine:
+`make install` places the `seshat` binary and nothing else. The shell files come out of that
+binary: the commands below need `seshat` on your `PATH`, and when it is updated, run them again.
 
-- **Installer** (lands with Stage 3 (d); until then, fisher for fish and the manual lines above
-  for bash/zsh). `install.sh` writes the fish files (only if
-  `${XDG_CONFIG_HOME:-~/.config}/fish` exists), the bash file (creating its directory; it is inert
-  until bash-completion is installed) and the zsh file. `install.sh --no-shell` skips all of them.
-- **fisher** (the dev loop). `install.sh --no-shell`, then
-  `fisher install ~/src/seshat/client/shell/fish`; `fisher update` re-copies the working tree.
-  fisher refuses to overwrite files the installer wrote, so when switching, first
-  `rm "${XDG_CONFIG_HOME:-$HOME/.config}"/fish/{completions,conf.d}/seshat.fish`.
+**fish** (completions and the prompt block):
+
+```sh
+mkdir -p ~/.config/fish/completions ~/.config/fish/conf.d
+seshat completions fish > ~/.config/fish/completions/seshat.fish
+seshat init fish > ~/.config/fish/conf.d/seshat.fish
+```
+
+Or with fisher, from a checkout (the dev loop): `fisher install ~/src/seshat/client/shell/fish`;
+`fisher update` re-copies the working tree. Use one way or the other: fisher refuses to
+overwrite files it did not write, so when switching, first
+`rm ~/.config/fish/{completions,conf.d}/seshat.fish`.
+
+**bash:**
+
+```sh
+mkdir -p ~/.local/share/bash-completion/completions
+seshat completions bash > ~/.local/share/bash-completion/completions/seshat
+```
+
+**zsh:**
+
+```sh
+mkdir -p ~/.local/share/zsh/site-functions
+seshat completions zsh > ~/.local/share/zsh/site-functions/_seshat
+```
+
+That directory has to be on `fpath` before `compinit` runs: add this to `~/.zshrc` (before
+`source $ZSH/oh-my-zsh.sh`, if you use it), then `rm -f ~/.zcompdump* && exec zsh`.
+
+```zsh
+fpath=(~/.local/share/zsh/site-functions $fpath)
+```
+
+If you set `XDG_CONFIG_HOME` or `XDG_DATA_HOME`, fish and bash-completion look under those
+instead of `~/.config` and `~/.local/share`.
 
 Stale `~/.cache/seshat/*` files from the retired fish client are inert and can be deleted; the
 directory is re-created on the next refresh.
@@ -133,10 +143,10 @@ directory is re-created on the next refresh.
 
 ```
 ~/.local/bin/seshat
-${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/seshat.fish
-${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/seshat.fish
-${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/seshat
-${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions/_seshat
+~/.config/fish/completions/seshat.fish
+~/.config/fish/conf.d/seshat.fish
+~/.local/share/bash-completion/completions/seshat
+~/.local/share/zsh/site-functions/_seshat
 ${XDG_CACHE_HOME:-~/.cache}/seshat/
 ```
 

@@ -1,4 +1,4 @@
-.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test shell-test docker-build docker-smoke
+.PHONY: schema-test server-test dev-server dev-seed client-integration-test bot-test shell-test install docker-build docker-smoke
 
 server-test:
 	go test -race ./server/... ./internal/...
@@ -26,6 +26,12 @@ client-integration-test:
 # not run it.
 shell-test:
 	./test/shell/run.sh
+
+# The client only, built from this checkout. SESHAT_INSTALL_DIR must be an absolute path: Zig
+# puts a relative one under client/zig/zig-out/.
+SESHAT_INSTALL_DIR ?= $(HOME)/.local/bin
+install:
+	cd client/zig && zig build -Doptimize=ReleaseSafe --prefix-exe-dir "$(SESHAT_INSTALL_DIR)"
 
 # Docker images (docker/README.md): pre-release, run by hand before tagging. Not among the six
 # pre-commit targets, not run by CI. Both need a Docker daemon with buildx
