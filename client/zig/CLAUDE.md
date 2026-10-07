@@ -20,8 +20,8 @@ without setting a cwd, so `git describe` resolves against wherever `zig build` w
 the build root — `zig build --build-file …` from outside the repo silently reports `dev`.
 
 **Build flags.** `zig build` takes the standard `-Dtarget=<triple>` / `-Doptimize=<mode>` plus
-`-Dstrip` (omit debug info; the release does **not** use it — spec (d) keeps ReleaseSafe stack
-traces) and `-Dversion=`. All four release targets (`{x86_64,aarch64}-{linux-musl,macos}`) build
+`-Dstrip` (omit debug info; `make install` does **not** use it, so stack traces stay readable)
+and `-Dversion=`. The four cross-compile targets (`{x86_64,aarch64}-{linux-musl,macos}`) build
 from this tree unchanged. The **test** artifact is pinned to `b.graph.host`, because a
 foreign-target test binary cannot be run here: `zig build test -Dtarget=…` still compiles and runs
 the full *host* suite, so a green `test` says nothing about a cross-target build — use

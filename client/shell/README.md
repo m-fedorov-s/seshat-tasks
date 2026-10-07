@@ -143,10 +143,10 @@ directory is re-created on the next refresh.
 
 ```
 ~/.local/bin/seshat
-${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/seshat.fish
-${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/seshat.fish
-${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/seshat
-${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions/_seshat
+~/.config/fish/completions/seshat.fish
+~/.config/fish/conf.d/seshat.fish
+~/.local/share/bash-completion/completions/seshat
+~/.local/share/zsh/site-functions/_seshat
 ${XDG_CACHE_HOME:-~/.cache}/seshat/
 ```
 

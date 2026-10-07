@@ -73,8 +73,8 @@ neither. `make install` writes into the developer's real `~/.local/bin`: try it 
   `fish_prompt` hook printing a cached task block after inactivity, and the `seshat-prompt`
   control function); `bash/` and `zsh/` are static completions only. The files are embedded in
   the client binary and printed by `seshat completions <shell>` / `seshat init fish`. A user
-  puts them in place by hand from those commands, or installs the fish plugin with fisher (a
-  local-path `fisher install` is the dev loop); `make install` installs only the binary.
+  puts them in place by hand from those commands, or installs the fish plugin from a checkout
+  with fisher (the dev loop); `make install` installs only the binary.
   Cache: `$XDG_CACHE_HOME/seshat/prompt`. Tested headlessly by `make shell-test`
   (`test/shell/run.sh`); see `client/shell/README.md`.
 - `test/` — integration tests needing a real server + client (`make client-integration-test`).
