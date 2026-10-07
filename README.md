@@ -38,6 +38,10 @@ cd server && go build -o seshat . && cd ..
 cd client/zig && zig build && cd ../..     # needs Zig 0.16
 ```
 
+`make install` builds the client in `ReleaseSafe` mode and installs it to `~/.local/bin` (set
+`SESHAT_INSTALL_DIR` to an absolute path for another directory); step 4 expects it on your
+`PATH`.
+
 **2. Configure the server** — a YAML file, environment variables, or both. Every key is
 optional, and so is the file itself at its default path (`config.yaml` in the working directory;
 `-config <path>` names another, and that one must exist):

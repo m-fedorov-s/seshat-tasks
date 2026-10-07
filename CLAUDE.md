@@ -13,6 +13,7 @@ make bot-test                 # Go Telegram bot client tests
 make shell-test               # the shell files under fish/bash/zsh, no server (local only)
 cd client/zig && zig build test   # Zig client unit tests
 
+make install                  # build the client into ~/.local/bin (or SESHAT_INSTALL_DIR)
 make dev-server               # run a local server (dev/ config)
 make dev-seed                 # load a realistic dataset into it
 
@@ -20,9 +21,11 @@ make docker-build             # both images, as seshat:dev and seshat-bot:dev (n
 make docker-smoke             # throwaway images, tested in a container (buildx + compose)
 ```
 
-All six test targets must pass before any commit. `make shell-test` is local-only — CI does not
-run it and installs no fish. The two `docker-*` targets are not among the six: they are the
-pre-release ritual, run by hand before tagging, and CI runs neither.
+All six test targets must pass before any commit. CI (`.github/workflows/ci.yml`) runs five of
+them: `make shell-test` is local-only, and CI installs no fish. The two `docker-*` targets are
+not among the six: they are the pre-release ritual, run by hand before tagging, and CI runs
+neither. `make install` writes into the developer's real `~/.local/bin`: try it only with
+`SESHAT_INSTALL_DIR` set to a directory under `/tmp`.
 
 ## Layout
 
@@ -86,6 +89,10 @@ pre-release ritual, run by hand before tagging, and CI runs neither.
   `make docker-smoke`, the only test of anything under `docker/`: run it after changing it. The
   Dockerfiles `COPY` only `go.mod`, `go.sum`, `internal/` and their own directory, so a new Go
   directory either binary imports must be added there; only `make docker-build` notices.
+- `.github/workflows/ci.yml` — CI, on pull requests and on pushes to `main` (never on pushes to
+  `dev`): the test targets a fresh checkout can run, on the Go minor the Dockerfiles pin as
+  `GO_VERSION` (keep the three copies equal; `go.mod`'s `go` line is only a floor). Lint it with
+  `actionlint`.
 - `plans/`, `docs/superpowers/` — design docs, specs, and implementation plans (gitignored).
 
 ## Task model
