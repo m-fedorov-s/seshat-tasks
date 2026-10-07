@@ -23,7 +23,7 @@ dev/client.json
 plans/
 docs/
 
-# Archived subagent-driven-development ledgers (see CLAUDE.md → Conventions)
+# Archived subagent-driven-development ledgers (see CLAUDE.local.md)
 sdd_archive/
 
 # Go build binary
@@ -35,3 +35,4 @@ sdd_archive/
 
 # Docker deployment secrets (docker/README.md)
 docker/secrets/
+CLAUDE.local.md
